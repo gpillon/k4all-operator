@@ -1,0 +1,29 @@
+FROM quay.io/fedora/fedora-coreos:stable
+
+LABEL org.opencontainers.image.source = "https://github.com/gpillon/k4all-operator"
+
+ENV VERIFY_CHECKSUM=false
+
+# Install required tools (rpm-ostree used for CoreOS package management)
+RUN rpm-ostree install \
+    curl \
+    bash \
+    git \
+    jq \
+    tar \
+    gzip \
+    util-linux \
+    findutils \
+    procps-ng \
+    coreutils && \
+    rpm-ostree cleanup -m && \
+    systemctl enable rpm-ostree-countme.timer
+
+RUN mkdir "/usr/local/bin"
+# Install Helm
+RUN curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 && \
+    chmod 700 get_helm.sh && \
+    ./get_helm.sh && \
+    rm get_helm.sh
+# Set default command
+CMD ["/bin/bash"] 

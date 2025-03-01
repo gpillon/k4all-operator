@@ -1,0 +1,9 @@
+apiVersion: k4all.magesgate.com/v1alpha1
+kind: ClusterConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: k4all-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: k4all-cluster-config
+  namespace: k4all-operator-system
+spec:

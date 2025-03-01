@@ -1,0 +1,23 @@
+# permissions for end users to view clusterconfigs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: k4all-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterconfig-viewer-role
+rules:
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs/status
+  verbs:
+  - get

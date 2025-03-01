@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- k4all_v1alpha1_clusterconfig.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

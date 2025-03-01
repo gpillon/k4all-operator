@@ -1,0 +1,186 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
+  name: clusterconfigs.k4all.magesgate.com
+spec:
+  group: k4all.magesgate.com
+  names:
+    kind: ClusterConfig
+    listKind: ClusterConfigList
+    plural: clusterconfigs
+    singular: clusterconfig
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ClusterConfig is the Schema for the clusterconfigs API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClusterConfigSpec defines the desired state of ClusterConfig
+            properties:
+              cluster:
+                description: Cluster configuration
+                properties:
+                  apiEndPointUseHostName:
+                    description: ApiEndPointUseHostName indicates if the API endpoint
+                      should use the hostname
+                    type: string
+                  customApiEndPoint:
+                    description: CustomApiEndPoint is a custom hostname for the control
+                      plane
+                    type: string
+                  ha:
+                    description: HA configuration
+                    properties:
+                      apiControlEndpoint:
+                        description: Control plane endpoint for the API server (ignored
+                          in "none" mode)
+                        type: string
+                      apiControlEndpointSubnetSize:
+                        description: Control plane endpoint subnet size for the API
+                          server (ignored in "none" mode)
+                        type: string
+                      interface:
+                        description: Interface to use for the virtual IP
+                        type: string
+                      type:
+                        description: Type of HA (none, keepalived, kubevip)
+                        type: string
+                    required:
+                    - interface
+                    - type
+                    type: object
+                required:
+                - apiEndPointUseHostName
+                - ha
+                type: object
+              features:
+                description: Features configuration
+                properties:
+                  argocd:
+                    description: ArgoCD configuration
+                    properties:
+                      enabled:
+                        description: Enabled indicates if ArgoCD is enabled
+                        type: boolean
+                      managed:
+                        description: Managed indicates if ArgoCD is managed by the
+                          operator
+                        type: boolean
+                    required:
+                    - enabled
+                    type: object
+                  virt:
+                    description: Virt configuration
+                    properties:
+                      emulation:
+                        description: Emulation indicates if emulation is enabled (true,
+                          false, or auto)
+                        type: string
+                      enabled:
+                        description: Enabled indicates if virtualization is enabled
+                        type: boolean
+                      managed:
+                        description: Managed indicates if virtualization is managed
+                          by the operator
+                        type: boolean
+                    required:
+                    - emulation
+                    - enabled
+                    type: object
+                required:
+                - argocd
+                - virt
+                type: object
+              networking:
+                description: Networking configuration
+                properties:
+                  cni:
+                    description: CNI configuration
+                    properties:
+                      type:
+                        description: Type of CNI (calico, cilium)
+                        type: string
+                    required:
+                    - type
+                    type: object
+                  firewalld:
+                    description: Firewalld configuration
+                    properties:
+                      enabled:
+                        description: Enabled indicates if firewalld is enabled
+                        type: string
+                    required:
+                    - enabled
+                    type: object
+                  iface:
+                    description: Interface configuration
+                    properties:
+                      dev:
+                        description: Device name (eth card)
+                        type: string
+                      dns:
+                        description: DNS servers (comma-separated list)
+                        type: string
+                      dns_search:
+                        description: DNS search domains (comma-separated list)
+                        type: string
+                      gateway:
+                        description: Gateway (required for static IP)
+                        type: string
+                      ipaddr:
+                        description: IP address (required for static IP)
+                        type: string
+                      ipconfig:
+                        description: IP configuration (dhcp or static)
+                        type: string
+                      subnet_mask:
+                        description: Subnet mask (required for static IP)
+                        type: string
+                    required:
+                    - dev
+                    - ipconfig
+                    type: object
+                required:
+                - cni
+                - firewalld
+                - iface
+                type: object
+              version:
+                description: Version of the configuration
+                type: string
+            required:
+            - cluster
+            - features
+            - networking
+            - version
+            type: object
+          status:
+            description: ClusterConfigStatus defines the observed state of ClusterConfig
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

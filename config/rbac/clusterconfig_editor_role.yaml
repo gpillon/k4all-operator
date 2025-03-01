@@ -1,0 +1,27 @@
+# permissions for end users to edit clusterconfigs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: k4all-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterconfig-editor-role
+rules:
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs/status
+  verbs:
+  - get
