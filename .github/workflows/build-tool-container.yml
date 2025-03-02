@@ -14,7 +14,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: gpillon/k4all-tools
+  IMAGE_NAME: ${{ github.repository_owner }}/k4all-tools
   CONTAINER_OS: fedora
 
 jobs:
