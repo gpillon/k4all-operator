@@ -22,7 +22,7 @@ env:
   IMAGE_NAME: gpillon/k4all-operator
 
 jobs:
-  build-and-push:
+  build-operator:
     runs-on: ubuntu-latest
     permissions:
       contents: write
