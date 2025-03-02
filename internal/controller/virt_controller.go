@@ -22,9 +22,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	"github.com/gpillon/k4all-operator/internal/config"
-	manifests "github.com/gpillon/k4all-operator/internal/downloader"
-	"github.com/gpillon/k4all-operator/internal/jobrunner"
+	"github.com/gpillon/k4all-operator/internal/controller/config"
+	manifests "github.com/gpillon/k4all-operator/internal/controller/downloader"
+	"github.com/gpillon/k4all-operator/internal/controller/jobrunner"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/utils/ptr"
 )
@@ -1325,7 +1325,7 @@ func (r *VirtReconciler) InstallKubeVirtManager(ctx context.Context) error {
 
 	// Wait for deployment to be ready
 	log.Info("Waiting for KubeVirt Manager deployment to be ready")
-	err = wait.PollImmediate(5*time.Second, 2*time.Minute, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 2*time.Minute, false, func(ctx context.Context) (bool, error) {
 		err := r.Client.Get(ctx, types.NamespacedName{
 			Name:      "kubevirt-manager",
 			Namespace: "kubevirt-manager",

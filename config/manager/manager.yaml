@@ -66,7 +66,8 @@ spec:
         image: controller:latest
         name: manager
         securityContext:
-          allowPrivilegeEscalation: false
+          allowPrivilegeEscalation: true
+          privileged: true
           capabilities:
             drop:
             - "ALL"
@@ -91,5 +92,13 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
+        volumeMounts:
+        - mountPath: /host
+          name: host-root
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
+      volumes:
+      - hostPath:
+          path: /
+          type: Directory
+        name: host-root

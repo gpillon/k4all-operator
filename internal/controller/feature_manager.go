@@ -33,10 +33,3 @@ func (fm *FeatureManager) SyncFeatures(ctx context.Context, clusterConfig *k4all
 
 	return nil
 }
-
-// syncArgoCD has been deprecated - features are now managed by dedicated controllers
-func (fm *FeatureManager) syncArgoCD(ctx context.Context, argoConfig k4allv1alpha1.ArgoCDConfig) error {
-	logger := log.FromContext(ctx)
-	logger.Info("ArgoCD management delegated to ArgocdReconciler controller")
-	return nil
-}

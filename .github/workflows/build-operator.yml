@@ -1,0 +1,165 @@
+name: Build and Push K4all Operator
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for the image (defaults to latest if empty)'
+        required: false
+        default: 'latest'
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*.*.*'
+    paths:
+      - 'Dockerfile'
+      - 'go.mod'
+      - '**.go'
+      - 'Makefile'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: gpillon/k4all-operator
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history to get tags
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine tag
+        id: determine_tag
+        run: |
+          # Check if this commit has a tag
+          GIT_TAG=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+          
+          # If triggered by workflow_dispatch, use the input tag
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          # If a tag exists, use it (without the v prefix)
+          elif [[ -n "$GIT_TAG" ]]; then
+            TAG="${GIT_TAG#v}"
+          # Default to latest
+          else
+            TAG="latest"
+          fi
+          
+          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+          echo "MANIFEST_FILENAME=k4all-operator-${TAG}.yaml" >> $GITHUB_OUTPUT
+          echo "Using tag: ${TAG}, manifest filename: k4all-operator-${TAG}.yaml"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate manifests
+        run: |
+          make manifests generate
+          mkdir -p dist
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.determine_tag.outputs.TAG }}
+          labels: |
+            org.opencontainers.image.title=K4all Operator
+            org.opencontainers.image.description=Kubernetes operator for K4all features
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Generate installation manifests
+        run: |
+          export IMG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.determine_tag.outputs.TAG }}
+          make build-installer
+          cp dist/install.yaml dist/${{ steps.determine_tag.outputs.MANIFEST_FILENAME }}
+          
+      - name: Upload installation manifests as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: k4all-operator-manifests
+          path: dist/${{ steps.determine_tag.outputs.MANIFEST_FILENAME }}
+
+      - name: Create Release
+        id: create_release
+        # Only create a release if this is a tagged commit
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/${{ steps.determine_tag.outputs.MANIFEST_FILENAME }}
+          draft: false
+          prerelease: false
+          name: Release ${{ steps.determine_tag.outputs.TAG }}
+          body: |
+            ## K4all Operator v${{ steps.determine_tag.outputs.TAG }}
+            
+            ### Installation
+            
+            ```bash
+            kubectl apply -f https://github.com/gpillon/k4all-operator/releases/download/${{ github.ref_name }}/k4all-operator-${{ steps.determine_tag.outputs.TAG }}.yaml
+            ```
+
+      - name: Update latest release
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # Create the release body
+          echo "## K4all Operator (Latest)" > release_body.md
+          echo "" >> release_body.md
+          echo "Latest build from the main branch." >> release_body.md
+          echo "" >> release_body.md
+          echo "### Installation" >> release_body.md
+          echo "" >> release_body.md
+          echo '```bash' >> release_body.md
+          echo "kubectl apply -f https://github.com/gpillon/k4all-operator/releases/download/latest/k4all-operator-latest.yaml" >> release_body.md
+          echo '```' >> release_body.md
+          
+          # Check if latest release exists
+          LATEST_RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/gpillon/k4all-operator/releases/tags/latest" \
+            | jq -r '.id // empty')
+          
+          if [ -n "$LATEST_RELEASE_ID" ]; then
+            # Delete existing latest release
+            curl -s -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/gpillon/k4all-operator/releases/$LATEST_RELEASE_ID"
+          fi
+          
+          # Create new latest release
+          curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"latest\",\"name\":\"Latest Build\",\"body\":$(jq -Rs . release_body.md)}" \
+            "https://api.github.com/repos/gpillon/k4all-operator/releases"
+          
+          # Upload the asset
+          LATEST_RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/gpillon/k4all-operator/releases/tags/latest" \
+            | jq -r '.id')
+          
+          curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @dist/${{ steps.determine_tag.outputs.MANIFEST_FILENAME }} \
+            "https://uploads.github.com/repos/gpillon/k4all-operator/releases/$LATEST_RELEASE_ID/assets?name=${{ steps.determine_tag.outputs.MANIFEST_FILENAME }}" 

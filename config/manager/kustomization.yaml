@@ -6,4 +6,4 @@ images:
 - newTag: v0.0.1
 - name: controller
   newName: ghcr.io/gpillon/k4all-operator
-  newTag: v0.0.2
+  newTag: latest

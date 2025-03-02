@@ -10,7 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/gpillon/k4all-operator/internal/jobrunner"
+	"github.com/gpillon/k4all-operator/internal/controller/jobrunner"
 )
 
 // FeatureScriptConfig contains configuration for running a feature script

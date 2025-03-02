@@ -10,7 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
-	"github.com/gpillon/k4all-operator/internal/config"
+	"github.com/gpillon/k4all-operator/internal/controller/config"
 )
 
 // SyncK8sToConfigFile reads the ClusterConfig resource and writes it to the config file,
