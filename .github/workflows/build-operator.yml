@@ -99,7 +99,7 @@ jobs:
           cp dist/install.yaml dist/${{ steps.determine_tag.outputs.MANIFEST_FILENAME }}
           
       - name: Upload installation manifests as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: k4all-operator-manifests
           path: dist/${{ steps.determine_tag.outputs.MANIFEST_FILENAME }}
