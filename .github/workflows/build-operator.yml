@@ -19,13 +19,21 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # 1. Build operator image + generate install.yaml manifest
+  # 1. Build per-arch images on native runners (fast, no QEMU)
   # ------------------------------------------------------------------
-  build:
-    runs-on: ubuntu-latest
+  build-image:
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -33,8 +41,6 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Extract version
         id: version
@@ -60,14 +66,6 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -78,94 +76,108 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine image tags
-        id: tags
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          IS_TAG="${{ steps.version.outputs.is_tag }}"
-          TAGS="${{ env.IMAGE_NAME }}:${VERSION}"
-          if [ "$IS_TAG" = "true" ]; then
-            TAGS="${TAGS},${{ env.IMAGE_NAME }}:latest"
-          fi
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push multi-arch image
+      - name: Build and push (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          provenance: false
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.title=K4All Operator
             org.opencontainers.image.description=Kubernetes operator for K4All cluster lifecycle
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
-      - name: Generate install.yaml manifest
+  # ------------------------------------------------------------------
+  # 2. Create multi-arch manifest from per-arch images
+  # ------------------------------------------------------------------
+  push-manifest:
+    needs: build-image
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
         run: |
-          export IMG=${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+          VERSION="${{ needs.build-image.outputs.version }}"
+          docker manifest create "${{ env.IMAGE_NAME }}:${VERSION}" \
+            "${{ env.IMAGE_NAME }}:${VERSION}-amd64" \
+            "${{ env.IMAGE_NAME }}:${VERSION}-arm64"
+          docker manifest push "${{ env.IMAGE_NAME }}:${VERSION}"
+
+          if [ "${{ needs.build-image.outputs.is_tag }}" = "true" ]; then
+            docker manifest create "${{ env.IMAGE_NAME }}:latest" \
+              "${{ env.IMAGE_NAME }}:${VERSION}-amd64" \
+              "${{ env.IMAGE_NAME }}:${VERSION}-arm64"
+            docker manifest push "${{ env.IMAGE_NAME }}:latest"
+          fi
+
+  # ------------------------------------------------------------------
+  # 3. Generate install.yaml and create GitHub Release
+  # ------------------------------------------------------------------
+  release:
+    needs: [build-image, push-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Generate install.yaml
+        run: |
+          export IMG=${{ env.IMAGE_NAME }}:${{ needs.build-image.outputs.version }}
           make manifests generate
           make build-installer
           echo "Generated dist/install.yaml for image ${IMG}"
           ls -lh dist/install.yaml
 
-      - name: Upload manifest artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: operator-install-manifest
-          path: dist/install.yaml
-          retention-days: 7
-
-  # ------------------------------------------------------------------
-  # 2. Create GitHub Release with install.yaml asset
-  # ------------------------------------------------------------------
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
-
-      - name: Download manifest artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: operator-install-manifest
-          path: dist
-
       - name: Create tagged release
-        if: needs.build.outputs.is_tag == 'true'
+        if: needs.build-image.outputs.is_tag == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.build.outputs.version }}
-          name: "K4All Operator ${{ needs.build.outputs.version }}"
-          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
+          tag_name: ${{ needs.build-image.outputs.version }}
+          name: "K4All Operator ${{ needs.build-image.outputs.version }}"
+          prerelease: ${{ needs.build-image.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: dist/install.yaml
           body: |
-            ## K4All Operator ${{ needs.build.outputs.version }}
+            ## K4All Operator ${{ needs.build-image.outputs.version }}
 
             ### Installation
             ```bash
-            kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ needs.build.outputs.version }}/install.yaml
+            kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ needs.build-image.outputs.version }}/install.yaml
             ```
 
             ### Container Image
             ```
-            ghcr.io/${{ github.repository_owner }}/k4all-operator:${{ needs.build.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/k4all-operator:${{ needs.build-image.outputs.version }}
             ```
 
       - name: Create/update latest prerelease
-        if: needs.build.outputs.is_tag != 'true'
+        if: needs.build-image.outputs.is_tag != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Remove existing latest release so assets are replaced cleanly
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
 
           gh release create latest dist/install.yaml \
