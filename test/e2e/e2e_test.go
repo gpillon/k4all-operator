@@ -19,104 +19,104 @@ package e2e
 import (
 	"fmt"
 	"os/exec"
+	"strings"
+	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	"github.com/gpillon/k4all-operator/test/utils"
 )
 
-const namespace = "k4all-operator-system"
+func TestE2E(t *testing.T) {
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "K4All Operator E2E Suite")
+}
 
-var _ = Describe("controller", Ordered, func() {
+const (
+	operatorNamespace = "k4all-operator-system"
+	testTimeout       = 10 * time.Minute
+	pollInterval      = 10 * time.Second
+)
+
+func kubectl(args ...string) (string, error) {
+	cmd := exec.Command("kubectl", args...)
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+var _ = Describe("K4All Operator", Ordered, func() {
+
 	BeforeAll(func() {
-		By("installing prometheus operator")
-		Expect(utils.InstallPrometheusOperator()).To(Succeed())
-
-		By("installing the cert-manager")
-		Expect(utils.InstallCertManager()).To(Succeed())
-
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, _ = utils.Run(cmd)
+		By("verifying the cluster is reachable")
+		Eventually(func() error {
+			_, err := kubectl("cluster-info")
+			return err
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 	})
 
-	AfterAll(func() {
-		By("uninstalling the Prometheus manager bundle")
-		utils.UninstallPrometheusOperator()
+	Context("Operator deployment", func() {
+		It("should deploy the operator successfully", func() {
+			By("applying the operator manifests")
+			_, err := kubectl("apply", "-f", "dist/install.yaml")
+			Expect(err).NotTo(HaveOccurred())
 
-		By("uninstalling the cert-manager bundle")
-		utils.UninstallCertManager()
-
-		By("removing manager namespace")
-		cmd := exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
+			By("waiting for the operator deployment to be available")
+			Eventually(func() string {
+				out, _ := kubectl("get", "deployment",
+					"k4all-operator-controller-manager",
+					"-n", operatorNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Available')].status}")
+				return out
+			}, 3*time.Minute, pollInterval).Should(Equal("True"))
+		})
 	})
 
-	Context("Operator", func() {
-		It("should run successfully", func() {
-			var controllerPodName string
-			var err error
+	Context("CRD creation", func() {
+		It("should have the ReleaseManifest CRD registered", func() {
+			out, err := kubectl("get", "crd", "releasemanifests.k4all.magesgate.com")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(ContainSubstring("releasemanifests.k4all.magesgate.com"))
+		})
 
-			// projectimage stores the name of the image used in the example
-			var projectimage = "example.com/k4all-operator:v0.0.1"
+		It("should have the ClusterConfig CRD registered", func() {
+			out, err := kubectl("get", "crd", "clusterconfigs.k4all.magesgate.com")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(ContainSubstring("clusterconfigs.k4all.magesgate.com"))
+		})
+	})
 
-			By("building the manager(Operator) image")
-			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectimage))
-			_, err = utils.Run(cmd)
-			ExpectWithOffset(1, err).NotTo(HaveOccurred())
-
-			By("loading the the manager(Operator) image on Kind")
-			err = utils.LoadImageToKindClusterWithName(projectimage)
-			ExpectWithOffset(1, err).NotTo(HaveOccurred())
-
-			By("installing CRDs")
-			cmd = exec.Command("make", "install")
-			_, err = utils.Run(cmd)
-			ExpectWithOffset(1, err).NotTo(HaveOccurred())
-
-			By("deploying the controller-manager")
-			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectimage))
-			_, err = utils.Run(cmd)
-			ExpectWithOffset(1, err).NotTo(HaveOccurred())
-
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func() error {
-				// Get pod name
-
-				cmd = exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
-
-				podOutput, err := utils.Run(cmd)
-				ExpectWithOffset(2, err).NotTo(HaveOccurred())
-				podNames := utils.GetNonEmptyLines(string(podOutput))
-				if len(podNames) != 1 {
-					return fmt.Errorf("expect 1 controller pods running, but got %d", len(podNames))
-				}
-				controllerPodName = podNames[0]
-				ExpectWithOffset(2, controllerPodName).Should(ContainSubstring("controller-manager"))
-
-				// Validate pod status
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				status, err := utils.Run(cmd)
-				ExpectWithOffset(2, err).NotTo(HaveOccurred())
-				if string(status) != "Running" {
-					return fmt.Errorf("controller pod in %s status", status)
-				}
-				return nil
+	Context("ReleaseManifest reconciliation", func() {
+		It("should create a ClusterConfig CR", func() {
+			By("applying a minimal ClusterConfig")
+			_, err := kubectl("apply", "-f", "-", "--stdin")
+			if err != nil {
+				_, err = kubectl("apply", "-f", "config/samples/k4all_v1alpha1_clusterconfig.yaml")
 			}
-			EventuallyWithOffset(1, verifyControllerUp, time.Minute, time.Second).Should(Succeed())
+			Expect(err).NotTo(HaveOccurred())
+		})
 
+		It("should create a ReleaseManifest CR", func() {
+			By("applying a minimal ReleaseManifest for testing")
+			_, err := kubectl("apply", "-f", "config/samples/k4all_v1alpha1_releasemanifest.yaml")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should reconcile the ReleaseManifest and report component status", func() {
+			Eventually(func() string {
+				out, _ := kubectl("get", "releasemanifest", "k4all",
+					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+				return out
+			}, testTimeout, pollInterval).ShouldNot(BeEmpty())
+		})
+	})
+
+	Context("Component verification", func() {
+		It("should report component statuses", func() {
+			out, err := kubectl("get", "releasemanifest", "k4all",
+				"-o", "jsonpath={.status.components}")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).NotTo(BeEmpty())
+			fmt.Fprintf(GinkgoWriter, "Component statuses: %s\n", out)
 		})
 	})
 })

@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.16.1
+    controller-gen.kubebuilder.io/version: v0.18.0
   name: clusterconfigs.k4all.magesgate.com
 spec:
   group: k4all.magesgate.com
@@ -12,12 +12,27 @@ spec:
     listKind: ClusterConfigList
     plural: clusterconfigs
     singular: clusterconfig
-  scope: Namespaced
+  scope: Cluster
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.networking.cni.type
+      name: CNI
+      type: string
+    - jsonPath: .spec.features.virt.enabled
+      name: Virt
+      type: boolean
+    - jsonPath: .spec.features.argocd.enabled
+      name: ArgoCD
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: ClusterConfig is the Schema for the clusterconfigs API
+        description: |-
+          ClusterConfig is the Schema for the clusterconfigs API.
+          It defines user intent for which components and features to enable.
         properties:
           apiVersion:
             description: |-
@@ -37,147 +52,262 @@ spec:
           metadata:
             type: object
           spec:
-            description: ClusterConfigSpec defines the desired state of ClusterConfig
+            description: ClusterConfigSpec defines the desired state of the k4all
+              cluster
             properties:
               cluster:
-                description: Cluster configuration
+                description: Control plane / HA configuration
                 properties:
                   apiEndPointUseHostName:
-                    description: ApiEndPointUseHostName indicates if the API endpoint
-                      should use the hostname
-                    type: string
+                    description: Use hostname as API endpoint instead of IP
+                    type: boolean
                   customApiEndPoint:
-                    description: CustomApiEndPoint is a custom hostname for the control
-                      plane
+                    description: Custom hostname for the control plane API endpoint
                     type: string
                   ha:
                     description: HA configuration
                     properties:
                       apiControlEndpoint:
-                        description: Control plane endpoint for the API server (ignored
-                          in "none" mode)
+                        description: Virtual IP address for the control plane
                         type: string
                       apiControlEndpointSubnetSize:
-                        description: Control plane endpoint subnet size for the API
-                          server (ignored in "none" mode)
+                        description: Subnet size for the virtual IP (e.g. "24")
                         type: string
                       interface:
-                        description: Interface to use for the virtual IP
+                        description: Network interface for the virtual IP
                         type: string
                       type:
-                        description: Type of HA (none, keepalived, kubevip)
+                        default: none
+                        enum:
+                        - none
+                        - keepalived
+                        - kubevip
                         type: string
-                    required:
-                    - interface
-                    - type
                     type: object
-                required:
-                - apiEndPointUseHostName
-                - ha
+                  podNetwork:
+                    description: 'Pod network CIDR (default: "10.100.0.1/18")'
+                    type: string
+                  serviceNetwork:
+                    description: 'Service network CIDR (default: "10.96.0.0/16")'
+                    type: string
+                type: object
+              componentOverrides:
+                additionalProperties:
+                  description: ComponentOverride allows per-component value overrides
+                    in ClusterConfig
+                  properties:
+                    helmArgs:
+                      description: Extra Helm arguments to append
+                      items:
+                        type: string
+                      type: array
+                    values:
+                      description: Inline Helm values to merge on top of ReleaseManifest
+                        values
+                      x-kubernetes-preserve-unknown-fields: true
+                  type: object
+                description: |-
+                  Per-component value overrides (component name -> Helm values or custom config).
+                  These override values from ReleaseManifest for the named component.
                 type: object
               features:
-                description: Features configuration
+                description: Features to enable
                 properties:
                   argocd:
-                    description: ArgoCD configuration
+                    description: ArgoCD GitOps feature
                     properties:
                       enabled:
-                        description: Enabled indicates if ArgoCD is enabled
                         type: boolean
-                      managed:
-                        description: Managed indicates if ArgoCD is managed by the
-                          operator
+                    type: object
+                  ovsCni:
+                    description: OVS networking with Multus + OVS-CNI
+                    properties:
+                      enabled:
                         type: boolean
-                    required:
-                    - enabled
                     type: object
                   virt:
-                    description: Virt configuration
+                    description: Virtualization feature (KubeVirt + CDI + kubevirt-manager)
                     properties:
                       emulation:
-                        description: Emulation indicates if emulation is enabled (true,
-                          false, or auto)
+                        default: auto
+                        description: 'Emulation mode: "true", "false", or "auto" (detect
+                          /dev/kvm)'
+                        enum:
+                        - "true"
+                        - "false"
+                        - auto
                         type: string
                       enabled:
-                        description: Enabled indicates if virtualization is enabled
                         type: boolean
-                      managed:
-                        description: Managed indicates if virtualization is managed
-                          by the operator
-                        type: boolean
-                    required:
-                    - emulation
-                    - enabled
                     type: object
-                required:
-                - argocd
-                - virt
+                type: object
+              ingress:
+                description: Ingress controller configuration
+                properties:
+                  cilium:
+                    description: CiliumIngressConfig configures the Cilium ingress.
+                    properties:
+                      dedicatedIP:
+                        description: Dedicated LoadBalancer IP for Cilium ingress
+                        type: string
+                    type: object
+                  nginx:
+                    description: NginxIngressConfig configures the NGINX ingress controller.
+                    properties:
+                      dedicatedIP:
+                        description: Dedicated LoadBalancer IP; leave empty to use
+                          the node IP directly
+                        type: string
+                      isDefault:
+                        description: Whether NGINX should be the default IngressClass
+                        type: boolean
+                    type: object
                 type: object
               networking:
                 description: Networking configuration
                 properties:
                   cni:
-                    description: CNI configuration
+                    description: CNI plugin selection
                     properties:
                       type:
-                        description: Type of CNI (calico, cilium)
+                        enum:
+                        - calico
+                        - cilium
                         type: string
                     required:
                     - type
                     type: object
                   firewalld:
-                    description: Firewalld configuration
+                    description: Firewalld settings
                     properties:
                       enabled:
-                        description: Enabled indicates if firewalld is enabled
-                        type: string
-                    required:
-                    - enabled
+                        type: boolean
                     type: object
                   iface:
-                    description: Interface configuration
+                    description: Default network interface for the cluster
                     properties:
                       dev:
-                        description: Device name (eth card)
+                        description: Physical network device name
                         type: string
                       dns:
-                        description: DNS servers (comma-separated list)
                         type: string
-                      dns_search:
-                        description: DNS search domains (comma-separated list)
+                      dnsSearch:
                         type: string
                       gateway:
-                        description: Gateway (required for static IP)
                         type: string
-                      ipaddr:
-                        description: IP address (required for static IP)
+                      ipAddr:
                         type: string
-                      ipconfig:
-                        description: IP configuration (dhcp or static)
+                      ipConfig:
+                        description: IP configuration type
+                        enum:
+                        - static
+                        - dhcp
                         type: string
-                      subnet_mask:
-                        description: Subnet mask (required for static IP)
+                      subnetMask:
                         type: string
-                    required:
-                    - dev
-                    - ipconfig
                     type: object
                 required:
                 - cni
-                - firewalld
-                - iface
                 type: object
-              version:
-                description: Version of the configuration
-                type: string
+              proxy:
+                description: |-
+                  Proxy configuration for cluster-wide HTTP(S) proxy settings.
+                  Pre-boot scripts read these before the cluster starts; the operator
+                  also exposes them for in-cluster components that need proxy awareness.
+                properties:
+                  httpProxy:
+                    type: string
+                  httpsProxy:
+                    type: string
+                  noProxy:
+                    type: string
+                type: object
             required:
             - cluster
             - features
             - networking
-            - version
             type: object
           status:
-            description: ClusterConfigStatus defines the observed state of ClusterConfig
+            description: ClusterConfigStatus reflects the observed cluster state
+            properties:
+              activeCNI:
+                description: Currently active CNI
+                type: string
+              conditions:
+                description: Standard conditions (Reconciled, Degraded)
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              features:
+                description: Per-feature observed state
+                properties:
+                  argocdReady:
+                    type: boolean
+                  ovsCniReady:
+                    type: boolean
+                  virtReady:
+                    type: boolean
+                type: object
+              lastReconcileTime:
+                description: Last time the config was reconciled
+                format: date-time
+                type: string
+              observedGeneration:
+                description: Most recently processed generation of the spec
+                format: int64
+                type: integer
             type: object
         type: object
     served: true

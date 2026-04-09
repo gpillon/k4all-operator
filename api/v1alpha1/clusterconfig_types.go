@@ -17,116 +17,197 @@ limitations under the License.
 package v1alpha1
 
 import (
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ClusterConfigSpec defines the desired state of ClusterConfig
+// ClusterConfigSpec defines the desired state of the k4all cluster
 type ClusterConfigSpec struct {
-	// Version of the configuration
-	Version string `json:"version"`
 	// Networking configuration
 	Networking NetworkingConfig `json:"networking"`
-	// Features configuration
+	// Features to enable
 	Features FeaturesConfig `json:"features"`
-	// Cluster configuration
+	// Control plane / HA configuration
 	Cluster ControlPlaneConfig `json:"cluster"`
+	// Ingress controller configuration
+	// +optional
+	Ingress IngressConfig `json:"ingress,omitempty"`
+	// Proxy configuration for cluster-wide HTTP(S) proxy settings.
+	// Pre-boot scripts read these before the cluster starts; the operator
+	// also exposes them for in-cluster components that need proxy awareness.
+	// +optional
+	Proxy *ProxyConfig `json:"proxy,omitempty"`
+	// Per-component value overrides (component name -> Helm values or custom config).
+	// These override values from ReleaseManifest for the named component.
+	// +optional
+	ComponentOverrides map[string]ComponentOverride `json:"componentOverrides,omitempty"`
 }
 
-// NetworkingConfig defines the networking configuration
+// IngressConfig defines the desired ingress controller settings.
+type IngressConfig struct {
+	// +optional
+	Nginx NginxIngressConfig `json:"nginx,omitempty"`
+	// +optional
+	Cilium CiliumIngressConfig `json:"cilium,omitempty"`
+}
+
+// NginxIngressConfig configures the NGINX ingress controller.
+type NginxIngressConfig struct {
+	// Dedicated LoadBalancer IP; leave empty to use the node IP directly
+	// +optional
+	DedicatedIP string `json:"dedicatedIP,omitempty"`
+	// Whether NGINX should be the default IngressClass
+	// +optional
+	IsDefault bool `json:"isDefault,omitempty"`
+}
+
+// CiliumIngressConfig configures the Cilium ingress.
+type CiliumIngressConfig struct {
+	// Dedicated LoadBalancer IP for Cilium ingress
+	// +optional
+	DedicatedIP string `json:"dedicatedIP,omitempty"`
+}
+
+// ProxyConfig holds cluster-wide HTTP(S) proxy settings.
+type ProxyConfig struct {
+	// +optional
+	HTTPProxy string `json:"httpProxy,omitempty"`
+	// +optional
+	HTTPSProxy string `json:"httpsProxy,omitempty"`
+	// +optional
+	NoProxy string `json:"noProxy,omitempty"`
+}
+
+// ComponentOverride allows per-component value overrides in ClusterConfig
+type ComponentOverride struct {
+	// Inline Helm values to merge on top of ReleaseManifest values
+	// +optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	Values *apiextensionsv1.JSON `json:"values,omitempty"`
+	// Extra Helm arguments to append
+	// +optional
+	HelmArgs []string `json:"helmArgs,omitempty"`
+}
+
 type NetworkingConfig struct {
-	// CNI configuration
+	// CNI plugin selection
 	CNI CNIConfig `json:"cni"`
-	// Firewalld configuration
-	Firewalld FirewalldConfig `json:"firewalld"`
-	// Interface configuration
-	Interface InterfaceConfig `json:"iface"`
+	// Firewalld settings
+	// +optional
+	Firewalld FirewalldConfig `json:"firewalld,omitempty"`
+	// Default network interface for the cluster
+	// +optional
+	Interface InterfaceConfig `json:"iface,omitempty"`
 }
 
-// CNIConfig defines the CNI configuration
 type CNIConfig struct {
-	// Type of CNI (calico, cilium)
+	// +kubebuilder:validation:Enum=calico;cilium
 	Type string `json:"type"`
 }
 
-// FirewalldConfig defines the Firewalld configuration
 type FirewalldConfig struct {
-	// Enabled indicates if firewalld is enabled
-	Enabled string `json:"enabled"`
+	Enabled bool `json:"enabled,omitempty"`
 }
 
-// InterfaceConfig defines the interface configuration
-type InterfaceConfig struct {
-	// Device name (eth card)
-	Dev string `json:"dev"`
-	// IP configuration (dhcp or static)
-	IpConfig string `json:"ipconfig"`
-	// IP address (required for static IP)
-	IpAddr string `json:"ipaddr,omitempty"`
-	// Gateway (required for static IP)
-	Gateway string `json:"gateway,omitempty"`
-	// Subnet mask (required for static IP)
-	SubnetMask string `json:"subnet_mask,omitempty"`
-	// DNS servers (comma-separated list)
-	DNS string `json:"dns,omitempty"`
-	// DNS search domains (comma-separated list)
-	DNSSearch string `json:"dns_search,omitempty"`
-}
-
-// FeaturesConfig defines the features configuration
 type FeaturesConfig struct {
-	// Virt configuration
-	Virt VirtConfig `json:"virt"`
-	// ArgoCD configuration
-	ArgoCD ArgoCDConfig `json:"argocd"`
+	// Virtualization feature (KubeVirt + CDI + kubevirt-manager)
+	// +optional
+	Virt VirtConfig `json:"virt,omitempty"`
+	// ArgoCD GitOps feature
+	// +optional
+	ArgoCD ArgoCDConfig `json:"argocd,omitempty"`
+	// OVS networking with Multus + OVS-CNI
+	// +optional
+	OVSCNI OVSCNIConfig `json:"ovsCni,omitempty"`
 }
 
 type VirtConfig struct {
-	// Enabled indicates if virtualization is enabled
-	Enabled bool `json:"enabled"` // Changed to bool
-	// Managed indicates if virtualization is managed by the operator
-	Managed bool `json:"managed,omitempty"`
-	// Emulation indicates if emulation is enabled (true, false, or auto)
-	Emulation string `json:"emulation"`
+	Enabled bool `json:"enabled,omitempty"`
+	// Emulation mode: "true", "false", or "auto" (detect /dev/kvm)
+	// +kubebuilder:validation:Enum="true";"false";auto
+	// +kubebuilder:default="auto"
+	Emulation string `json:"emulation,omitempty"`
 }
 
 type ArgoCDConfig struct {
-	// Enabled indicates if ArgoCD is enabled
-	Enabled bool `json:"enabled"` // Changed to bool
-	// Managed indicates if ArgoCD is managed by the operator
-	Managed bool `json:"managed,omitempty"`
+	Enabled bool `json:"enabled,omitempty"`
 }
 
-// ControlPlaneConfig defines the cluster configuration
+type OVSCNIConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+}
+
 type ControlPlaneConfig struct {
-	// ApiEndPointUseHostName indicates if the API endpoint should use the hostname
-	ApiEndPointUseHostName string `json:"apiEndPointUseHostName"`
-	// CustomApiEndPoint is a custom hostname for the control plane
+	// Use hostname as API endpoint instead of IP
+	ApiEndPointUseHostName bool `json:"apiEndPointUseHostName,omitempty"`
+	// Custom hostname for the control plane API endpoint
+	// +optional
 	CustomApiEndPoint string `json:"customApiEndPoint,omitempty"`
 	// HA configuration
-	HA HAConfig `json:"ha"`
+	// +optional
+	HA HAConfig `json:"ha,omitempty"`
+	// Pod network CIDR (default: "10.100.0.1/18")
+	// +optional
+	PodNetwork string `json:"podNetwork,omitempty"`
+	// Service network CIDR (default: "10.96.0.0/16")
+	// +optional
+	ServiceNetwork string `json:"serviceNetwork,omitempty"`
 }
 
-// HAConfig defines the HA configuration
 type HAConfig struct {
-	// Interface to use for the virtual IP
-	Interface string `json:"interface"`
-	// Type of HA (none, keepalived, kubevip)
-	Type string `json:"type"`
-	// Control plane endpoint for the API server (ignored in "none" mode)
+	// Network interface for the virtual IP
+	// +optional
+	Interface string `json:"interface,omitempty"`
+	// +kubebuilder:validation:Enum=none;keepalived;kubevip
+	// +kubebuilder:default=none
+	Type string `json:"type,omitempty"`
+	// Virtual IP address for the control plane
+	// +optional
 	ApiControlEndpoint string `json:"apiControlEndpoint,omitempty"`
-	// Control plane endpoint subnet size for the API server (ignored in "none" mode)
+	// Subnet size for the virtual IP (e.g. "24")
+	// +optional
 	ApiControlEndpointSubnetSize string `json:"apiControlEndpointSubnetSize,omitempty"`
 }
 
-// ClusterConfigStatus defines the observed state of ClusterConfig
+// ClusterConfigStatus reflects the observed cluster state
 type ClusterConfigStatus struct {
-	// +operator-sdk:csv:customresourcedefinitions:type=status
+	// Standard conditions (Reconciled, Degraded)
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// Most recently processed generation of the spec
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// Currently active CNI
+	// +optional
+	ActiveCNI string `json:"activeCNI,omitempty"`
+	// Per-feature observed state
+	// +optional
+	Features FeaturesStatus `json:"features,omitempty"`
+	// Last time the config was reconciled
+	// +optional
+	LastReconcileTime metav1.Time `json:"lastReconcileTime,omitempty"`
 }
 
-//+kubebuilder:object:root=true
-//+kubebuilder:subresource:status
+// FeaturesStatus reports the observed state of each feature toggle.
+type FeaturesStatus struct {
+	// +optional
+	VirtReady bool `json:"virtReady,omitempty"`
+	// +optional
+	ArgoCDReady bool `json:"argocdReady,omitempty"`
+	// +optional
+	OVSCNIReady bool `json:"ovsCniReady,omitempty"`
+}
 
-// ClusterConfig is the Schema for the clusterconfigs API
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:printcolumn:name="CNI",type="string",JSONPath=".spec.networking.cni.type"
+// +kubebuilder:printcolumn:name="Virt",type="boolean",JSONPath=".spec.features.virt.enabled"
+// +kubebuilder:printcolumn:name="ArgoCD",type="boolean",JSONPath=".spec.features.argocd.enabled"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+
+// ClusterConfig is the Schema for the clusterconfigs API.
+// It defines user intent for which components and features to enable.
 type ClusterConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -135,7 +216,7 @@ type ClusterConfig struct {
 	Status ClusterConfigStatus `json:"status,omitempty"`
 }
 
-//+kubebuilder:object:root=true
+// +kubebuilder:object:root=true
 
 // ClusterConfigList contains a list of ClusterConfig
 type ClusterConfigList struct {

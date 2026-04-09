@@ -13,11 +13,27 @@ repo: github.com/gpillon/k4all-operator
 resources:
 - api:
     crdVersion: v1
-    namespaced: true
   controller: true
   domain: magesgate.com
   group: k4all
   kind: ClusterConfig
+  path: github.com/gpillon/k4all-operator/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: magesgate.com
+  group: k4all
+  kind: NodeConfig
+  path: github.com/gpillon/k4all-operator/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+  controller: true
+  domain: magesgate.com
+  group: k4all
+  kind: ReleaseManifest
   path: github.com/gpillon/k4all-operator/api/v1alpha1
   version: v1alpha1
 version: "3"

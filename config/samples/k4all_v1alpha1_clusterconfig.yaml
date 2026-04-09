@@ -1,9 +1,34 @@
 apiVersion: k4all.magesgate.com/v1alpha1
 kind: ClusterConfig
 metadata:
-  labels:
-    app.kubernetes.io/name: k4all-operator
-    app.kubernetes.io/managed-by: kustomize
   name: k4all-cluster-config
-  namespace: k4all-operator-system
 spec:
+  networking:
+    cni:
+      type: calico
+    firewalld:
+      enabled: false
+    iface:
+      dev: auto
+      ipConfig: dhcp
+  features:
+    virt:
+      enabled: false
+      emulation: auto
+    argocd:
+      enabled: false
+    ovsCni:
+      enabled: false
+  cluster:
+    apiEndPointUseHostName: false
+    podNetwork: "10.100.0.1/18"
+    serviceNetwork: "10.96.0.0/16"
+    ha:
+      type: none
+  ingress:
+    nginx:
+      isDefault: true
+  proxy:
+    httpProxy: ""
+    httpsProxy: ""
+    noProxy: ""

@@ -1,0 +1,1207 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+    control-plane: controller-manager
+  name: k4all-operator-system
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: clusterconfigs.k4all.magesgate.com
+spec:
+  group: k4all.magesgate.com
+  names:
+    kind: ClusterConfig
+    listKind: ClusterConfigList
+    plural: clusterconfigs
+    singular: clusterconfig
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.networking.cni.type
+      name: CNI
+      type: string
+    - jsonPath: .spec.features.virt.enabled
+      name: Virt
+      type: boolean
+    - jsonPath: .spec.features.argocd.enabled
+      name: ArgoCD
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClusterConfig is the Schema for the clusterconfigs API.
+          It defines user intent for which components and features to enable.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClusterConfigSpec defines the desired state of the k4all
+              cluster
+            properties:
+              cluster:
+                description: Control plane / HA configuration
+                properties:
+                  apiEndPointUseHostName:
+                    description: Use hostname as API endpoint instead of IP
+                    type: boolean
+                  customApiEndPoint:
+                    description: Custom hostname for the control plane API endpoint
+                    type: string
+                  ha:
+                    description: HA configuration
+                    properties:
+                      apiControlEndpoint:
+                        description: Virtual IP address for the control plane
+                        type: string
+                      apiControlEndpointSubnetSize:
+                        description: Subnet size for the virtual IP (e.g. "24")
+                        type: string
+                      interface:
+                        description: Network interface for the virtual IP
+                        type: string
+                      type:
+                        default: none
+                        enum:
+                        - none
+                        - keepalived
+                        - kubevip
+                        type: string
+                    type: object
+                type: object
+              componentOverrides:
+                additionalProperties:
+                  description: ComponentOverride allows per-component value overrides
+                    in ClusterConfig
+                  properties:
+                    helmArgs:
+                      description: Extra Helm arguments to append
+                      items:
+                        type: string
+                      type: array
+                    values:
+                      description: Inline Helm values to merge on top of ReleaseManifest
+                        values
+                      x-kubernetes-preserve-unknown-fields: true
+                  type: object
+                description: |-
+                  Per-component value overrides (component name -> Helm values or custom config).
+                  These override values from ReleaseManifest for the named component.
+                type: object
+              features:
+                description: Features to enable
+                properties:
+                  argocd:
+                    description: ArgoCD GitOps feature
+                    properties:
+                      enabled:
+                        type: boolean
+                    type: object
+                  ovsCni:
+                    description: OVS networking with Multus + OVS-CNI
+                    properties:
+                      enabled:
+                        type: boolean
+                    type: object
+                  virt:
+                    description: Virtualization feature (KubeVirt + CDI + kubevirt-manager)
+                    properties:
+                      emulation:
+                        default: auto
+                        description: 'Emulation mode: "true", "false", or "auto" (detect
+                          /dev/kvm)'
+                        enum:
+                        - "true"
+                        - "false"
+                        - auto
+                        type: string
+                      enabled:
+                        type: boolean
+                    type: object
+                type: object
+              networking:
+                description: Networking configuration
+                properties:
+                  cni:
+                    description: CNI plugin selection
+                    properties:
+                      type:
+                        enum:
+                        - calico
+                        - cilium
+                        type: string
+                    required:
+                    - type
+                    type: object
+                  firewalld:
+                    description: Firewalld settings
+                    properties:
+                      enabled:
+                        type: boolean
+                    type: object
+                  iface:
+                    description: Default network interface for the cluster
+                    properties:
+                      dev:
+                        description: Physical network device name
+                        type: string
+                      dns:
+                        type: string
+                      dnsSearch:
+                        type: string
+                      gateway:
+                        type: string
+                      ipAddr:
+                        type: string
+                      ipConfig:
+                        description: IP configuration type
+                        enum:
+                        - static
+                        - dhcp
+                        type: string
+                      subnetMask:
+                        type: string
+                    type: object
+                required:
+                - cni
+                type: object
+            required:
+            - cluster
+            - features
+            - networking
+            type: object
+          status:
+            description: ClusterConfigStatus reflects the observed cluster state
+            properties:
+              activeCNI:
+                description: Currently active CNI
+                type: string
+              conditions:
+                description: Standard conditions (Reconciled, Degraded)
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              features:
+                description: Per-feature observed state
+                properties:
+                  argocdReady:
+                    type: boolean
+                  ovsCniReady:
+                    type: boolean
+                  virtReady:
+                    type: boolean
+                type: object
+              lastReconcileTime:
+                description: Last time the config was reconciled
+                format: date-time
+                type: string
+              observedGeneration:
+                description: Most recently processed generation of the spec
+                format: int64
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: nodeconfigs.k4all.magesgate.com
+spec:
+  group: k4all.magesgate.com
+  names:
+    kind: NodeConfig
+    listKind: NodeConfigList
+    plural: nodeconfigs
+    singular: nodeconfig
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.nodeName
+      name: Node
+      type: string
+    - jsonPath: .status.networkInterface.state
+      name: State
+      type: string
+    - jsonPath: .status.nodeType
+      name: Type
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NodeConfig is the Schema for the nodeconfigs API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: NodeConfigSpec defines per-node desired state
+            properties:
+              interface:
+                description: Network interface configuration for this node
+                properties:
+                  dev:
+                    description: Physical network device name
+                    type: string
+                  dns:
+                    type: string
+                  dnsSearch:
+                    type: string
+                  gateway:
+                    type: string
+                  ipAddr:
+                    type: string
+                  ipConfig:
+                    description: IP configuration type
+                    enum:
+                    - static
+                    - dhcp
+                    type: string
+                  subnetMask:
+                    type: string
+                type: object
+            type: object
+          status:
+            description: NodeConfigStatus reflects observed node state
+            properties:
+              availableInterfaces:
+                description: Interfaces discovered on the node
+                items:
+                  properties:
+                    mac:
+                      type: string
+                    name:
+                      type: string
+                  required:
+                  - mac
+                  - name
+                  type: object
+                type: array
+              networkInterface:
+                description: Current network interface status
+                properties:
+                  lastUpdateTime:
+                    format: date-time
+                    type: string
+                  message:
+                    type: string
+                  phase:
+                    type: string
+                  state:
+                    enum:
+                    - Configuring
+                    - Ready
+                    - Error
+                    type: string
+                type: object
+              nodeName:
+                description: Kubernetes node name
+                type: string
+              nodeType:
+                description: Node role (bootstrap, control, worker)
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: releasemanifests.k4all.magesgate.com
+spec:
+  group: k4all.magesgate.com
+  names:
+    kind: ReleaseManifest
+    listKind: ReleaseManifestList
+    plural: releasemanifests
+    singular: releasemanifest
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=='Ready')].message
+      name: Components
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ReleaseManifest is the Schema for the releasemanifests API.
+          It defines all components and their versions for a k4all cluster.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ReleaseManifestSpec mirrors the k4all-release.yaml structure
+            properties:
+              components:
+                additionalProperties:
+                  properties:
+                    chart:
+                      description: Helm chart name
+                      type: string
+                    custom:
+                      additionalProperties:
+                        type: string
+                      description: User-customizable key-value pairs preserved across
+                        upgrades
+                      type: object
+                    dependsOn:
+                      description: Components that must be installed before this one
+                      items:
+                        type: string
+                      type: array
+                    featureGate:
+                      description: If set, this component is only installed when the
+                        named feature is enabled in ClusterConfig
+                      type: string
+                    helmArgs:
+                      description: Extra Helm CLI-style arguments (e.g. "--set installCRDs=true")
+                      items:
+                        type: string
+                      type: array
+                    image:
+                      description: Container image reference (for static-pod type,
+                        supports {{ version }})
+                      type: string
+                    installPath:
+                      description: Host filesystem path for binary installation
+                      type: string
+                    management:
+                      default: Managed
+                      description: 'Lifecycle management policy: Managed (default),
+                        Removed, or Unmanaged'
+                      enum:
+                      - Managed
+                      - Removed
+                      - Unmanaged
+                      type: string
+                    namespace:
+                      description: Target namespace for the component
+                      type: string
+                    patches:
+                      description: Post-install patches to apply to cluster resources
+                      items:
+                        properties:
+                          patch:
+                            description: Raw patch content (JSON or YAML)
+                            type: string
+                          target:
+                            description: Target resource to patch
+                            properties:
+                              apiVersion:
+                                description: API version of the target resource
+                                type: string
+                              kind:
+                                description: Kind of the target resource
+                                type: string
+                              name:
+                                description: Name of the target resource
+                                type: string
+                              namespace:
+                                description: Namespace of the target resource; empty
+                                  for cluster-scoped
+                                type: string
+                            required:
+                            - kind
+                            - name
+                            type: object
+                          type:
+                            description: Patch strategy
+                            enum:
+                            - merge
+                            - strategic
+                            - json
+                            type: string
+                        required:
+                        - patch
+                        - target
+                        - type
+                        type: object
+                      type: array
+                    repo:
+                      description: Helm repository URL (for type helm) or OCI reference
+                        (for type helm-oci)
+                      type: string
+                    source:
+                      description: Single manifest URL (supports {{ version }} and
+                        {{ arch }} templates)
+                      type: string
+                    sources:
+                      description: Multiple manifest URLs, applied in order
+                      items:
+                        type: string
+                      type: array
+                    type:
+                      description: Type of component installation strategy
+                      enum:
+                      - helm
+                      - helm-oci
+                      - manifest
+                      - binary
+                      - static-pod
+                      type: string
+                    values:
+                      description: Inline Helm values (arbitrary YAML)
+                      x-kubernetes-preserve-unknown-fields: true
+                    valuesFrom:
+                      description: References to ConfigMaps containing Helm values
+                      items:
+                        properties:
+                          kind:
+                            description: Kind of the reference (ConfigMap or Secret)
+                            enum:
+                            - ConfigMap
+                            - Secret
+                            type: string
+                          name:
+                            description: Name of the ConfigMap or Secret
+                            type: string
+                          namespace:
+                            description: Namespace of the ConfigMap or Secret; defaults
+                              to the release namespace
+                            type: string
+                          valuesKey:
+                            description: Key in the ConfigMap/Secret data; defaults
+                              to "values.yaml"
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        type: object
+                      type: array
+                    version:
+                      description: Desired version; "latest" triggers resolution via
+                        VersionURL
+                      type: string
+                    versionUrl:
+                      description: URL to fetch the latest version string (for "latest"
+                        resolution)
+                      type: string
+                  required:
+                  - type
+                  - version
+                  type: object
+                description: Components to install, keyed by component name
+                type: object
+              osImage:
+                description: OS image specification
+                properties:
+                  imageTag:
+                    type: string
+                  name:
+                    type: string
+                  repository:
+                    type: string
+                type: object
+            required:
+            - components
+            type: object
+          status:
+            description: ReleaseManifestStatus tracks per-component installation state
+            properties:
+              components:
+                additionalProperties:
+                  properties:
+                    installedVersion:
+                      description: Currently installed version
+                      type: string
+                    lastTransitionTime:
+                      description: Last time the state transitioned
+                      format: date-time
+                      type: string
+                    message:
+                      description: Human-readable message
+                      type: string
+                    state:
+                      description: Current state of the component
+                      type: string
+                  type: object
+                description: Per-component installation status
+                type: object
+              conditions:
+                description: Standard conditions
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              resolvedOSImageTag:
+                description: Resolved OS image tag (stamped by CI)
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+  name: k4all-operator-controller-manager
+  namespace: k4all-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+  name: k4all-operator-leader-election-role
+  namespace: k4all-operator-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+  name: k4all-operator-clusterconfig-editor-role
+rules:
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+  name: k4all-operator-clusterconfig-viewer-role
+rules:
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k4all-operator-k4all-operator-cluster-role
+rules:
+- apiGroups:
+  - '*'
+  resources:
+  - '*'
+  verbs:
+  - '*'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k4all-operator-manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - pods
+  - secrets
+  - serviceaccounts
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - mutatingwebhookconfigurations
+  - validatingwebhookconfigurations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  - deployments
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - clusterconfigs/status
+  - nodeconfigs/status
+  - releasemanifests/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - nodeconfigs
+  - releasemanifests
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - releasemanifests/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingressclasses
+  - ingresses
+  - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterrolebindings
+  - clusterroles
+  - rolebindings
+  - roles
+  verbs:
+  - bind
+  - create
+  - delete
+  - escalate
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - csidrivers
+  - storageclasses
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k4all-operator-metrics-auth-role
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k4all-operator-metrics-reader
+rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+  name: k4all-operator-nodeconfig-editor-role
+rules:
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - nodeconfigs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - nodeconfigs/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+  name: k4all-operator-nodeconfig-viewer-role
+rules:
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - nodeconfigs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - k4all.magesgate.com
+  resources:
+  - nodeconfigs/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+  name: k4all-operator-leader-election-rolebinding
+  namespace: k4all-operator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k4all-operator-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: k4all-operator-controller-manager
+  namespace: k4all-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k4all-operator-k4all-operator-cluster-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k4all-operator-k4all-operator-cluster-role
+subjects:
+- kind: ServiceAccount
+  name: k4all-operator-controller-manager
+  namespace: k4all-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+  name: k4all-operator-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k4all-operator-manager-role
+subjects:
+- kind: ServiceAccount
+  name: k4all-operator-controller-manager
+  namespace: k4all-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k4all-operator-metrics-auth-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k4all-operator-metrics-auth-role
+subjects:
+- kind: ServiceAccount
+  name: k4all-operator-controller-manager
+  namespace: k4all-operator-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+    control-plane: controller-manager
+  name: k4all-operator-controller-manager-metrics-service
+  namespace: k4all-operator-system
+spec:
+  ports:
+  - name: https
+    port: 8443
+    protocol: TCP
+    targetPort: 8443
+  selector:
+    control-plane: controller-manager
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: k4all-operator
+    control-plane: controller-manager
+  name: k4all-operator-controller-manager
+  namespace: k4all-operator-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        control-plane: controller-manager
+    spec:
+      containers:
+      - args:
+        - --metrics-bind-address=:8443
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        command:
+        - /manager
+        image: localhost/k4all-operator:latest
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        name: manager
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      securityContext:
+        runAsNonRoot: true
+      serviceAccountName: k4all-operator-controller-manager
+      terminationGracePeriodSeconds: 10

@@ -1,0 +1,11 @@
+apiVersion: k4all.magesgate.com/v1alpha1
+kind: NodeConfig
+metadata:
+  name: nodeconfig-sample
+  labels:
+    app.kubernetes.io/name: k4all-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  interface:
+    dev: eth0
+    ipConfig: dhcp

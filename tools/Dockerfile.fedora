@@ -4,6 +4,14 @@ LABEL org.opencontainers.image.source = "https://github.com/gpillon/k4all-operat
 
 ENV VERIFY_CHECKSUM=false
 
+# istall kubectl; add repo and install
+RUN echo "[kubernetes]" > /etc/yum.repos.d/kubernetes.repo && \
+    echo "name=Kubernetes" >> /etc/yum.repos.d/kubernetes.repo && \
+    echo "baseurl=https://pkgs.k8s.io/core/stable/v1.32/rpm/" >> /etc/yum.repos.d/kubernetes.repo && \
+    echo "enabled=1" >> /etc/yum.repos.d/kubernetes.repo && \
+    echo "gpgcheck=1" >> /etc/yum.repos.d/kubernetes.repo && \
+    echo "gpgkey=https://pkgs.k8s.io/core/stable/v1.32/rpm/repodata/repomd.xml.key" >> /etc/yum.repos.d/kubernetes.repo
+
 # Install required tools
 RUN dnf update -y && \
     dnf install -y \
@@ -11,6 +19,7 @@ RUN dnf update -y && \
     bash \
     git \
     jq \
+    bc \
     tar \
     gzip \
     util-linux \
@@ -19,17 +28,9 @@ RUN dnf update -y && \
     iproute \
     coreutils \
     grep \
+    kubectl \
     which && \
     dnf clean all
-
-# istall kubectl; add repo and install
-RUN echo "[kubernetes]" > /etc/yum.repos.d/kubernetes.repo && \
-    echo "name=Kubernetes" >> /etc/yum.repos.d/kubernetes.repo && \
-    echo "baseurl=https://pkgs.k8s.io/core/stable/v1.32/rpm/" >> /etc/yum.repos.d/kubernetes.repo && \
-    echo "enabled=1" >> /etc/yum.repos.d/kubernetes.repo && \
-    echo "gpgcheck=1" >> /etc/yum.repos.d/kubernetes.repo && \
-    echo "gpgkey=https://pkgs.k8s.io/core/stable/v1.32/rpm/repodata/repomd.xml.key" >> /etc/yum.repos.d/kubernetes.repo && \
-    dnf install -y kubectl
 
 # Install Helm
 RUN curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 && \

@@ -1,9 +1,8 @@
-resources:
-- manager.yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+resources:
+- manager.yaml
 images:
-- newTag: v0.0.1
 - name: controller
-  newName: ghcr.io/gpillon/k4all-operator
+  newName: controller
   newTag: latest
