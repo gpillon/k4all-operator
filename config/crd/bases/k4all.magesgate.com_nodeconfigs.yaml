@@ -50,31 +50,10 @@ spec:
           metadata:
             type: object
           spec:
-            description: NodeConfigSpec defines per-node desired state
-            properties:
-              interface:
-                description: Network interface configuration for this node
-                properties:
-                  dev:
-                    description: Physical network device name
-                    type: string
-                  dns:
-                    type: string
-                  dnsSearch:
-                    type: string
-                  gateway:
-                    type: string
-                  ipAddr:
-                    type: string
-                  ipConfig:
-                    description: IP configuration type
-                    enum:
-                    - static
-                    - dhcp
-                    type: string
-                  subnetMask:
-                    type: string
-                type: object
+            description: |-
+              NodeConfigSpec defines per-node desired state.
+              Network interface configuration is now handled by Anaconda/NetworkManager
+              and OVS bridge creation by the nmstate NNCP feature.
             type: object
           status:
             description: NodeConfigStatus reflects observed node state

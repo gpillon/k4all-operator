@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -25,7 +26,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,13 +36,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
+// +kubebuilder:rbac:groups=nmstate.io,resources=nodenetworkstates,verbs=get;list;watch
+// +kubebuilder:rbac:groups=nmstate.io,resources=nodenetworkconfigurationpolicies,verbs=get;list;watch;create;update;patch;delete
+
 // NodeConfigReconciler watches Node objects and ensures a matching
 // NodeConfig CR exists for each node, populated with observed state.
+// When the OVS bridge feature flag is enabled it also creates per-node
+// NodeNetworkConfigurationPolicy (NNCP) resources via nmstate.
 type NodeConfigReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Log    logr.Logger
 }
+
+var (
+	nncpGVR = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1", Resource: "nodenetworkconfigurationpolicies"}
+	nnsGVR  = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1", Resource: "nodenetworkstates"}
+)
 
 func (r *NodeConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("node", req.Name)
@@ -84,6 +97,11 @@ func (r *NodeConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		log.Error(err, "failed to update NodeConfig status")
 		return ctrl.Result{}, err
 	}
+
+	if err := r.reconcileOVSBridge(ctx, log, node); err != nil {
+		log.Error(err, "OVS bridge reconciliation failed")
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -99,7 +117,156 @@ func (r *NodeConfigReconciler) handleNodeDeletion(ctx context.Context, name stri
 		return ctrl.Result{}, err
 	}
 	r.Log.Info("deleted NodeConfig for removed node", "node", name)
+
+	nncp := &unstructured.Unstructured{}
+	nncp.SetGroupVersionKind(schema.GroupVersionKind{Group: "nmstate.io", Version: "v1", Kind: "NodeNetworkConfigurationPolicy"})
+	nncp.SetName(nncpName(name))
+	if err := r.Delete(ctx, nncp); err != nil && !errors.IsNotFound(err) {
+		r.Log.V(1).Info("NNCP delete on node removal (best-effort)", "node", name, "error", err)
+	}
+
 	return ctrl.Result{}, nil
+}
+
+func nncpName(nodeName string) string {
+	return "ovs-bridge-" + nodeName
+}
+
+func (r *NodeConfigReconciler) getClusterConfig(ctx context.Context) (*k4allv1alpha1.ClusterConfig, error) {
+	list := &k4allv1alpha1.ClusterConfigList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil, fmt.Errorf("list ClusterConfigs: %w", err)
+	}
+	if len(list.Items) == 0 {
+		return nil, fmt.Errorf("no ClusterConfig found")
+	}
+	return &list.Items[0], nil
+}
+
+func (r *NodeConfigReconciler) reconcileOVSBridge(ctx context.Context, log logr.Logger, node *corev1.Node) error {
+	config, err := r.getClusterConfig(ctx)
+	if err != nil {
+		return nil
+	}
+
+	if !config.Spec.Features.OVSBridge.Enabled {
+		return nil
+	}
+
+	name := nncpName(node.Name)
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(schema.GroupVersionKind{Group: "nmstate.io", Version: "v1", Kind: "NodeNetworkConfigurationPolicy"})
+	if err := r.Get(ctx, types.NamespacedName{Name: name}, existing); err == nil {
+		return nil
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("check existing NNCP: %w", err)
+	}
+
+	nicName, err := r.detectDefaultNIC(ctx, node.Name)
+	if err != nil {
+		return fmt.Errorf("detect default NIC for %s: %w", node.Name, err)
+	}
+	if nicName == "" {
+		log.Info("no default route interface found in NodeNetworkState, skipping NNCP creation", "node", node.Name)
+		return nil
+	}
+
+	nncp := buildOVSBridgeNNCP(name, node.Name, nicName)
+	if err := r.Create(ctx, nncp); err != nil {
+		return fmt.Errorf("create NNCP %s: %w", name, err)
+	}
+	log.Info("created OVS bridge NNCP", "nncp", name, "nic", nicName, "node", node.Name)
+	return nil
+}
+
+func (r *NodeConfigReconciler) detectDefaultNIC(ctx context.Context, nodeName string) (string, error) {
+	nns := &unstructured.Unstructured{}
+	nns.SetGroupVersionKind(schema.GroupVersionKind{Group: "nmstate.io", Version: "v1", Kind: "NodeNetworkState"})
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, nns); err != nil {
+		if errors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	routes, found, err := unstructured.NestedSlice(nns.Object, "status", "currentState", "routes", "running")
+	if err != nil || !found {
+		return "", nil
+	}
+
+	for _, route := range routes {
+		routeMap, ok := route.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		dest, _ := routeMap["destination"].(string)
+		if dest == "0.0.0.0/0" {
+			iface, _ := routeMap["next-hop-interface"].(string)
+			return iface, nil
+		}
+	}
+	return "", nil
+}
+
+func buildOVSBridgeNNCP(name, nodeName, nicName string) *unstructured.Unstructured {
+	nncp := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "nmstate.io/v1",
+			"kind":       "NodeNetworkConfigurationPolicy",
+			"metadata": map[string]interface{}{
+				"name": name,
+				"labels": map[string]interface{}{
+					"app.kubernetes.io/managed-by": "k4all-operator",
+				},
+			},
+			"spec": map[string]interface{}{
+				"nodeSelector": map[string]interface{}{
+					"kubernetes.io/hostname": nodeName,
+				},
+				"desiredState": map[string]interface{}{
+					"interfaces": []interface{}{
+						map[string]interface{}{
+							"name":  nicName,
+							"type":  "ethernet",
+							"state": "up",
+							"ipv4":  map[string]interface{}{"enabled": false},
+							"ipv6":  map[string]interface{}{"enabled": false},
+						},
+						map[string]interface{}{
+							"name":          "ovs-bridge",
+							"type":          "ovs-interface",
+							"state":         "up",
+							"copy-mac-from": nicName,
+							"ipv4": map[string]interface{}{
+								"enabled": true,
+								"dhcp":    true,
+							},
+							"ipv6": map[string]interface{}{
+								"enabled":  true,
+								"dhcp":     true,
+								"autoconf": true,
+							},
+						},
+						map[string]interface{}{
+							"name":  "ovs-bridge",
+							"type":  "ovs-bridge",
+							"state": "up",
+							"bridge": map[string]interface{}{
+								"options": map[string]interface{}{
+									"stp": false,
+								},
+								"port": []interface{}{
+									map[string]interface{}{"name": nicName},
+									map[string]interface{}{"name": "ovs-bridge"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	return nncp
 }
 
 func resolveNodeType(node *corev1.Node) string {

@@ -92,6 +92,12 @@ spec:
                         - kubevip
                         type: string
                     type: object
+                  podNetwork:
+                    description: 'Pod network CIDR (default: "10.100.0.1/18")'
+                    type: string
+                  serviceNetwork:
+                    description: 'Service network CIDR (default: "10.96.0.0/16")'
+                    type: string
                 type: object
               componentOverrides:
                 additionalProperties:
@@ -121,6 +127,12 @@ spec:
                       enabled:
                         type: boolean
                     type: object
+                  ovsBridge:
+                    description: OVS bridge creation via nmstate NNCP on every node
+                    properties:
+                      enabled:
+                        type: boolean
+                    type: object
                   ovsCni:
                     description: OVS networking with Multus + OVS-CNI
                     properties:
@@ -140,6 +152,28 @@ spec:
                         - auto
                         type: string
                       enabled:
+                        type: boolean
+                    type: object
+                type: object
+              ingress:
+                description: Ingress controller configuration
+                properties:
+                  cilium:
+                    description: CiliumIngressConfig configures the Cilium ingress.
+                    properties:
+                      dedicatedIP:
+                        description: Dedicated LoadBalancer IP for Cilium ingress
+                        type: string
+                    type: object
+                  nginx:
+                    description: NginxIngressConfig configures the NGINX ingress controller.
+                    properties:
+                      dedicatedIP:
+                        description: Dedicated LoadBalancer IP; leave empty to use
+                          the node IP directly
+                        type: string
+                      isDefault:
+                        description: Whether NGINX should be the default IngressClass
                         type: boolean
                     type: object
                 type: object
@@ -163,31 +197,21 @@ spec:
                       enabled:
                         type: boolean
                     type: object
-                  iface:
-                    description: Default network interface for the cluster
-                    properties:
-                      dev:
-                        description: Physical network device name
-                        type: string
-                      dns:
-                        type: string
-                      dnsSearch:
-                        type: string
-                      gateway:
-                        type: string
-                      ipAddr:
-                        type: string
-                      ipConfig:
-                        description: IP configuration type
-                        enum:
-                        - static
-                        - dhcp
-                        type: string
-                      subnetMask:
-                        type: string
-                    type: object
                 required:
                 - cni
+                type: object
+              proxy:
+                description: |-
+                  Proxy configuration for cluster-wide HTTP(S) proxy settings.
+                  Pre-boot scripts read these before the cluster starts; the operator
+                  also exposes them for in-cluster components that need proxy awareness.
+                properties:
+                  httpProxy:
+                    type: string
+                  httpsProxy:
+                    type: string
+                  noProxy:
+                    type: string
                 type: object
             required:
             - cluster
@@ -262,6 +286,8 @@ spec:
                 properties:
                   argocdReady:
                     type: boolean
+                  ovsBridgeReady:
+                    type: boolean
                   ovsCniReady:
                     type: boolean
                   virtReady:
@@ -333,31 +359,10 @@ spec:
           metadata:
             type: object
           spec:
-            description: NodeConfigSpec defines per-node desired state
-            properties:
-              interface:
-                description: Network interface configuration for this node
-                properties:
-                  dev:
-                    description: Physical network device name
-                    type: string
-                  dns:
-                    type: string
-                  dnsSearch:
-                    type: string
-                  gateway:
-                    type: string
-                  ipAddr:
-                    type: string
-                  ipConfig:
-                    description: IP configuration type
-                    enum:
-                    - static
-                    - dhcp
-                    type: string
-                  subnetMask:
-                    type: string
-                type: object
+            description: |-
+              NodeConfigSpec defines per-node desired state.
+              Network interface configuration is now handled by Anaconda/NetworkManager
+              and OVS bridge creation by the nmstate NNCP feature.
             type: object
           status:
             description: NodeConfigStatus reflects observed node state
@@ -484,6 +489,13 @@ spec:
                       description: Container image reference (for static-pod type,
                         supports {{ version }})
                       type: string
+                    inlineManifests:
+                      description: |-
+                        Raw YAML manifests to apply inline (for manifest-type components).
+                        Applied after URL-sourced manifests, with retry for CRD availability.
+                      items:
+                        type: string
+                      type: array
                     installPath:
                       description: Host filesystem path for binary installation
                       type: string
@@ -961,6 +973,26 @@ rules:
   - update
   - watch
 - apiGroups:
+  - nmstate.io
+  resources:
+  - nodenetworkconfigurationpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - nmstate.io
+  resources:
+  - nodenetworkstates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - rbac.authorization.k8s.io
   resources:
   - clusterrolebindings
@@ -1174,7 +1206,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: localhost/k4all-operator:latest
+        image: controller:latest
         imagePullPolicy: IfNotPresent
         livenessProbe:
           httpGet:

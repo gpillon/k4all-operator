@@ -119,6 +119,12 @@ spec:
                       enabled:
                         type: boolean
                     type: object
+                  ovsBridge:
+                    description: OVS bridge creation via nmstate NNCP on every node
+                    properties:
+                      enabled:
+                        type: boolean
+                    type: object
                   ovsCni:
                     description: OVS networking with Multus + OVS-CNI
                     properties:
@@ -182,29 +188,6 @@ spec:
                     properties:
                       enabled:
                         type: boolean
-                    type: object
-                  iface:
-                    description: Default network interface for the cluster
-                    properties:
-                      dev:
-                        description: Physical network device name
-                        type: string
-                      dns:
-                        type: string
-                      dnsSearch:
-                        type: string
-                      gateway:
-                        type: string
-                      ipAddr:
-                        type: string
-                      ipConfig:
-                        description: IP configuration type
-                        enum:
-                        - static
-                        - dhcp
-                        type: string
-                      subnetMask:
-                        type: string
                     type: object
                 required:
                 - cni
@@ -294,6 +277,8 @@ spec:
                 description: Per-feature observed state
                 properties:
                   argocdReady:
+                    type: boolean
+                  ovsBridgeReady:
                     type: boolean
                   ovsCniReady:
                     type: boolean

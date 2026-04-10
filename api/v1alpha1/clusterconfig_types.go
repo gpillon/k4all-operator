@@ -95,9 +95,6 @@ type NetworkingConfig struct {
 	// Firewalld settings
 	// +optional
 	Firewalld FirewalldConfig `json:"firewalld,omitempty"`
-	// Default network interface for the cluster
-	// +optional
-	Interface InterfaceConfig `json:"iface,omitempty"`
 }
 
 type CNIConfig struct {
@@ -119,6 +116,9 @@ type FeaturesConfig struct {
 	// OVS networking with Multus + OVS-CNI
 	// +optional
 	OVSCNI OVSCNIConfig `json:"ovsCni,omitempty"`
+	// OVS bridge creation via nmstate NNCP on every node
+	// +optional
+	OVSBridge OVSBridgeConfig `json:"ovsBridge,omitempty"`
 }
 
 type VirtConfig struct {
@@ -134,6 +134,10 @@ type ArgoCDConfig struct {
 }
 
 type OVSCNIConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+type OVSBridgeConfig struct {
 	Enabled bool `json:"enabled,omitempty"`
 }
 
@@ -196,6 +200,8 @@ type FeaturesStatus struct {
 	ArgoCDReady bool `json:"argocdReady,omitempty"`
 	// +optional
 	OVSCNIReady bool `json:"ovsCniReady,omitempty"`
+	// +optional
+	OVSBridgeReady bool `json:"ovsBridgeReady,omitempty"`
 }
 
 // +kubebuilder:object:root=true

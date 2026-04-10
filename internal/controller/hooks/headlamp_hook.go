@@ -44,6 +44,10 @@ func (h *HeadlampHook) PostInstall(ctx context.Context, spec k4allv1alpha1.Compo
 		return fmt.Errorf("headlamp cluster role binding: %w", err)
 	}
 
+	if err := h.ensurePodClusterRoleBinding(ctx, ns); err != nil {
+		return fmt.Errorf("headlamp pod cluster role binding: %w", err)
+	}
+
 	if err := h.ensureTokenSecret(ctx, ns); err != nil {
 		return fmt.Errorf("headlamp token secret: %w", err)
 	}
@@ -124,6 +128,40 @@ func (h *HeadlampHook) ensureClusterRoleBinding(ctx context.Context, namespace s
 	if !found {
 		existing.Subjects = desired.Subjects
 		return h.client.Update(ctx, existing)
+	}
+	return nil
+}
+
+// ensurePodClusterRoleBinding grants cluster-admin to the Helm-managed "headlamp"
+// ServiceAccount used by the pod, so in-cluster mode has full visibility.
+func (h *HeadlampHook) ensurePodClusterRoleBinding(ctx context.Context, namespace string) error {
+	desired := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "headlamp-pod-admin",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "k4all-operator",
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "cluster-admin",
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "headlamp",
+				Namespace: namespace,
+			},
+		},
+	}
+
+	existing := &rbacv1.ClusterRoleBinding{}
+	if err := h.client.Get(ctx, types.NamespacedName{Name: desired.Name}, existing); err != nil {
+		if errors.IsNotFound(err) {
+			return h.client.Create(ctx, desired)
+		}
+		return err
 	}
 	return nil
 }
@@ -215,6 +253,47 @@ func (h *HeadlampHook) ensureIngress(ctx context.Context, namespace string, _ k4
 	existing.Spec = desired.Spec
 	existing.Annotations = desired.Annotations
 	return h.client.Update(ctx, existing)
+}
+
+func (h *HeadlampHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha1.ClusterConfigSpec) error {
+	ns := "headlamp"
+	h.log.Info("cleaning up headlamp resources", "namespace", ns)
+
+	secret := &corev1.Secret{}
+	secret.Name = "headlamp-admin-token"
+	secret.Namespace = ns
+	if err := h.client.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
+		h.log.V(1).Info("headlamp secret delete (best-effort)", "error", err)
+	}
+
+	sa := &corev1.ServiceAccount{}
+	sa.Name = "headlamp-admin"
+	sa.Namespace = ns
+	if err := h.client.Delete(ctx, sa); err != nil && !errors.IsNotFound(err) {
+		h.log.V(1).Info("headlamp SA delete (best-effort)", "error", err)
+	}
+
+	crb := &rbacv1.ClusterRoleBinding{}
+	crb.Name = "headlamp-admin"
+	if err := h.client.Delete(ctx, crb); err != nil && !errors.IsNotFound(err) {
+		h.log.V(1).Info("headlamp CRB delete (best-effort)", "error", err)
+	}
+
+	podCrb := &rbacv1.ClusterRoleBinding{}
+	podCrb.Name = "headlamp-pod-admin"
+	if err := h.client.Delete(ctx, podCrb); err != nil && !errors.IsNotFound(err) {
+		h.log.V(1).Info("headlamp pod CRB delete (best-effort)", "error", err)
+	}
+
+	ingress := &networkingv1.Ingress{}
+	ingress.Name = "headlamp"
+	ingress.Namespace = ns
+	if err := h.client.Delete(ctx, ingress); err != nil && !errors.IsNotFound(err) {
+		h.log.V(1).Info("headlamp ingress delete (best-effort)", "error", err)
+	}
+
+	h.log.Info("headlamp cleanup complete")
+	return nil
 }
 
 func (h *HeadlampHook) detectClusterIP(ctx context.Context) (string, error) {

@@ -20,31 +20,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// NodeConfigSpec defines per-node desired state
+// NodeConfigSpec defines per-node desired state.
+// Network interface configuration is now handled by Anaconda/NetworkManager
+// and OVS bridge creation by the nmstate NNCP feature.
 type NodeConfigSpec struct {
-	// Network interface configuration for this node
-	// +optional
-	Interface InterfaceConfig `json:"interface,omitempty"`
-}
-
-// InterfaceConfig defines network interface parameters shared by
-// ClusterConfig (default) and NodeConfig (per-node override).
-type InterfaceConfig struct {
-	// Physical network device name
-	Dev string `json:"dev,omitempty"`
-	// IP configuration type
-	// +kubebuilder:validation:Enum=static;dhcp
-	IpConfig string `json:"ipConfig,omitempty"`
-	// +optional
-	IpAddr string `json:"ipAddr,omitempty"`
-	// +optional
-	Gateway string `json:"gateway,omitempty"`
-	// +optional
-	SubnetMask string `json:"subnetMask,omitempty"`
-	// +optional
-	DNS string `json:"dns,omitempty"`
-	// +optional
-	DNSSearch string `json:"dnsSearch,omitempty"`
 }
 
 // NodeConfigStatus reflects observed node state

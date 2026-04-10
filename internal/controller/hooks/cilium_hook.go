@@ -80,9 +80,5 @@ func BuildCiliumValues(config k4allv1alpha1.ClusterConfigSpec) map[string]interf
 		},
 	}
 
-	if config.Networking.Interface.Dev != "" {
-		values["devices"] = []string{config.Networking.Interface.Dev + "+"}
-	}
-
 	return values
 }

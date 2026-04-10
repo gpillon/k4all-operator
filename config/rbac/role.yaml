@@ -142,6 +142,26 @@ rules:
   - update
   - watch
 - apiGroups:
+  - nmstate.io
+  resources:
+  - nodenetworkconfigurationpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - nmstate.io
+  resources:
+  - nodenetworkstates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - rbac.authorization.k8s.io
   resources:
   - clusterrolebindings
