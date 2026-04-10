@@ -104,7 +104,21 @@ func (e *Engine) ReconcileComponent(ctx context.Context, name string, spec k4all
 }
 
 // UninstallComponent removes a previously installed component.
-func (e *Engine) UninstallComponent(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec) error {
+// It resolves version templates before dispatching so that manifest URLs
+// containing {{ version }} are expanded correctly.
+func (e *Engine) UninstallComponent(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, installedVersion string) error {
+	version := installedVersion
+	if version == "" {
+		resolved, err := e.resolver.Resolve(ctx, spec)
+		if err != nil {
+			e.log.V(1).Info("version resolution failed during uninstall, using spec.Version as-is", "component", name, "error", err)
+			version = spec.Version
+		} else {
+			version = resolved
+		}
+	}
+	spec = e.templateSpec(spec, version)
+
 	switch spec.Type {
 	case k4allv1alpha1.ComponentTypeHelm, k4allv1alpha1.ComponentTypeHelmOCI:
 		return e.helm.Uninstall(ctx, name, spec.Namespace)

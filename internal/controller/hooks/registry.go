@@ -49,6 +49,7 @@ func NewRegistry(c client.Client, log logr.Logger) *Registry {
 	r.hooks["metallb"] = NewMetalLBHook(c, log.WithName("hook-metallb"))
 	r.hooks["topolvm"] = NewTopolvmHook(c, log.WithName("hook-topolvm"))
 	r.hooks["calico"] = NewCalicoHook(c, log.WithName("hook-calico"))
+	r.hooks["nmstate"] = NewNMStateHook(c, log.WithName("hook-nmstate"))
 	return r
 }
 

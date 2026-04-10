@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -29,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,9 +70,10 @@ type ReleaseReconciler struct {
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses;ingressclasses;networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses;csidrivers,verbs=get;list;watch;create;update;patch;delete
 
+const ForceResyncAnnotation = "k4all.magesgate.com/force-resync"
+
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("releasemanifest", req.Name)
-
 	rm := &k4allv1alpha1.ReleaseManifest{}
 	if err := r.Get(ctx, req.NamespacedName, rm); err != nil {
 		if errors.IsNotFound(err) {
@@ -82,13 +86,67 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		log.Error(err, "failed to get ClusterConfig")
 		engine.SetReadyCondition(rm, metav1.ConditionFalse, "ClusterConfigNotFound", err.Error())
-		_ = r.Status().Update(ctx, rm)
+		_ = r.patchStatus(ctx, rm)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	if r.engine == nil {
 		r.engine = engine.New(r.Client, r.RestConfig, r.Log.WithName("engine"), r.ToolsImage)
 		r.hookReg = hooks.NewRegistry(r.Client, r.Log)
+	}
+
+	// Handle force-resync annotation.
+	// Value = component name to resync, or "all" to resync everything.
+	if resyncTarget, ok := rm.GetAnnotations()[ForceResyncAnnotation]; ok {
+		log.Info("force-resync annotation detected", "target", resyncTarget)
+
+		if rm.Status.Components == nil {
+			rm.Status.Components = make(map[string]k4allv1alpha1.ComponentStatus)
+		}
+
+		resetCount := 0
+		for name, st := range rm.Status.Components {
+			if st.State != k4allv1alpha1.ComponentStateInstalled {
+				continue
+			}
+			if resyncTarget != "all" && name != resyncTarget {
+				continue
+			}
+			if spec, exists := rm.Spec.Components[name]; exists &&
+				(spec.Management == k4allv1alpha1.ComponentManagementRemoved ||
+					spec.Management == k4allv1alpha1.ComponentManagementUnmanaged) {
+				continue
+			}
+			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
+				State:              k4allv1alpha1.ComponentStatePending,
+				Message:            "force resync requested",
+				InstalledVersion:   st.InstalledVersion,
+				LastTransitionTime: metav1.Now(),
+			}
+			resetCount++
+		}
+
+		if resetCount > 0 {
+			engine.SetReadyCondition(rm, metav1.ConditionFalse, "ForceResync",
+				fmt.Sprintf("force resync in progress (%d components)", resetCount))
+		} else if resyncTarget != "all" {
+			log.Info("force-resync target not found or not in Installed state", "target", resyncTarget)
+		}
+
+		if err := r.patchStatus(ctx, rm); err != nil {
+			log.Error(err, "failed to update status during force-resync")
+			return ctrl.Result{}, err
+		}
+
+		// Remove the annotation via merge-patch to avoid resourceVersion conflicts.
+		patch := client.RawPatch(types.MergePatchType,
+			[]byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:null}}}`, ForceResyncAnnotation)))
+		if err := r.Patch(ctx, rm, patch); err != nil {
+			log.Error(err, "failed to remove force-resync annotation")
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	active := engine.FilterActiveComponents(rm.Spec.Components, config.Spec)
@@ -99,7 +157,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		log.Error(err, "dependency resolution failed")
 		engine.SetReadyCondition(rm, metav1.ConditionFalse, "DependencyCycle", err.Error())
-		_ = r.Status().Update(ctx, rm)
+		_ = r.patchStatus(ctx, rm)
 		return ctrl.Result{}, err
 	}
 
@@ -118,6 +176,8 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	allOK := true
+
 	// Handle components disabled by feature gates or CNI switch (but still Managed).
 	// If they were previously installed, uninstall them first.
 	for name, spec := range rm.Spec.Components {
@@ -135,13 +195,26 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		if wasInstalled {
 			log.Info("uninstalling component disabled by feature gate or CNI switch", "name", name)
-			if err := r.engine.UninstallComponent(ctx, name, spec); err != nil {
+			var uninstallErrs []string
+			if err := r.engine.UninstallComponent(ctx, name, spec, prevStatus.InstalledVersion); err != nil {
 				log.Error(err, "uninstall failed", "name", name)
+				uninstallErrs = append(uninstallErrs, fmt.Sprintf("uninstall: %v", err))
 			}
 			if hook := r.hookReg.Get(name); hook != nil {
 				if err := hook.Cleanup(ctx, name, config.Spec); err != nil {
 					log.Error(err, "cleanup hook failed", "name", name)
+					uninstallErrs = append(uninstallErrs, fmt.Sprintf("cleanup hook: %v", err))
 				}
+			}
+			if len(uninstallErrs) > 0 {
+				rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
+					State:              k4allv1alpha1.ComponentStateFailed,
+					Message:            fmt.Sprintf("uninstall failed (feature gate disabled): %s", strings.Join(uninstallErrs, "; ")),
+					InstalledVersion:   prevStatus.InstalledVersion,
+					LastTransitionTime: metav1.Now(),
+				}
+				allOK = false
+				continue
 			}
 		}
 
@@ -153,7 +226,6 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Reconcile active components in dependency order
-	allOK := true
 	for _, name := range order {
 		spec := active[name]
 		currentStatus := rm.Status.Components[name]
@@ -205,13 +277,32 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		prevStatus, hasPrev := rm.Status.Components[name]
 		if hasPrev && (prevStatus.State == k4allv1alpha1.ComponentStateInstalled || prevStatus.State == k4allv1alpha1.ComponentStateFailed) {
 			log.Info("removing component (management=Removed)", "name", name)
-			if err := r.engine.UninstallComponent(ctx, name, spec); err != nil {
+			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
+				State:              k4allv1alpha1.ComponentStateUninstalling,
+				Message:            "uninstalling component",
+				InstalledVersion:   prevStatus.InstalledVersion,
+				LastTransitionTime: metav1.Now(),
+			}
+			var uninstallErrs []string
+			if err := r.engine.UninstallComponent(ctx, name, spec, prevStatus.InstalledVersion); err != nil {
 				log.Error(err, "uninstall failed for removed component", "name", name)
+				uninstallErrs = append(uninstallErrs, fmt.Sprintf("uninstall: %v", err))
 			}
 			if hook := r.hookReg.Get(name); hook != nil {
 				if err := hook.Cleanup(ctx, name, config.Spec); err != nil {
 					log.Error(err, "cleanup hook failed for removed component", "name", name)
+					uninstallErrs = append(uninstallErrs, fmt.Sprintf("cleanup hook: %v", err))
 				}
+			}
+			if len(uninstallErrs) > 0 {
+				rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
+					State:              k4allv1alpha1.ComponentStateFailed,
+					Message:            fmt.Sprintf("removal failed: %s", strings.Join(uninstallErrs, "; ")),
+					InstalledVersion:   prevStatus.InstalledVersion,
+					LastTransitionTime: metav1.Now(),
+				}
+				allOK = false
+				continue
 			}
 		}
 		rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
@@ -235,7 +326,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			"one or more components failed to reconcile")
 	}
 
-	if err := r.Status().Update(ctx, rm); err != nil {
+	if err := r.patchStatus(ctx, rm); err != nil {
 		log.Error(err, "failed to update ReleaseManifest status")
 		return ctrl.Result{}, err
 	}
@@ -270,7 +361,16 @@ func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, confi
 		Message:            fmt.Sprintf("CNI=%s, reconciled at %s", config.Status.ActiveCNI, config.Status.LastReconcileTime.Format(time.RFC3339)),
 	})
 
-	if err := r.Status().Update(ctx, config); err != nil {
+	statusPayload := map[string]interface{}{
+		"status": config.Status,
+	}
+	raw, err := json.Marshal(statusPayload)
+	if err != nil {
+		r.Log.Error(err, "failed to marshal ClusterConfig status patch")
+		return
+	}
+	patch := client.RawPatch(types.MergePatchType, raw)
+	if err := r.Status().Patch(ctx, config, patch); err != nil {
 		r.Log.Error(err, "failed to update ClusterConfig status")
 	}
 }
@@ -281,6 +381,21 @@ func isComponentInstalled(rm *k4allv1alpha1.ReleaseManifest, name string) bool {
 	}
 	st, ok := rm.Status.Components[name]
 	return ok && st.State == k4allv1alpha1.ComponentStateInstalled
+}
+
+// patchStatus writes the ReleaseManifest status via a merge-patch, avoiding
+// resourceVersion conflicts that happen when the spec/metadata was modified
+// while the reconcile loop was running.
+func (r *ReleaseReconciler) patchStatus(ctx context.Context, rm *k4allv1alpha1.ReleaseManifest) error {
+	statusPayload := map[string]interface{}{
+		"status": rm.Status,
+	}
+	raw, err := json.Marshal(statusPayload)
+	if err != nil {
+		return fmt.Errorf("marshal status patch: %w", err)
+	}
+	patch := client.RawPatch(types.MergePatchType, raw)
+	return r.Status().Patch(ctx, rm, patch)
 }
 
 func (r *ReleaseReconciler) getClusterConfig(ctx context.Context) (*k4allv1alpha1.ClusterConfig, error) {
