@@ -25,6 +25,7 @@ import (
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,13 +46,14 @@ import (
 // NodeNetworkConfigurationPolicy (NNCP) resources via nmstate.
 type NodeConfigReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Log    logr.Logger
+	Scheme    *runtime.Scheme
+	Log       logr.Logger
+	APIReader client.Reader
 }
 
 var (
 	nncpGVR = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1", Resource: "nodenetworkconfigurationpolicies"}
-	nnsGVR  = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1", Resource: "nodenetworkstates"}
+	nnsGVR  = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1beta1", Resource: "nodenetworkstates"}
 )
 
 func (r *NodeConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -121,7 +123,7 @@ func (r *NodeConfigReconciler) handleNodeDeletion(ctx context.Context, name stri
 	nncp := &unstructured.Unstructured{}
 	nncp.SetGroupVersionKind(schema.GroupVersionKind{Group: "nmstate.io", Version: "v1", Kind: "NodeNetworkConfigurationPolicy"})
 	nncp.SetName(nncpName(name))
-	if err := r.Delete(ctx, nncp); err != nil && !errors.IsNotFound(err) {
+	if err := r.Delete(ctx, nncp); err != nil && !errors.IsNotFound(err) && !isNoMatchError(err) {
 		r.Log.V(1).Info("NNCP delete on node removal (best-effort)", "node", name, "error", err)
 	}
 
@@ -130,6 +132,13 @@ func (r *NodeConfigReconciler) handleNodeDeletion(ctx context.Context, name stri
 
 func nncpName(nodeName string) string {
 	return "ovs-bridge-" + nodeName
+}
+
+// isNoMatchError returns true when the API server doesn't know the requested
+// GVK (e.g. nmstate CRDs not yet installed).  We treat this the same as
+// "not found" so the reconciler doesn't error-loop.
+func isNoMatchError(err error) bool {
+	return meta.IsNoMatchError(err)
 }
 
 func (r *NodeConfigReconciler) getClusterConfig(ctx context.Context) (*k4allv1alpha1.ClusterConfig, error) {
@@ -156,7 +165,10 @@ func (r *NodeConfigReconciler) reconcileOVSBridge(ctx context.Context, log logr.
 	name := nncpName(node.Name)
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(schema.GroupVersionKind{Group: "nmstate.io", Version: "v1", Kind: "NodeNetworkConfigurationPolicy"})
-	if err := r.Get(ctx, types.NamespacedName{Name: name}, existing); err == nil {
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: name}, existing); err == nil {
+		return nil
+	} else if isNoMatchError(err) {
+		log.V(1).Info("nmstate CRDs not available yet, skipping OVS bridge reconciliation")
 		return nil
 	} else if !errors.IsNotFound(err) {
 		return fmt.Errorf("check existing NNCP: %w", err)
@@ -181,16 +193,19 @@ func (r *NodeConfigReconciler) reconcileOVSBridge(ctx context.Context, log logr.
 
 func (r *NodeConfigReconciler) detectDefaultNIC(ctx context.Context, nodeName string) (string, error) {
 	nns := &unstructured.Unstructured{}
-	nns.SetGroupVersionKind(schema.GroupVersionKind{Group: "nmstate.io", Version: "v1", Kind: "NodeNetworkState"})
-	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, nns); err != nil {
-		if errors.IsNotFound(err) {
+	nns.SetGroupVersionKind(schema.GroupVersionKind{Group: "nmstate.io", Version: "v1beta1", Kind: "NodeNetworkState"})
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: nodeName}, nns); err != nil {
+		if errors.IsNotFound(err) || isNoMatchError(err) {
 			return "", nil
 		}
 		return "", err
 	}
 
+	// The NodeNetworkState stores currentState as a nested JSON string in some
+	// versions.  Try the direct nested path first, then fall back to parsing
+	// the currentState as a raw JSON string.
 	routes, found, err := unstructured.NestedSlice(nns.Object, "status", "currentState", "routes", "running")
-	if err != nil || !found {
+	if err != nil || !found || len(routes) == 0 {
 		return "", nil
 	}
 
