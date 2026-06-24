@@ -4,5 +4,5 @@ resources:
 - manager.yaml
 images:
 - name: controller
-  newName: controller
-  newTag: latest
+  newName: k4all-operator
+  newTag: e2e-test

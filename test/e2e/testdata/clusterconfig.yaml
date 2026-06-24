@@ -1,0 +1,33 @@
+apiVersion: k4all.magesgate.com/v1alpha1
+kind: ClusterConfig
+metadata:
+  name: k4all-cluster-config
+spec:
+  networking:
+    cni:
+      type: calico
+    firewalld:
+      enabled: false
+  features:
+    virt:
+      enabled: false
+      emulation: auto
+    argocd:
+      enabled: false
+    ovsCni:
+      enabled: false
+    ovsBridge:
+      enabled: false
+  cluster:
+    apiEndPointUseHostName: false
+    podNetwork: "10.244.0.0/16"
+    serviceNetwork: "10.96.0.0/16"
+    ha:
+      type: none
+  ingress:
+    nginx:
+      isDefault: true
+  proxy:
+    httpProxy: ""
+    httpsProxy: ""
+    noProxy: ""

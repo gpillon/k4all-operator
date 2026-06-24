@@ -1,0 +1,65 @@
+apiVersion: k4all.magesgate.com/v1alpha1
+kind: ReleaseManifest
+metadata:
+  name: k4all
+spec:
+  osImage:
+    name: k4all-bootc
+    repository: ghcr.io/gpillon/k4all-bootc
+    imageTag: latest
+  components:
+    # CNI — manifest type with inline manifests, tests manifest install + inline
+    calico:
+      type: manifest
+      version: "v3.27.3"
+      source: "https://raw.githubusercontent.com/projectcalico/calico/{{ version }}/manifests/tigera-operator.yaml"
+      namespace: tigera-operator
+      inlineManifests:
+        - |
+          apiVersion: operator.tigera.io/v1
+          kind: Installation
+          metadata:
+            name: default
+          spec:
+            calicoNetwork:
+              ipPools:
+              - blockSize: 26
+                cidr: 10.244.0.0/16
+                encapsulation: VXLANCrossSubnet
+                natOutgoing: Enabled
+                nodeSelector: all()
+        - |
+          apiVersion: operator.tigera.io/v1
+          kind: APIServer
+          metadata:
+            name: default
+          spec: {}
+
+    # Certificates — helm type, tests helm installation
+    cert-manager:
+      type: helm
+      version: "v1.14.5"
+      repo: "https://charts.jetstack.io"
+      chart: cert-manager
+      namespace: cert-manager
+      helmArgs:
+        - "--set installCRDs=true"
+      dependsOn:
+        - calico
+
+    # Monitoring — manifest type with patches, tests patching
+    metrics-server:
+      type: manifest
+      version: "latest"
+      source: "https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml"
+      namespace: kube-system
+      dependsOn:
+        - calico
+      patches:
+        - target:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: metrics-server
+            namespace: kube-system
+          type: strategic
+          patch: '{"spec":{"template":{"spec":{"containers":[{"name":"metrics-server","args":["--cert-dir=/tmp","--secure-port=10250","--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname","--kubelet-use-node-status-port","--metric-resolution=15s","--kubelet-insecure-tls"]}]}}}}'

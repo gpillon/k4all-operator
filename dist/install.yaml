@@ -1206,7 +1206,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: controller:latest
+        image: k4all-operator:e2e-test
         imagePullPolicy: IfNotPresent
         livenessProbe:
           httpGet:

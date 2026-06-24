@@ -115,6 +115,25 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test $$(go list ./... | grep -v /test/) -coverprofile cover.out
 
 KIND_CLUSTER ?= k4all-operator-test-e2e
+E2E_IMG ?= k4all-operator:e2e-test
+E2E_TIMEOUT ?= 20m
+
+.PHONY: test-all
+test-all: ## Full e2e: build image, create Kind cluster, deploy, test, cleanup
+	@echo "==> Building operator image $(E2E_IMG)..."
+	$(MAKE) docker-build IMG=$(E2E_IMG)
+	@echo "==> Setting up Kind cluster '$(KIND_CLUSTER)'..."
+	$(MAKE) setup-test-e2e
+	@echo "==> Loading image into Kind..."
+	$(MAKE) kind-load-image IMG=$(E2E_IMG)
+	@echo "==> Building install manifest..."
+	$(MAKE) build-installer IMG=$(E2E_IMG)
+	@echo "==> Running e2e tests..."
+	@KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT); \
+		EXIT_CODE=$$?; \
+		echo "==> Cleaning up Kind cluster..."; \
+		$(MAKE) cleanup-test-e2e; \
+		exit $$EXIT_CODE
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -130,9 +149,19 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
 	esac
 
+.PHONY: kind-load-image
+kind-load-image: ## Load the operator image into the Kind cluster
+ifeq ($(CONTAINER_TOOL),docker)
+	$(KIND) load docker-image $(IMG) --name $(KIND_CLUSTER)
+else
+	$(CONTAINER_TOOL) save $(IMG) -o /tmp/k4all-e2e-image.tar
+	$(KIND) load image-archive /tmp/k4all-e2e-image.tar --name $(KIND_CLUSTER)
+	@rm -f /tmp/k4all-e2e-image.tar
+endif
+
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run e2e tests against an existing Kind cluster (no image build).
+	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT)
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e

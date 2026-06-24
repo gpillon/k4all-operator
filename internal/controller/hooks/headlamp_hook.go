@@ -209,7 +209,8 @@ func (h *HeadlampHook) ensureIngress(ctx context.Context, namespace string, _ k4
 			Name:      "headlamp",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "k4all-operator",
+				"app.kubernetes.io/managed-by":  "k4all-operator",
+				"k4all.magesgate.com/dashboard": "true",
 			},
 			Annotations: map[string]string{
 				"nginx.ingress.kubernetes.io/backend-protocol": "HTTP",
