@@ -1,0 +1,47 @@
+name: E2E Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KIND_VERSION: v0.33.0
+  # Same Kubernetes minor as the k4all bootc image (pkgs.k8s.io core:/stable:/v1.35).
+  KIND_NODE_IMAGE: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+  KIND_CLUSTER: k4all-operator-test-e2e
+
+jobs:
+  test-e2e:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl -sSLo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      # Pre-create the cluster with a pinned node image; 'make setup-test-e2e'
+      # (called by test-all) skips creation when the cluster already exists.
+      - name: Create kind cluster
+        run: kind create cluster --name "${KIND_CLUSTER}" --image "${KIND_NODE_IMAGE}" --wait 2m
+
+      # test-all: build the operator image, load it into kind, render
+      # dist/install.yaml with that image, run the suite, delete the cluster.
+      - name: Running Test e2e
+        run: make test-all CONTAINER_TOOL=docker KIND_CLUSTER="${KIND_CLUSTER}"

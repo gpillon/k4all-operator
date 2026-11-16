@@ -115,7 +115,9 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # The default setup assumes Kind is pre-installed. Use 'make test-all' to also build
 # and load the Manager image into Kind before running the e2e suite.
 KIND_CLUSTER ?= k4all-operator-test-e2e
-E2E_IMG ?= k4all-operator:e2e-test
+# Fully-qualified on purpose: podman stores unqualified tags as localhost/<name>, while the
+# kubelet would resolve an unqualified image to docker.io/library/<name> and fail to find it.
+E2E_IMG ?= localhost/k4all-operator:e2e-test
 E2E_TIMEOUT ?= 20m
 
 .PHONY: test-all
