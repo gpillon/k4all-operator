@@ -85,7 +85,7 @@ func (r *VersionResolver) fetchVersion(ctx context.Context, url string) (string,
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Handle GitHub redirect (releases/latest -> releases/tag/vX.Y.Z)
 	if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently {

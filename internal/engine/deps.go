@@ -118,13 +118,19 @@ func FilterRemovedComponents(
 	return removed
 }
 
+// CNI types accepted by ClusterConfig.spec.networking.cni.type.
+const (
+	cniCalico = "calico"
+	cniCilium = "cilium"
+)
+
 func shouldInstall(name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) bool {
 	// CNI selection: only install the chosen CNI and its CLI
 	switch name {
-	case "calico":
-		return config.Networking.CNI.Type == "calico"
-	case "cilium", "cilium-cli":
-		return config.Networking.CNI.Type == "cilium"
+	case cniCalico:
+		return config.Networking.CNI.Type == cniCalico
+	case cniCilium, "cilium-cli":
+		return config.Networking.CNI.Type == cniCilium
 	}
 
 	// HA components: kube-vip only when HA type matches
@@ -134,7 +140,7 @@ func shouldInstall(name string, spec k4allv1alpha1.ComponentSpec, config k4allv1
 
 	// MetalLB is skipped when Cilium handles L2 announcements and no dedicated IPs
 	if name == "metallb" {
-		if config.Networking.CNI.Type == "cilium" {
+		if config.Networking.CNI.Type == cniCilium {
 			hasIPs := config.Ingress.Nginx.DedicatedIP != "" || config.Ingress.Cilium.DedicatedIP != ""
 			if !hasIPs {
 				return false

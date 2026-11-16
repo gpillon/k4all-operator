@@ -222,7 +222,7 @@ func (e *Engine) loadValuesFrom(ctx context.Context, ref k4allv1alpha1.ValuesRef
 		}
 		return values, nil
 	case "Secret":
-		return nil, fmt.Errorf("Secret values loading not yet implemented")
+		return nil, fmt.Errorf("secret values loading not yet implemented")
 	}
 	return nil, fmt.Errorf("unsupported ValuesFrom kind: %s", ref.Kind)
 }

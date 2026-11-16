@@ -49,7 +49,7 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 		return err
 	}
 
-	chartPath, err := h.pullChart(ctx, spec)
+	chartPath, err := h.pullChart(spec)
 	if err != nil {
 		return fmt.Errorf("pull chart: %w", err)
 	}
@@ -119,14 +119,16 @@ func (h *HelmInstaller) getRelease(cfg *action.Configuration, name string) (inst
 	return true, rel.Chart.Metadata.Version, nil
 }
 
-func (h *HelmInstaller) pullChart(ctx context.Context, spec k4allv1alpha1.ComponentSpec) (string, error) {
+// pullChart downloads and untars the chart into the cache dir. Helm v3 pull
+// actions do not accept a context, so the download cannot be cancelled.
+func (h *HelmInstaller) pullChart(spec k4allv1alpha1.ComponentSpec) (string, error) {
 	if spec.Type == k4allv1alpha1.ComponentTypeHelmOCI {
-		return h.pullOCI(ctx, spec)
+		return h.pullOCI(spec)
 	}
-	return h.pullFromRepo(ctx, spec)
+	return h.pullFromRepo(spec)
 }
 
-func (h *HelmInstaller) pullFromRepo(ctx context.Context, spec k4allv1alpha1.ComponentSpec) (string, error) {
+func (h *HelmInstaller) pullFromRepo(spec k4allv1alpha1.ComponentSpec) (string, error) {
 	repoEntry := &repo.Entry{
 		Name: sanitizeRepoName(spec.Repo),
 		URL:  spec.Repo,
@@ -166,7 +168,7 @@ func (h *HelmInstaller) pullFromRepo(ctx context.Context, spec k4allv1alpha1.Com
 	return chartDir, nil
 }
 
-func (h *HelmInstaller) pullOCI(ctx context.Context, spec k4allv1alpha1.ComponentSpec) (string, error) {
+func (h *HelmInstaller) pullOCI(spec k4allv1alpha1.ComponentSpec) (string, error) {
 	ref := spec.Repo
 	if !strings.HasPrefix(ref, "oci://") {
 		ref = "oci://" + ref
