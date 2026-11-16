@@ -18,12 +18,17 @@ resources:
 - metrics_auth_role.yaml
 - metrics_auth_role_binding.yaml
 - metrics_reader_role.yaml
-# For each CRD, "Editor" and "Viewer" roles are scaffolded by
+# For each CRD, "Admin", "Editor" and "Viewer" roles are scaffolded by
 # default, aiding admins in cluster management. Those roles are
-# not used by the Project itself. You can comment the following lines
+# not used by the k4all-operator itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- releasemanifest_admin_role.yaml
+- releasemanifest_editor_role.yaml
+- releasemanifest_viewer_role.yaml
+- nodeconfig_admin_role.yaml
 - nodeconfig_editor_role.yaml
 - nodeconfig_viewer_role.yaml
+- clusterconfig_admin_role.yaml
 - clusterconfig_editor_role.yaml
 - clusterconfig_viewer_role.yaml
 # Add the cluster-wide role and binding

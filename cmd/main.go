@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 
+	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
+	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,6 +39,7 @@ import (
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller"
+	// +kubebuilder:scaffold:imports
 )
 
 var (
@@ -47,6 +50,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(k4allv1alpha1.AddToScheme(scheme))
+	// +kubebuilder:scaffold:scheme
 }
 
 func main() {
@@ -166,6 +170,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "NodeConfig")
 		os.Exit(1)
 	}
+	// +kubebuilder:scaffold:builder
 
 	if metricsCertWatcher != nil {
 		if err := mgr.Add(metricsCertWatcher); err != nil {
