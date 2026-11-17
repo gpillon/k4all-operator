@@ -222,8 +222,9 @@ const (
 
 var middlewareGVK = schema.GroupVersionKind{Group: "traefik.io", Version: "v1alpha1", Kind: "Middleware"}
 
-// ensureIngress publishes the dashboard on dashboard.<ingress IP>.nip.io:
-// through Traefik once the ReleaseManifest has it, through NGINX before.
+// ensureIngress publishes the dashboard on dashboard.<ingress IP>.nip.io,
+// the controller's dedicated IP or else the node's: through Traefik once the
+// ReleaseManifest has it, through NGINX before.
 // It manages that rule, the class and its own annotations; other rules, the
 // tls entries and other annotations on the Ingress are left as they are.
 func (h *HeadlampHook) ensureIngress(ctx context.Context, namespace string, config k4allv1alpha1.ClusterConfigSpec) error {
@@ -236,11 +237,16 @@ func (h *HeadlampHook) ensureIngress(ctx context.Context, namespace string, conf
 	if err != nil {
 		return err
 	}
+	// The controller's dedicated IP, when it has one, is where it listens.
+	dedicated := config.Ingress.NginxSettings().DedicatedIP
+	if onTraefik {
+		dedicated = traefikConfig(config.Ingress).DedicatedIP
+	}
+	if dedicated != "" {
+		ip = dedicated
+	}
 	redirect := false
 	if onTraefik {
-		if dedicated := traefikConfig(config.Ingress).DedicatedIP; dedicated != "" {
-			ip = dedicated
-		}
 		if redirect, err = h.redirectMiddlewareExists(ctx); err != nil {
 			return err
 		}
