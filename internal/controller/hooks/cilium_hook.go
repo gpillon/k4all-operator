@@ -12,7 +12,7 @@ import (
 )
 
 // CiliumHook configures Cilium-specific Helm values that depend on ClusterConfig
-// (pod CIDR, kube-proxy replacement, device selection, L2 announcements).
+// (kube-proxy replacement, spec.networking.cni.cilium options).
 type CiliumHook struct {
 	BaseHook
 	client client.Client
@@ -68,16 +68,42 @@ func (h *CiliumHook) Cleanup(ctx context.Context, name string, config k4allv1alp
 	return nil
 }
 
+// ovsBridgeDevice is the bridge created on every node when features.ovsBridge is enabled.
+const ovsBridgeDevice = "ovs-bridge"
+
 // BuildCiliumValues computes Helm values for Cilium based on ClusterConfig.
 func BuildCiliumValues(config k4allv1alpha1.ClusterConfigSpec) map[string]interface{} {
+	cilium := config.Networking.CNI.Cilium
 	values := map[string]interface{}{
 		"kubeProxyReplacement": true,
-		"l2announcements": map[string]interface{}{
-			"enabled": true,
-		},
 		"externalIPs": map[string]interface{}{
 			"enabled": true,
 		},
+	}
+
+	if cilium.L2Announcements {
+		values["l2announcements"] = map[string]interface{}{"enabled": true}
+	}
+
+	// Setting devices turns off Cilium's auto-detection, so the main
+	// interface (ovs-bridge, when k4all creates it) must be listed too.
+	if len(cilium.AdditionalDevices) > 0 {
+		var devices []string
+		if config.Features.OVSBridge.Enabled {
+			devices = append(devices, ovsBridgeDevice)
+		}
+		values["devices"] = append(devices, cilium.AdditionalDevices...)
+	}
+
+	if cilium.GatewayAPI {
+		values["gatewayAPI"] = map[string]interface{}{"enabled": true}
+	}
+
+	if cilium.Hubble {
+		values["hubble"] = map[string]interface{}{
+			"relay": map[string]interface{}{"enabled": true},
+			"ui":    map[string]interface{}{"enabled": true},
+		}
 	}
 
 	return values

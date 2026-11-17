@@ -100,6 +100,27 @@ type NetworkingConfig struct {
 type CNIConfig struct {
 	// +kubebuilder:validation:Enum=calico;cilium
 	Type string `json:"type"`
+	// Cilium options, used when type is cilium. The operator translates them
+	// into Cilium Helm values; componentOverrides.cilium can still override any value.
+	// +optional
+	Cilium CiliumConfig `json:"cilium,omitempty"`
+}
+
+// CiliumConfig holds the Cilium options exposed by the k4all installer.
+type CiliumConfig struct {
+	// Interfaces Cilium attaches to, in addition to ovs-bridge when the OVS
+	// bridge feature is enabled.
+	// +optional
+	AdditionalDevices []string `json:"additionalDevices,omitempty"`
+	// Announce LoadBalancer IPs on the local network (L2 announcements).
+	// +optional
+	L2Announcements bool `json:"l2announcements,omitempty"`
+	// Deploy Hubble Relay and the Hubble UI.
+	// +optional
+	Hubble bool `json:"hubble,omitempty"`
+	// Enable Cilium's Gateway API implementation.
+	// +optional
+	GatewayAPI bool `json:"gatewayAPI,omitempty"`
 }
 
 type FirewalldConfig struct {

@@ -175,6 +175,29 @@ spec:
                   cni:
                     description: CNI plugin selection
                     properties:
+                      cilium:
+                        description: |-
+                          Cilium options, used when type is cilium. The operator translates them
+                          into Cilium Helm values; componentOverrides.cilium can still override any value.
+                        properties:
+                          additionalDevices:
+                            description: |-
+                              Interfaces Cilium attaches to, in addition to ovs-bridge when the OVS
+                              bridge feature is enabled.
+                            items:
+                              type: string
+                            type: array
+                          gatewayAPI:
+                            description: Enable Cilium's Gateway API implementation.
+                            type: boolean
+                          hubble:
+                            description: Deploy Hubble Relay and the Hubble UI.
+                            type: boolean
+                          l2announcements:
+                            description: Announce LoadBalancer IPs on the local network
+                              (L2 announcements).
+                            type: boolean
+                        type: object
                       type:
                         enum:
                         - calico

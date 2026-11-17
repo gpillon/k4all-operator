@@ -254,6 +254,20 @@ var _ = Describe("K4All Operator", Ordered, func() {
 			Expect(out).To(ContainSubstring("--kubelet-insecure-tls"),
 				"metrics-server missing patched arg, got: %s", out)
 		})
+
+		// testdata/clusterconfig.yaml sets componentOverrides for cert-manager:
+		// a podLabels value and a --set helmArg, each tagging one Deployment.
+		It("should apply ClusterConfig componentOverrides to the cert-manager release", func() {
+			labelOf := func(deployment string) string {
+				out, _ := kubectl("get", "deployment", deployment, "-n", "cert-manager",
+					"-o", "jsonpath={.spec.template.metadata.labels.k4all-e2e}")
+				return out
+			}
+			Expect(labelOf("cert-manager")).To(Equal("values"),
+				"componentOverrides.cert-manager.values not applied")
+			Expect(labelOf("cert-manager-webhook")).To(Equal("helmargs"),
+				"componentOverrides.cert-manager.helmArgs not applied")
+		})
 	})
 
 	// ── ClusterConfig Status ────────────────────────────────────────────

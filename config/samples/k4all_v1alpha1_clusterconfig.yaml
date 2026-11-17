@@ -6,6 +6,12 @@ spec:
   networking:
     cni:
       type: calico
+      # Used when type is cilium; translated into Cilium Helm values.
+      cilium:
+        l2announcements: false
+        hubble: false
+        gatewayAPI: false
+        additionalDevices: []
     firewalld:
       enabled: false
   features:

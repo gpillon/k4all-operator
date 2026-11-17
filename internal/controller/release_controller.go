@@ -266,23 +266,18 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			continue
 		}
 
-		extraValues := r.computeExtraValues(name, config)
 		log.Info("reconciling component", "name", name, "type", spec.Type, "version", spec.Version)
 
-		// Run PreInstall hook to let hooks modify values or prepare the cluster
-		if hook := r.hookReg.Get(name); hook != nil {
-			var hookErr error
-			extraValues, hookErr = hook.PreInstall(ctx, name, spec, config, extraValues)
-			if hookErr != nil {
-				log.Error(hookErr, "pre-install hook failed", "name", name)
-				rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
-					State:              k4allv1alpha1.ComponentStateFailed,
-					Message:            fmt.Sprintf("pre-install hook failed: %v", hookErr),
-					LastTransitionTime: metav1.Now(),
-				}
-				allOK = false
-				continue
+		extraValues, valuesErr := r.componentValues(ctx, name, spec, config)
+		if valuesErr != nil {
+			log.Error(valuesErr, "preparing component values failed", "name", name)
+			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
+				State:              k4allv1alpha1.ComponentStateFailed,
+				Message:            fmt.Sprintf("preparing values failed: %v", valuesErr),
+				LastTransitionTime: metav1.Now(),
 			}
+			allOK = false
+			continue
 		}
 
 		st, err := r.engine.ReconcileComponent(ctx, name, spec, extraValues)
@@ -455,19 +450,25 @@ func (r *ReleaseReconciler) getClusterConfig(ctx context.Context) (*k4allv1alpha
 	return &list.Items[0], nil
 }
 
-func (r *ReleaseReconciler) computeExtraValues(name string, config k4allv1alpha1.ClusterConfigSpec) map[string]interface{} {
-	extra := make(map[string]interface{})
-
-	if override, ok := config.ComponentOverrides[name]; ok && override.Values != nil {
-		overrideValues := make(map[string]interface{})
-		if err := override.Values.UnmarshalJSON(override.Values.Raw); err == nil {
-			for k, v := range overrideValues {
-				extra[k] = v
-			}
+// componentValues returns the values the engine layers on top of the
+// ReleaseManifest values of one component: the PreInstall hook's values
+// first, then the ClusterConfig componentOverrides, so the user always wins.
+// The PreInstall hook, if any, may also prepare the cluster.
+func (r *ReleaseReconciler) componentValues(
+	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+) (map[string]interface{}, error) {
+	values := make(map[string]interface{})
+	if hook := r.hookReg.Get(name); hook != nil {
+		var err error
+		if values, err = hook.PreInstall(ctx, name, spec, config, values); err != nil {
+			return nil, err
 		}
 	}
-
-	return extra
+	override, ok := config.ComponentOverrides[name]
+	if !ok {
+		return values, nil
+	}
+	return engine.ApplyOverride(values, override)
 }
 
 func (r *ReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
