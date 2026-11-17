@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"strings"
 	"time"
@@ -19,6 +20,11 @@ import (
 
 // StaticPodManager writes/removes static pod manifests on target nodes
 // via short-lived privileged jobs.
+//
+// Deprecated: the manifest it writes has only an image (no args, env or
+// volumes), and only on the control-plane node its Job lands on. k4all's one
+// static pod, kube-vip, is owned by the host from v2.4.0 (Unmanaged in the
+// ReleaseManifest). It never touches a manifest it did not write.
 type StaticPodManager struct {
 	client     client.Client
 	log        logr.Logger
@@ -34,15 +40,76 @@ func (s *StaticPodManager) Reconcile(ctx context.Context, name string, spec k4al
 		return fmt.Errorf("component %s: no image specified for static-pod", name)
 	}
 
-	s.log.Info("reconciling static pod", "component", name, "image", spec.Image)
+	s.log.Info("reconciling static pod (type static-pod is deprecated)", "component", name, "image", spec.Image)
 
 	manifest := s.generateStaticPodManifest(name, spec)
-	return s.writeManifestOnNodes(ctx, name, manifest)
+	return s.runNodeJob(ctx, fmt.Sprintf("staticpod-write-%s", name), s.writeScript(name, manifest))
 }
 
+// Remove deletes the component's manifest, if the operator wrote it.
 func (s *StaticPodManager) Remove(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec) error {
 	s.log.Info("removing static pod", "component", name)
-	return s.deleteManifestFromNodes(ctx, name)
+	err := s.runNodeJob(ctx, fmt.Sprintf("staticpod-rm-%s", name), s.removeScript(name))
+	if goerrors.Is(err, errForeignManifest) {
+		s.log.Info("static pod manifest not written by the k4all-operator: left in place", "component", name)
+		return nil
+	}
+	return err
+}
+
+// errForeignManifest: the node has a manifest for the component that the
+// operator did not write (no managed-by label); it is left alone.
+var errForeignManifest = goerrors.New("its static pod manifest was not written by the k4all-operator: left alone")
+
+// staticPodResult reports a component whose manifest the operator did not
+// write as Unmanaged with the reason. In the status only: management in the
+// ReleaseManifest spec belongs to the user and the host. Not as Failed
+// either, which would stop the host's sync.
+func staticPodResult(st *k4allv1alpha1.ComponentStatus, name string, err error) error {
+	if !goerrors.Is(err, errForeignManifest) {
+		return err
+	}
+	st.State = k4allv1alpha1.ComponentStateUnmanaged
+	st.Message = fmt.Sprintf("%s: %v; set management: Unmanaged in the ReleaseManifest", name, err)
+	st.LastTransitionTime = metav1.Now()
+	return nil
+}
+
+// foreignManifestMark is the termination message of a Job that found a
+// manifest the operator did not write.
+const foreignManifestMark = "foreign-manifest"
+
+// ownManifestLabel marks the manifests the operator writes.
+const ownManifestLabel = "app.kubernetes.io/managed-by: k4all-operator"
+
+// guardScript opens the node scripts: they stop, leaving the file and the
+// mark, when the component's manifest exists without the operator's label.
+// MANIFESTS and TERMINATION_LOG are overridable for tests.
+func (s *StaticPodManager) guardScript(name string) string {
+	return fmt.Sprintf(`#!/bin/sh
+set -e
+M="${MANIFESTS:-/manifests}"
+F="$M/%s.yaml"
+if [ -f "$F" ] && ! grep -q '%s' "$F"; then
+  echo "%s" > "${TERMINATION_LOG:-/dev/termination-log}"
+  echo "$F was not written by the k4all-operator: left alone"
+  exit 0
+fi
+`, name, ownManifestLabel, foreignManifestMark)
+}
+
+func (s *StaticPodManager) writeScript(name, manifest string) string {
+	return s.guardScript(name) + fmt.Sprintf(`cat > "$F" << 'STATICPOD'
+%s
+STATICPOD
+echo "Static pod manifest written to /etc/kubernetes/manifests/%s.yaml"
+`, manifest, name)
+}
+
+func (s *StaticPodManager) removeScript(name string) string {
+	return s.guardScript(name) + fmt.Sprintf(`rm -f "$F"
+echo "Removed static pod manifest %s"
+`, name)
 }
 
 func (s *StaticPodManager) generateStaticPodManifest(name string, spec k4allv1alpha1.ComponentSpec) string {
@@ -66,28 +133,6 @@ spec:
     image: %s
     imagePullPolicy: IfNotPresent
 `, name, ns, name, name, spec.Image)
-}
-
-func (s *StaticPodManager) writeManifestOnNodes(ctx context.Context, name, manifest string) error {
-	escapedManifest := strings.ReplaceAll(manifest, "'", "'\\''")
-	script := fmt.Sprintf(`#!/bin/sh
-set -e
-cat > /manifests/%s.yaml << 'STATICPOD'
-%s
-STATICPOD
-echo "Static pod manifest written to /etc/kubernetes/manifests/%s.yaml"
-`, name, escapedManifest, name)
-
-	return s.runNodeJob(ctx, fmt.Sprintf("staticpod-write-%s", name), script)
-}
-
-func (s *StaticPodManager) deleteManifestFromNodes(ctx context.Context, name string) error {
-	script := fmt.Sprintf(`#!/bin/sh
-rm -f /manifests/%s.yaml
-echo "Removed static pod manifest %s"
-`, name, name)
-
-	return s.runNodeJob(ctx, fmt.Sprintf("staticpod-rm-%s", name), script)
 }
 
 func (s *StaticPodManager) runNodeJob(ctx context.Context, jobName, script string) error {
@@ -156,7 +201,27 @@ func (s *StaticPodManager) runNodeJob(ctx context.Context, jobName, script strin
 		return fmt.Errorf("create static pod job: %w", err)
 	}
 
-	return s.waitForJob(ctx, jobName, namespace, 2*time.Minute)
+	if err := s.waitForJob(ctx, jobName, namespace, 2*time.Minute); err != nil {
+		return err
+	}
+	return s.jobMark(ctx, jobName, namespace)
+}
+
+// jobMark returns errForeignManifest when the Job's pod ended with
+// foreignManifestMark as its termination message.
+func (s *StaticPodManager) jobMark(ctx context.Context, jobName, namespace string) error {
+	pods := &corev1.PodList{}
+	if err := s.client.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{"job-name": jobName}); err != nil {
+		return fmt.Errorf("read the result of job %s: %w", jobName, err)
+	}
+	for _, p := range pods.Items {
+		for _, c := range p.Status.ContainerStatuses {
+			if t := c.State.Terminated; t != nil && strings.TrimSpace(t.Message) == foreignManifestMark {
+				return errForeignManifest
+			}
+		}
+	}
+	return nil
 }
 
 func (s *StaticPodManager) waitForJob(ctx context.Context, name, namespace string, timeout time.Duration) error {

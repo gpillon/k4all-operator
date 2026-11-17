@@ -70,6 +70,7 @@ func TestComponentValues_TraefikDedicatedIPUsesALoadBalancer(t *testing.T) {
 		{"ports", "web", "hostPort"},
 		{"ports", "websecure", "hostPort"},
 		{"service", "spec", "externalIPs"},
+		{"service", "spec", "loadBalancerClass"}, // MetalLB's, without a class
 	} {
 		if v, ok := valueAt(got, path...); ok {
 			t.Errorf("%v = %v, want unset with a dedicated IP", path, v)
@@ -77,39 +78,66 @@ func TestComponentValues_TraefikDedicatedIPUsesALoadBalancer(t *testing.T) {
 	}
 }
 
-// Without host ports the service carries the node IP, as nginx's did.
+// Not the default class, without a dedicated IP: the service carries the
+// node IP, as nginx's did.
 func TestComponentValues_TraefikWithoutHostPorts(t *testing.T) {
-	cases := map[string]k4allv1alpha1.ClusterConfigSpec{
-		"kube-vip": {
-			Cluster: k4allv1alpha1.ControlPlaneConfig{HA: k4allv1alpha1.HAConfig{Type: "kubevip"}},
-			Ingress: k4allv1alpha1.IngressConfig{Nginx: &k4allv1alpha1.NginxIngressConfig{IsDefault: true}},
-		},
-		"not the default class": {
-			Ingress: k4allv1alpha1.IngressConfig{Nginx: &k4allv1alpha1.NginxIngressConfig{IsDefault: false}},
-		},
-	}
-	for name, config := range cases {
-		t.Run(name, func(t *testing.T) {
-			got := traefikValues(t, config)
+	got := traefikValues(t, k4allv1alpha1.ClusterConfigSpec{
+		Ingress: k4allv1alpha1.IngressConfig{Nginx: &k4allv1alpha1.NginxIngressConfig{IsDefault: false}},
+	})
 
-			expectValue(t, got, "LoadBalancer", "service", "spec", "type")
-			expectValue(t, got, nodeIP, "service", "spec", "loadBalancerIP")
-			expectValue(t, got, []interface{}{nodeIP}, "service", "spec", "externalIPs")
-			if v, ok := valueAt(got, "ports"); ok {
-				t.Errorf("ports = %v, want no host ports", v)
-			}
-		})
+	expectValue(t, got, "LoadBalancer", "service", "spec", "type")
+	expectValue(t, got, nodeIP, "service", "spec", "loadBalancerIP")
+	expectValue(t, got, []interface{}{nodeIP}, "service", "spec", "externalIPs")
+	if v, ok := valueAt(got, "ports"); ok {
+		t.Errorf("ports = %v, want no host ports", v)
+	}
+	if v, ok := valueAt(got, "service", "spec", "loadBalancerClass"); ok {
+		t.Errorf("loadBalancerClass = %v, want none", v)
 	}
 }
 
-func TestComponentValues_TraefikKubeVIPClass(t *testing.T) {
-	config := k4allv1alpha1.ClusterConfigSpec{
+func kubeVIPCluster(ingress k4allv1alpha1.IngressConfig) k4allv1alpha1.ClusterConfigSpec {
+	return k4allv1alpha1.ClusterConfigSpec{
 		Cluster: k4allv1alpha1.ControlPlaneConfig{HA: k4allv1alpha1.HAConfig{Type: "kubevip"}},
+		Ingress: ingress,
 	}
+}
 
-	got := traefikValues(t, config)
+// With HA kube-vip, the host's kube-vip (lb_class_only) announces the
+// ingress IP, not MetalLB: the service asks for it through its class.
+func TestComponentValues_TraefikDedicatedIPOnKubeVIP(t *testing.T) {
+	got := traefikValues(t, kubeVIPCluster(k4allv1alpha1.IngressConfig{
+		Traefik: &k4allv1alpha1.TraefikIngressConfig{DedicatedIP: "192.168.6.201", IsDefault: true},
+	}))
 
+	expectValue(t, got, "LoadBalancer", "service", "spec", "type")
+	expectValue(t, got, "192.168.6.201", "service", "spec", "loadBalancerIP")
 	expectValue(t, got, "kube-vip.io/kube-vip-class", "service", "spec", "loadBalancerClass")
+	if v, ok := valueAt(got, "ports"); ok {
+		t.Errorf("ports = %v, want no host ports", v)
+	}
+}
+
+// Without a dedicated IP there is no address for kube-vip to announce: a
+// node's IP is that node's, and the API VIP is announced already. Traefik,
+// a DaemonSet on the control planes, takes their ports 80/443, so the
+// routes answer on every control plane and on the API VIP.
+func TestComponentValues_TraefikOnKubeVIPWithoutDedicatedIPUsesHostPorts(t *testing.T) {
+	got := traefikValues(t, kubeVIPCluster(k4allv1alpha1.IngressConfig{
+		Traefik: &k4allv1alpha1.TraefikIngressConfig{IsDefault: true},
+	}))
+
+	expectValue(t, got, "ClusterIP", "service", "spec", "type")
+	expectValue(t, got, float64(80), "ports", "web", "hostPort")
+	expectValue(t, got, float64(443), "ports", "websecure", "hostPort")
+	for _, path := range [][]string{
+		{"service", "spec", "loadBalancerClass"},
+		{"service", "spec", "loadBalancerIP"},
+	} {
+		if v, ok := valueAt(got, path...); ok {
+			t.Errorf("%v = %v, want unset", path, v)
+		}
+	}
 }
 
 // Once ingress.traefik is present it wins, even when it is all defaults:

@@ -32,6 +32,10 @@ func (h *TraefikHook) PreInstall(ctx context.Context, _ string, _ k4allv1alpha1.
 	if cfg.DedicatedIP != "" {
 		serviceSpec["type"] = serviceTypeLoadBalancer
 		serviceSpec["loadBalancerIP"] = cfg.DedicatedIP
+		if kubeVIPIngressIP(config) != "" {
+			// The host's kube-vip (lb_class_only) announces it, not MetalLB.
+			serviceSpec["loadBalancerClass"] = kubeVIPLoadBalancer
+		}
 		return values, nil
 	}
 
@@ -42,19 +46,18 @@ func (h *TraefikHook) PreInstall(ctx context.Context, _ string, _ k4allv1alpha1.
 		serviceSpec["externalIPs"] = []string{nodeIP}
 	}
 
-	kubeVIP := config.Cluster.HA.Type == haTypeKubeVIP
-	if kubeVIP || !cfg.IsDefault {
+	if !cfg.IsDefault {
 		serviceSpec["type"] = serviceTypeLoadBalancer
 		if nodeIP != "" {
 			serviceSpec["loadBalancerIP"] = nodeIP
 		}
-		if kubeVIP {
-			serviceSpec["loadBalancerClass"] = kubeVIPLoadBalancer
-		}
 		return values, nil
 	}
 
-	// No dedicated IP and no kube-vip: listen on the node's own ports.
+	// No dedicated IP: listen on the node's own ports. With kube-vip too:
+	// there is no address for it to announce (a node's IP is that node's,
+	// the API VIP is announced already), and on the control planes the
+	// routes then answer on the API VIP as well.
 	nested(values, "ports", "web")["hostPort"] = 80
 	nested(values, "ports", "websecure")["hostPort"] = 443
 	serviceSpec["type"] = "ClusterIP"
@@ -64,6 +67,17 @@ func (h *TraefikHook) PreInstall(ctx context.Context, _ string, _ k4allv1alpha1.
 	rollingUpdate["maxSurge"] = 0
 
 	return values, nil
+}
+
+// kubeVIPIngressIP is the ingress IP the host's kube-vip announces, through
+// the kube-vip LoadBalancer class: ingress.traefik.dedicatedIP when HA is
+// kube-vip. "" otherwise, and on clusters whose ClusterConfig has no
+// ingress.traefik yet: their nginx IP stays MetalLB's.
+func kubeVIPIngressIP(config k4allv1alpha1.ClusterConfigSpec) string {
+	if config.Cluster.HA.Type != haTypeKubeVIP || config.Ingress.Traefik == nil {
+		return ""
+	}
+	return config.Ingress.Traefik.DedicatedIP
 }
 
 // traefikConfig returns ingress.traefik, or the nginx settings on clusters

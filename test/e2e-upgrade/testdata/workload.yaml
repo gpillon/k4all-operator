@@ -29,3 +29,31 @@ spec:
         - name: sleep
           image: busybox:1.37
           command: ["sleep", "infinity"]
+---
+# Like tigera-operator: it tolerates every taint, the cordon included, so its
+# ReplicaSet puts it back on the node being drained. The nodeSelector keeps
+# it on the control plane (the bootstrap node), so it always comes back there.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comes-back
+  namespace: k4all-e2e-upgrade
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: comes-back
+  template:
+    metadata:
+      labels:
+        app: comes-back
+    spec:
+      terminationGracePeriodSeconds: 1
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: sleep
+          image: busybox:1.37
+          command: ["sleep", "infinity"]

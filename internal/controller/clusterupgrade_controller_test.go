@@ -3,14 +3,18 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/upgradegraph"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -106,12 +110,12 @@ func (b *upgradeTestbed) node(name string) *corev1.Node {
 	return n
 }
 
-// pod creates a running pod bound to nodeName.
-func (b *upgradeTestbed) pod(name, nodeName string, owners ...metav1.OwnerReference) *corev1.Pod {
+// pod creates a running pod bound to the node cu-cp, the one drained first.
+func (b *upgradeTestbed) pod(name string, owners ...metav1.OwnerReference) *corev1.Pod {
 	b.t.Helper()
 	p := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, OwnerReferences: owners},
-		Spec:       corev1.PodSpec{NodeName: nodeName, Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+		Spec:       corev1.PodSpec{NodeName: "cu-cp", Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
 	}
 	if err := b.c.Create(context.Background(), p); err != nil {
 		b.t.Fatal(err)
@@ -175,9 +179,9 @@ func TestClusterUpgrade_DrainsTheNodeThenAsksForTheHop(t *testing.T) {
 		upgradeNode("cu-cp", "bootstrap", "v2.5.0"),
 		upgradeNode("cu-w", "worker", "v2.5.0"))
 	b.reconcile()
-	app := b.pod("app", "cu-cp")
-	ds := b.pod("ds", "cu-cp", metav1.OwnerReference{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "ds", UID: "ds-uid"})
-	self := b.pod("k4all-operator", "cu-cp")
+	app := b.pod("app")
+	ds := b.pod("ds", metav1.OwnerReference{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "ds", UID: "ds-uid"})
+	self := b.pod("k4all-operator")
 	b.targetNextRelease()
 
 	b.reconcile()
@@ -207,6 +211,93 @@ func TestClusterUpgrade_DrainsTheNodeThenAsksForTheHop(t *testing.T) {
 	}
 	if cu.Status.Nodes[0].Phase != k4allv1alpha1.NodeUpgradeUpgrading {
 		t.Errorf("cu-cp phase = %s, want Upgrading", cu.Status.Nodes[0].Phase)
+	}
+}
+
+// A pod that tolerates the cordon is put back on the node by its controller
+// (tigera-operator in the lab): the drain neither evicts it again nor waits
+// for it, and names it.
+func TestClusterUpgrade_DrainLeavesThePodsPutBackOnTheNode(t *testing.T) {
+	b := newUpgradeTestbed(t,
+		upgradeNode("cu-cp", "bootstrap", "v2.5.0"),
+		upgradeNode("cu-w", "worker", "v2.5.0"))
+	b.reconcile()
+	app := b.pod("app")
+	b.targetNextRelease()
+	b.reconcile() // cordon
+
+	time.Sleep(1100 * time.Millisecond) // creation times have a one-second resolution
+	back := b.pod("app-back")
+	b.reconcile()
+	if !b.evicted(app) {
+		t.Fatalf("pod app was not evicted")
+	}
+	if b.evicted(back) {
+		t.Errorf("evicted app-back, put on the node after the drain started")
+	}
+
+	// The kubelet finishes the eviction of app.
+	if err := b.c.Delete(context.Background(), app, client.GracePeriodSeconds(0)); client.IgnoreNotFound(err) != nil {
+		t.Fatal(err)
+	}
+	cu := b.reconcile()
+	if got := b.node("cu-cp").Annotations[k4allv1alpha1.NodeUpgradeTargetAnnotation]; got != nextRelease {
+		t.Errorf("cu-cp upgrade-target = %q with only app-back left, want %s", got, nextRelease)
+	}
+	if msg := cu.Status.Nodes[0].Message; !strings.Contains(msg, "default/app-back") {
+		t.Errorf("cu-cp message = %q, want app-back named", msg)
+	}
+}
+
+// The drain names the PodDisruptionBudget that refuses an eviction.
+func TestClusterUpgrade_DrainNamesThePDBThatRefuses(t *testing.T) {
+	b := newUpgradeTestbed(t,
+		upgradeNode("cu-cp", "bootstrap", "v2.5.0"),
+		upgradeNode("cu-w", "worker", "v2.5.0"))
+	b.reconcile()
+	app := b.pod("app")
+	app.Labels = map[string]string{"app": "pdb-guarded"}
+	if err := b.c.Update(context.Background(), app); err != nil {
+		t.Fatal(err)
+	}
+	// The eviction API ignores budgets for Pending pods: make it Running.
+	app.Status = corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+	}}
+	if err := b.c.Status().Update(context.Background(), app); err != nil {
+		t.Fatal(err)
+	}
+	minAvailable := intstr.FromInt32(1)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "app-pdb"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &minAvailable,
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "pdb-guarded"}},
+		},
+	}
+	if err := b.c.Create(context.Background(), pdb); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.c.Delete(context.Background(), pdb) })
+	// What the disruption controller, absent from envtest, would report.
+	pdb.Status = policyv1.PodDisruptionBudgetStatus{
+		ObservedGeneration: pdb.Generation, DisruptionsAllowed: 0, CurrentHealthy: 0, DesiredHealthy: 1, ExpectedPods: 1,
+	}
+	if err := b.c.Status().Update(context.Background(), pdb); err != nil {
+		t.Fatal(err)
+	}
+	b.targetNextRelease()
+	b.reconcile() // cordon
+
+	cu := b.reconcile()
+	if b.evicted(app) {
+		t.Fatalf("app was evicted despite its PodDisruptionBudget")
+	}
+	if msg := cu.Status.Nodes[0].Message; !strings.Contains(msg, "PDB default/app-pdb") {
+		t.Errorf("cu-cp message = %q, want the PodDisruptionBudget named", msg)
+	}
+	if !strings.Contains(cu.Status.Message, "PDB default/app-pdb") {
+		t.Errorf("message = %q, want the PodDisruptionBudget named", cu.Status.Message)
 	}
 }
 

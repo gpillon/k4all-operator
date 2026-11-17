@@ -123,7 +123,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if r.engine == nil {
 		r.engine = engine.New(r.Client, r.RestConfig, r.Log.WithName("engine"), r.ToolsImage)
-		r.hookReg = hooks.NewRegistry(r.Client, r.Log)
+		r.hookReg = hooks.NewRegistry(r.Client, r.Log, hooks.WithRestConfig(r.RestConfig))
 	}
 
 	// The release may need the ClusterConfig in a new shape before its
@@ -311,6 +311,11 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 		currentStatus := rm.Status.Components[name]
 		hash := r.appliedHash(name, spec, config)
 
+		// A static pod whose manifest the operator did not write stays left
+		// alone until the component's spec changes.
+		if currentStatus.State == k4allv1alpha1.ComponentStateUnmanaged && currentStatus.AppliedHash == hash {
+			continue
+		}
 		if r.engine.IsInstalled(ctx, name, spec, &currentStatus) {
 			switch currentStatus.AppliedHash {
 			case hash:

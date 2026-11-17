@@ -158,6 +158,18 @@ func TestHeadlampHook_DashboardOnTraefik(t *testing.T) {
 	}
 }
 
+// With a dedicated IP ingress-nginx is not on the node's ports: the dashboard
+// host names the IP that serves it, as update-routes.sh does.
+func TestHeadlampHook_DashboardOnTheNginxDedicatedIP(t *testing.T) {
+	ing := dashboard(t, k4allv1alpha1.ClusterConfigSpec{Ingress: k4allv1alpha1.IngressConfig{
+		Nginx: &k4allv1alpha1.NginxIngressConfig{DedicatedIP: "192.168.6.193", IsDefault: false},
+	}}, releaseManifest("ingress-nginx"))
+
+	if want := []string{"dashboard.192.168.6.193.nip.io"}; !reflect.DeepEqual(hosts(ing), want) {
+		t.Errorf("hosts = %v, want %v", hosts(ing), want)
+	}
+}
+
 // Traefik drops a router whose middleware does not exist: no redirect
 // rather than no dashboard.
 func TestHeadlampHook_NoRedirectWithoutTheMiddleware(t *testing.T) {

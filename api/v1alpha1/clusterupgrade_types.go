@@ -102,6 +102,14 @@ type DrainSpec struct {
 	// stop at its reboot.
 	// +optional
 	ContinueOnTimeout bool `json:"continueOnTimeout,omitempty"`
+
+	// Minutes to wait, after a node finishes its hop, for every
+	// PodDisruptionBudget to have its healthy pods again before the next
+	// node is cordoned. Then the next node starts anyway. 0 does not wait.
+	// +optional
+	// +kubebuilder:default=10
+	// +kubebuilder:validation:Minimum=0
+	SettleMinutes *int32 `json:"settleMinutes,omitempty"`
 }
 
 // ClusterUpgradePhase is where the whole upgrade stands.

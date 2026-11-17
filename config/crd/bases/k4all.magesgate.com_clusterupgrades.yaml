@@ -70,6 +70,15 @@ spec:
                       Run the hop anyway when the drain times out. The pods left on the node
                       stop at its reboot.
                     type: boolean
+                  settleMinutes:
+                    default: 10
+                    description: |-
+                      Minutes to wait, after a node finishes its hop, for every
+                      PodDisruptionBudget to have its healthy pods again before the next
+                      node is cordoned. Then the next node starts anyway. 0 does not wait.
+                    format: int32
+                    minimum: 0
+                    type: integer
                   timeoutMinutes:
                     default: 30
                     description: |-

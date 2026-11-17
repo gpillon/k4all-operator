@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
@@ -95,12 +96,20 @@ func (r *NodeConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reconcileOVSBridge(ctx, log, node); err != nil {
+	waiting, err := r.reconcileOVSBridge(ctx, log, node)
+	if err != nil {
 		log.Error(err, "OVS bridge reconciliation failed")
 	}
-
+	if waiting || err != nil {
+		// The Node may not change for minutes: come back for the bridge.
+		return ctrl.Result{RequeueAfter: ovsBridgeRetry}, nil
+	}
 	return ctrl.Result{}, nil
 }
+
+// ovsBridgeRetry is how soon the bridge is tried again while nmstate is not
+// ready for it.
+const ovsBridgeRetry = 30 * time.Second
 
 func (r *NodeConfigReconciler) handleNodeDeletion(ctx context.Context, name string) (ctrl.Result, error) {
 	nc := &k4allv1alpha1.NodeConfig{}
@@ -147,43 +156,46 @@ func (r *NodeConfigReconciler) getClusterConfig(ctx context.Context) (*k4allv1al
 	return &list.Items[0], nil
 }
 
-func (r *NodeConfigReconciler) reconcileOVSBridge(ctx context.Context, log logr.Logger, node *corev1.Node) error {
+// reconcileOVSBridge creates the node's OVS bridge NNCP when the feature is
+// on. It reports waiting while nmstate is not ready for it yet: no nmstate
+// CRDs, or no default route in the node's NodeNetworkState.
+func (r *NodeConfigReconciler) reconcileOVSBridge(ctx context.Context, log logr.Logger, node *corev1.Node) (bool, error) {
 	config, err := r.getClusterConfig(ctx)
 	if err != nil {
-		return nil
+		return false, nil
 	}
 
 	if !config.Spec.Features.OVSBridge.Enabled {
-		return nil
+		return false, nil
 	}
 
 	name := nncpName(node.Name)
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(schema.GroupVersionKind{Group: "nmstate.io", Version: "v1", Kind: "NodeNetworkConfigurationPolicy"})
 	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: name}, existing); err == nil {
-		return nil
+		return false, nil
 	} else if isNoMatchError(err) {
-		log.V(1).Info("nmstate CRDs not available yet, skipping OVS bridge reconciliation")
-		return nil
+		log.V(1).Info("nmstate CRDs not available yet, OVS bridge waits")
+		return true, nil
 	} else if !errors.IsNotFound(err) {
-		return fmt.Errorf("check existing NNCP: %w", err)
+		return false, fmt.Errorf("check existing NNCP: %w", err)
 	}
 
 	nicName, err := r.detectDefaultNIC(ctx, node.Name)
 	if err != nil {
-		return fmt.Errorf("detect default NIC for %s: %w", node.Name, err)
+		return false, fmt.Errorf("detect default NIC for %s: %w", node.Name, err)
 	}
 	if nicName == "" {
-		log.Info("no default route interface found in NodeNetworkState, skipping NNCP creation", "node", node.Name)
-		return nil
+		log.Info("no default route interface found in NodeNetworkState yet, OVS bridge waits", "node", node.Name)
+		return true, nil
 	}
 
 	nncp := buildOVSBridgeNNCP(name, node.Name, nicName)
 	if err := r.Create(ctx, nncp); err != nil {
-		return fmt.Errorf("create NNCP %s: %w", name, err)
+		return false, fmt.Errorf("create NNCP %s: %w", name, err)
 	}
 	log.Info("created OVS bridge NNCP", "nncp", name, "nic", nicName, "node", node.Name)
-	return nil
+	return false, nil
 }
 
 func (r *NodeConfigReconciler) detectDefaultNIC(ctx context.Context, nodeName string) (string, error) {

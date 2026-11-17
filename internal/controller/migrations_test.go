@@ -112,3 +112,75 @@ func TestMigrations_RemoveTheNginxKey(t *testing.T) {
 		t.Errorf("spec.ingress.traefik = %v, want dedicatedIP 192.168.6.193 and isDefault false", ingress["traefik"])
 	}
 }
+
+// At step 1/2 of the k4all v2.4.0 sync, operator v0.5.0 starts with the
+// cluster's v2.2.x ReleaseManifest (ingress-nginx, no traefik): until step
+// 2/2 brings Traefik, the nginx-to-traefik migration must neither convert
+// nor count itself. With Traefik in and ingress-nginx Removed, it does both.
+func TestMigrations_WaitForTraefikInTheReleaseManifest(t *testing.T) {
+	c := envtestClient(t)
+	ctx := context.Background()
+	cc := &k4allv1alpha1.ClusterConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "migrate-at-v24-sync"},
+		Spec: k4allv1alpha1.ClusterConfigSpec{
+			Networking: k4allv1alpha1.NetworkingConfig{CNI: k4allv1alpha1.CNIConfig{Type: "calico"}},
+			Ingress: k4allv1alpha1.IngressConfig{
+				Nginx: &k4allv1alpha1.NginxIngressConfig{DedicatedIP: "192.168.6.193", IsDefault: false},
+			},
+		},
+	}
+	if err := c.Create(ctx, cc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), cc) })
+
+	stored := func() *k4allv1alpha1.ClusterConfig {
+		got := &k4allv1alpha1.ClusterConfig{}
+		if err := c.Get(ctx, types.NamespacedName{Name: cc.Name}, got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	manifest := func(components map[string]k4allv1alpha1.ComponentManagement) *k4allv1alpha1.ReleaseManifest {
+		rm := &k4allv1alpha1.ReleaseManifest{Spec: k4allv1alpha1.ReleaseManifestSpec{
+			Components: map[string]k4allv1alpha1.ComponentSpec{},
+		}}
+		for name, m := range components {
+			rm.Spec.Components[name] = k4allv1alpha1.ComponentSpec{Type: "helm", Version: "1", Management: m}
+		}
+		return rm
+	}
+
+	v22 := manifest(map[string]k4allv1alpha1.ComponentManagement{
+		"ingress-nginx": k4allv1alpha1.ComponentManagementManaged,
+		"headlamp":      k4allv1alpha1.ComponentManagementManaged,
+	})
+	if changed, err := migrations.Run(ctx, c, v22, stored()); err != nil || changed {
+		t.Fatalf("v2.2.x manifest: changed %t, err %v; want no change", changed, err)
+	}
+	got := stored()
+	if got.Spec.Ingress.Nginx == nil || got.Spec.Ingress.Traefik != nil {
+		t.Errorf("v2.2.x manifest: ingress = nginx %+v, traefik %+v; want it untouched", got.Spec.Ingress.Nginx, got.Spec.Ingress.Traefik)
+	}
+	if v, ok := got.Annotations[migrations.AppliedAnnotation]; ok {
+		t.Errorf("v2.2.x manifest: %s = %q, want none", migrations.AppliedAnnotation, v)
+	}
+
+	v24 := manifest(map[string]k4allv1alpha1.ComponentManagement{
+		"ingress-nginx": k4allv1alpha1.ComponentManagementRemoved,
+		"traefik":       k4allv1alpha1.ComponentManagementManaged,
+		"headlamp":      k4allv1alpha1.ComponentManagementManaged,
+	})
+	if changed, err := migrations.Run(ctx, c, v24, stored()); err != nil || !changed {
+		t.Fatalf("v2.4.0 manifest: changed %t, err %v; want a change", changed, err)
+	}
+	got = stored()
+	want := k4allv1alpha1.TraefikIngressConfig{DedicatedIP: "192.168.6.193", IsDefault: false}
+	if got.Spec.Ingress.Nginx != nil || got.Spec.Ingress.Traefik == nil || *got.Spec.Ingress.Traefik != want {
+		t.Errorf("v2.4.0 manifest: ingress = nginx %+v, traefik %+v; want only traefik %+v",
+			got.Spec.Ingress.Nginx, got.Spec.Ingress.Traefik, want)
+	}
+	if v := got.Annotations[migrations.AppliedAnnotation]; v != "1" {
+		t.Errorf("v2.4.0 manifest: %s = %q, want \"1\"", migrations.AppliedAnnotation, v)
+	}
+}

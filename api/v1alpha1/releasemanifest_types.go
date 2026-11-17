@@ -21,6 +21,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ComponentType is how a component is installed. static-pod is deprecated:
+// its manifest has only an image, no args, env or volumes; the operator
+// leaves alone a manifest it did not write.
 // +kubebuilder:validation:Enum=helm;"helm-oci";manifest;binary;"static-pod"
 type ComponentType string
 
@@ -29,7 +32,7 @@ const (
 	ComponentTypeHelmOCI   ComponentType = "helm-oci"
 	ComponentTypeManifest  ComponentType = "manifest"
 	ComponentTypeBinary    ComponentType = "binary"
-	ComponentTypeStaticPod ComponentType = "static-pod"
+	ComponentTypeStaticPod ComponentType = "static-pod" // deprecated, see ComponentType
 )
 
 // +kubebuilder:validation:Enum=merge;strategic;json
@@ -79,7 +82,9 @@ type OSImageSpec struct {
 }
 
 type ComponentSpec struct {
-	// Type of component installation strategy
+	// Type of component installation strategy. static-pod is deprecated: its
+	// manifest has only an image, and the operator leaves alone a manifest
+	// it did not write.
 	Type ComponentType `json:"type"`
 	// Lifecycle management policy: Managed (default), Removed, or Unmanaged
 	// +kubebuilder:default=Managed
