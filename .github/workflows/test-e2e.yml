@@ -32,6 +32,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ClusterUpgrade on three nodes, a fake k4all-upgrade playing the
+          # nodes' side of the protocol (test/e2e-upgrade).
+          - kubernetes: "1.35"
+            suite: cluster-upgrade
+            node-image: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+            kind-config: test/e2e-upgrade/kind.yaml
+            e2e-suite: ./test/e2e-upgrade/
           - kubernetes: "1.35"
             node-image: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
             cluster-config: test/e2e/testdata/clusterconfig.yaml
@@ -45,13 +52,6 @@ jobs:
             node-image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
             cluster-config: test/e2e/testdata/clusterconfig-v2.6.yaml
             release-manifest: test/e2e/testdata/releasemanifest-v2.6.yaml
-          # ClusterUpgrade on three nodes, a fake k4all-upgrade playing the
-          # nodes' side of the protocol (test/e2e-upgrade).
-          - kubernetes: "1.35"
-            suite: cluster-upgrade
-            node-image: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
-            kind-config: test/e2e-upgrade/kind.yaml
-            e2e-suite: ./test/e2e-upgrade/
     env:
       KIND_NODE_IMAGE: ${{ matrix.node-image }}
       E2E_CLUSTER_CONFIG: ${{ matrix.cluster-config }}
