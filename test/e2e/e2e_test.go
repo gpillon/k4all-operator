@@ -330,7 +330,7 @@ func upgradeTo(file string, from, to *k4allv1alpha1.ReleaseManifest) {
 			pending = append(pending, fmt.Sprintf("%s=%s (%s)", name, componentStatus(name), componentMessage(name)))
 		}
 		return pending
-	}, 60*time.Minute, pollInterval).Should(BeEmpty(), "components not at their target state")
+	}, 20*time.Minute, pollInterval).Should(BeEmpty(), "components not at their target state")
 
 	certManager := to.Spec.Components["cert-manager"]
 	if certManager.Version != from.Spec.Components["cert-manager"].Version {
