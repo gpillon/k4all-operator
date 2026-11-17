@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
 	"github.com/gpillon/k4all-operator/internal/engine"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -72,6 +74,15 @@ type ReleaseReconciler struct {
 
 const ForceResyncAnnotation = "k4all.magesgate.com/force-resync"
 
+// UpgradeInProgressAnnotation is set by the host tool k4all-upgrade on its own
+// Node while an OS/Kubernetes hop is running (value "<from>-><to>"). While any
+// Node carries it, components are not reconciled: no installs, no upgrades, no
+// operator self-update and no re-resolution of "latest" versions.
+const UpgradeInProgressAnnotation = "k4all.magesgate.com/upgrade-in-progress"
+
+// upgradePollInterval is how often a paused reconcile checks whether the hop is over.
+const upgradePollInterval = 30 * time.Second
+
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("releasemanifest", req.Name)
 	rm := &k4allv1alpha1.ReleaseManifest{}
@@ -88,6 +99,20 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		engine.SetReadyCondition(rm, metav1.ConditionFalse, "ClusterConfigNotFound", err.Error())
 		_ = r.patchStatus(ctx, rm)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	upgrading, err := r.nodesUpgrading(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if upgrading != "" {
+		log.Info("component reconcile paused", "upgrading", upgrading)
+		engine.SetReadyCondition(rm, metav1.ConditionFalse, "UpgradeInProgress",
+			"node upgrade in progress: "+upgrading)
+		if err := r.patchStatus(ctx, rm); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: upgradePollInterval}, nil
 	}
 
 	if r.engine == nil {
@@ -437,6 +462,23 @@ func (r *ReleaseReconciler) patchStatus(ctx context.Context, rm *k4allv1alpha1.R
 	}
 	patch := client.RawPatch(types.MergePatchType, raw)
 	return r.Status().Patch(ctx, rm, patch)
+}
+
+// nodesUpgrading lists the Nodes carrying UpgradeInProgressAnnotation as
+// "node (hop), ...", sorted by name; empty when no upgrade is running.
+func (r *ReleaseReconciler) nodesUpgrading(ctx context.Context) (string, error) {
+	nodes := &corev1.NodeList{}
+	if err := r.List(ctx, nodes); err != nil {
+		return "", fmt.Errorf("list nodes: %w", err)
+	}
+	var upgrading []string
+	for _, n := range nodes.Items {
+		if hop, ok := n.Annotations[UpgradeInProgressAnnotation]; ok {
+			upgrading = append(upgrading, fmt.Sprintf("%s (%s)", n.Name, hop))
+		}
+	}
+	sort.Strings(upgrading)
+	return strings.Join(upgrading, ", "), nil
 }
 
 func (r *ReleaseReconciler) getClusterConfig(ctx context.Context) (*k4allv1alpha1.ClusterConfig, error) {
