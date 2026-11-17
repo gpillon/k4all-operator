@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -99,7 +100,9 @@ func (e *Engine) ReconcileComponent(
 	case k4allv1alpha1.ComponentTypeBinary:
 		err = e.binary.Install(ctx, name, spec)
 	case k4allv1alpha1.ComponentTypeStaticPod:
-		err = e.staticPod.Reconcile(ctx, name, spec)
+		if err = e.staticPod.Reconcile(ctx, name, spec); goerrors.Is(err, errForeignManifest) {
+			return st, staticPodResult(st, name, err)
+		}
 	default:
 		err = fmt.Errorf("unsupported component type: %s", spec.Type)
 	}

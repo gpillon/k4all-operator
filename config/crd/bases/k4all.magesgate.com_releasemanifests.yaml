@@ -154,7 +154,10 @@ spec:
                         type: string
                       type: array
                     type:
-                      description: Type of component installation strategy
+                      description: |-
+                        Type of component installation strategy. static-pod is deprecated: its
+                        manifest has only an image, and the operator leaves alone a manifest
+                        it did not write.
                       enum:
                       - helm
                       - helm-oci

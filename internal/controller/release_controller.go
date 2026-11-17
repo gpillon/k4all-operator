@@ -311,6 +311,11 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 		currentStatus := rm.Status.Components[name]
 		hash := r.appliedHash(name, spec, config)
 
+		// A static pod whose manifest the operator did not write stays left
+		// alone until the component's spec changes.
+		if currentStatus.State == k4allv1alpha1.ComponentStateUnmanaged && currentStatus.AppliedHash == hash {
+			continue
+		}
 		if r.engine.IsInstalled(ctx, name, spec, &currentStatus) {
 			switch currentStatus.AppliedHash {
 			case hash:
