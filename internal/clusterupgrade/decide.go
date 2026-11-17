@@ -32,6 +32,8 @@ const (
 	Evict ActionKind = "Evict"
 	// Write upgrade-target: Release, the hop k4all-upgrade runs.
 	SetTarget ActionKind = "SetTarget"
+	// Uncordon the node past its reboot and mark it upgrade-cordoned: released.
+	Uncordon ActionKind = "Uncordon"
 	// Uncordon the node if the operator cordoned it, and clear the
 	// upgrade-target, upgrade-done and upgrade-cordoned annotations.
 	Finish ActionKind = "Finish"
@@ -341,7 +343,7 @@ func cordonNext(in Input, status *k4allv1alpha1.ClusterUpgradeStatus, hop string
 }
 
 // step moves on the node the operator cordoned: drain it, ask for the hop,
-// wait for k4all-upgrade, then finish it.
+// uncordon it once k4all-upgrade is past the reboot, then finish it.
 func step(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) []Action {
 	target := node.Annotations[k4allv1alpha1.NodeUpgradeTargetAnnotation]
 	if target == "" {
@@ -355,7 +357,8 @@ func step(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) [
 		return []Action{{Kind: Finish, Node: n.Name}}
 	}
 	n.Phase = k4allv1alpha1.NodeUpgradeUpgrading
-	if n.HostPhase == hostHold {
+	switch n.HostPhase {
+	case hostHold:
 		n.Phase = k4allv1alpha1.NodeUpgradeFailed
 		n.Message = hostMessage(node, "k4all-upgrade stopped the hop")
 		n.Reason = k4allv1alpha1.NodeReasonHostHold
@@ -363,14 +366,23 @@ func step(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) [
 		case k4allv1alpha1.NodeReasonTargetRejected, k4allv1alpha1.NodeReasonRollbackRebooted:
 			n.Reason = r
 		}
+	case hostSync, hostCommit:
+		// Past the reboot: the node is Ready on the new release, and the
+		// SYNC may start pods that only fit on it.
+		if node.Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation] == k4allv1alpha1.NodeCordonedByOperator {
+			return []Action{{Kind: Uncordon, Node: n.Name}}
+		}
 	}
 	return nil
 }
 
-// Phases of k4all-upgrade that stop a hop.
+// Phases of k4all-upgrade: the ones that stop a hop, and the ones after the
+// node rebooted healthy on the new release.
 const (
 	hostHold      = "HOLD"
 	hostAbandoned = "ABANDONED"
+	hostSync      = "SYNC"
+	hostCommit    = "COMMIT"
 )
 
 func hostMessage(node Node, fallback string) string {

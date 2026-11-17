@@ -42,7 +42,7 @@ const (
 
 	// Written by the operator.
 	NodeUpgradeTargetAnnotation   = "k4all.magesgate.com/upgrade-target"   // release of the hop the node must run
-	NodeUpgradeCordonedAnnotation = "k4all.magesgate.com/upgrade-cordoned" // the operator cordoned the node, so it uncordons it
+	NodeUpgradeCordonedAnnotation = "k4all.magesgate.com/upgrade-cordoned" // the node is in its hop; values below
 
 	// Set by the user (or the UI) on the ClusterUpgrade, with any value: the
 	// operator runs again the node that failed with reason DrainTimeout or
@@ -51,6 +51,17 @@ const (
 	// touch a node in HOLD, which k4all-upgrade resumes on the node. The
 	// operator removes the annotation after the reconcile that read it.
 	ClusterUpgradeRetryAnnotation = "k4all.magesgate.com/retry"
+)
+
+// Values of upgrade-cordoned. The operator removes it at the end of the hop.
+const (
+	// The operator cordoned the node. It uncordons it once k4all-upgrade is
+	// past the reboot (upgrade-phase SYNC or COMMIT), or at the end of the hop.
+	NodeCordonedByOperator = "true"
+	// The node was cordoned already: it stays cordoned after the hop.
+	NodeCordonedAlready = "already"
+	// The operator uncordoned the node after its reboot, before the end of the hop.
+	NodeCordonReleased = "released"
 )
 
 // ClusterUpgradeSpec is the release the cluster should reach.

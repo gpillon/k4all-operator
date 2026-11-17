@@ -204,13 +204,6 @@ func ownedByDaemonSet(p corev1.Pod) bool {
 	return false
 }
 
-// Values of the upgrade-cordoned annotation: the operator cordoned the node,
-// or found it cordoned already and leaves it so.
-const (
-	cordonedByOperator = "true"
-	cordonedAlready    = "already"
-)
-
 // run applies one action of Decide to its Node.
 func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Action) error {
 	switch a.Kind {
@@ -220,9 +213,9 @@ func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Act
 			return err
 		}
 		// A node the admin had cordoned keeps its cordon after the hop.
-		mark := cordonedByOperator
+		mark := k4allv1alpha1.NodeCordonedByOperator
 		if node.Spec.Unschedulable {
-			mark = cordonedAlready
+			mark = k4allv1alpha1.NodeCordonedAlready
 		}
 		return r.patchNode(ctx, a.Node, map[string]interface{}{
 			"metadata": map[string]interface{}{"annotations": map[string]interface{}{
@@ -232,6 +225,14 @@ func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Act
 		})
 	case clusterupgrade.Evict:
 		return r.evict(ctx, a.Node)
+	case clusterupgrade.Uncordon:
+		// From here a cordon on the node is the admin's: Finish leaves it.
+		return r.patchNode(ctx, a.Node, map[string]interface{}{
+			"metadata": map[string]interface{}{"annotations": map[string]interface{}{
+				k4allv1alpha1.NodeUpgradeCordonedAnnotation: k4allv1alpha1.NodeCordonReleased,
+			}},
+			"spec": map[string]interface{}{"unschedulable": false},
+		})
 	case clusterupgrade.SetTarget:
 		return r.patchNode(ctx, a.Node, map[string]interface{}{
 			"metadata": map[string]interface{}{"annotations": map[string]interface{}{
@@ -250,7 +251,7 @@ func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Act
 				k4allv1alpha1.NodeUpgradeDoneAnnotation:     nil,
 			}},
 		}
-		if node.Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation] == cordonedByOperator {
+		if node.Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation] == k4allv1alpha1.NodeCordonedByOperator {
 			patch["spec"] = map[string]interface{}{"unschedulable": false}
 		}
 		return r.patchNode(ctx, a.Node, patch)
