@@ -1,0 +1,46 @@
+# A ClusterConfig written before k4all v2.6.0, with a dedicated ingress IP
+# that is not the default class: only ingress.nginx. The suite installs the
+# v2.4.0 set with it, then the v2.6.0 set, whose operator moves these
+# settings to ingress.traefik and removes ingress.nginx.
+apiVersion: k4all.magesgate.com/v1alpha1
+kind: ClusterConfig
+metadata:
+  name: k4all-cluster-config
+spec:
+  networking:
+    cni:
+      type: calico
+    firewalld:
+      enabled: false
+  features:
+    virt:
+      enabled: false
+      emulation: auto
+    argocd:
+      enabled: false
+    ovsCni:
+      enabled: false
+    ovsBridge:
+      enabled: false
+  cluster:
+    apiEndPointUseHostName: false
+    podNetwork: "10.244.0.0/16"
+    serviceNetwork: "10.96.0.0/16"
+    ha:
+      type: none
+  ingress:
+    nginx:
+      dedicatedIP: "172.18.255.200"
+      isDefault: false
+  proxy:
+    httpProxy: ""
+    httpsProxy: ""
+    noProxy: ""
+  # Checked by "should apply ClusterConfig componentOverrides to the cert-manager release".
+  componentOverrides:
+    cert-manager:
+      values:
+        podLabels:
+          k4all-e2e: values
+      helmArgs:
+        - "--set webhook.podLabels.k4all-e2e=helmargs"

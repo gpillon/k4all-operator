@@ -1,6 +1,6 @@
 # Component set of k4all v2.6.0 (fcos-k8s bootc/overlay/usr/local/share/k4all-release.yaml),
 # limited to the components the e2e suite installs: the v2.4.0 set with
-# ingress-nginx replaced by Traefik, plus MetalLB for Traefik's dedicated IP. On Kubernetes 1.35 the suite applies it
+# ingress-nginx replaced by Traefik. On Kubernetes 1.35 the suite applies it
 # after releasemanifest-v2.4.yaml; on 1.36 and 1.37, which a k4all cluster only
 # reaches from v2.6.0, it installs this file directly.
 apiVersion: k4all.magesgate.com/v1alpha1
@@ -134,6 +134,33 @@ spec:
               name: nginx
             spec:
               controller: k8s.io/ingress-nginx
+          # The redirect the operator's headlamp hook puts on the dashboard.
+          - apiVersion: traefik.io/v1alpha1
+            kind: Middleware
+            metadata:
+              name: redirect-https
+              namespace: traefik
+            spec:
+              redirectScheme:
+                scheme: https
+                permanent: true
       dependsOn:
         - cert-manager
         - metallb
+
+    # Dashboard — on Traefik from v2.6.0, which it now depends on.
+    headlamp:
+      type: helm
+      version: "0.46.0"
+      repo: "https://kubernetes-sigs.github.io/headlamp/"
+      chart: headlamp
+      namespace: headlamp
+      values:
+        service:
+          type: ClusterIP
+          port: 4466
+        ingress:
+          enabled: false
+      dependsOn:
+        - cert-manager
+        - traefik

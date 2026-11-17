@@ -45,6 +45,15 @@ jobs:
             cluster-config: test/e2e/testdata/clusterconfig.yaml
             release-manifest: test/e2e/testdata/releasemanifest.yaml
             upgrade-to: test/e2e/testdata/releasemanifest-v2.4.yaml,test/e2e/testdata/releasemanifest-v2.6.yaml
+          # A cluster from before v2.6.0 with only ingress.nginx, on a dedicated
+          # IP and not the default class: the v2.6.0 set moves it to
+          # ingress.traefik (internal/migrations) and the dashboard to Traefik.
+          - kubernetes: "1.35"
+            suite: nginx-dedicated-ip
+            node-image: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+            cluster-config: test/e2e/testdata/clusterconfig-v2.4-nginx-dedicated-ip.yaml
+            release-manifest: test/e2e/testdata/releasemanifest-v2.4.yaml
+            upgrade-to: test/e2e/testdata/releasemanifest-v2.6.yaml
           - kubernetes: "1.36"
             node-image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
             cluster-config: test/e2e/testdata/clusterconfig-v2.6.yaml
