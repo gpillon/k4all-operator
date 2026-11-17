@@ -46,6 +46,9 @@ const (
 	releaseManifestName = "k4all"
 	clusterConfigName   = "k4all-cluster-config"
 
+	// The ingress controller of k4all v2.6.0 on, as ingressController names it.
+	traefikController = "traefik"
+
 	testTimeout  = 15 * time.Minute
 	pollInterval = 10 * time.Second
 )
@@ -143,6 +146,20 @@ func mustReadReleaseManifest(path string) *k4allv1alpha1.ReleaseManifest {
 	return rm
 }
 
+// mustReadClusterConfig parses the testdata ClusterConfig the cluster is
+// installed with, for the checks that depend on its settings.
+func mustReadClusterConfig(path string) *k4allv1alpha1.ClusterConfig {
+	raw, err := os.ReadFile(filepath.Join(root, path))
+	if err != nil {
+		panic(err)
+	}
+	cc := &k4allv1alpha1.ClusterConfig{}
+	if err := yaml.Unmarshal(raw, cc); err != nil {
+		panic(fmt.Sprintf("%s: %v", path, err))
+	}
+	return cc
+}
+
 func managed(spec k4allv1alpha1.ComponentSpec) bool {
 	return spec.Management != k4allv1alpha1.ComponentManagementRemoved &&
 		spec.Management != k4allv1alpha1.ComponentManagementUnmanaged
@@ -211,8 +228,37 @@ func nodeInternalIP() string {
 		"-o", `jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}`)
 }
 
+// dedicatedIP is the ingress.*.dedicatedIP controller is published on, or ""
+// when it listens on the node IP. Traefik takes the nginx settings when the
+// ClusterConfig has no ingress.traefik.
+func dedicatedIP(controller string) string {
+	ingress := mustReadClusterConfig(clusterConfigFile).Spec.Ingress
+	if controller == traefikController && ingress.Traefik != nil {
+		return ingress.Traefik.DedicatedIP
+	}
+	return ingress.Nginx.DedicatedIP
+}
+
+// routesIP is the address the k4all routes are published on through controller.
+func routesIP(controller string) string {
+	if ip := dedicatedIP(controller); ip != "" {
+		return ip
+	}
+	return nodeInternalIP()
+}
+
+// expectTraefikOnDedicatedIP checks that MetalLB gives the Traefik service ip,
+// the address a ClusterConfig with ingress.traefik.dedicatedIP asks for.
+func expectTraefikOnDedicatedIP(ip string) {
+	Eventually(func() string {
+		out, _ := kubectl("get", "svc", "-n", "traefik", "-l", "k4all-ingress=traefik",
+			"-o", "jsonpath={.items[*].status.loadBalancer.ingress[*].ip}")
+		return out
+	}, 5*time.Minute, pollInterval).Should(Equal(ip), "Traefik service has no LoadBalancer IP from MetalLB")
+}
+
 // routeRequest runs curl in the fixture's client pod against host, resolved
-// to the node IP, the address k4all routes are published on.
+// to ip, the address k4all routes are published on.
 func routeRequest(ip, scheme, host string, curlArgs ...string) (string, error) {
 	port := "443"
 	if scheme == "http" {
@@ -237,7 +283,7 @@ func expectRoutesServedBy(controller string) {
 		out, _ := kubectl("get", "pod", "client", "-n", routesNamespace, "-o", "jsonpath={.status.phase}")
 		return out
 	}, 3*time.Minute, pollInterval).Should(Equal("Running"))
-	ip := nodeInternalIP()
+	ip := routesIP(controller)
 
 	By("http-backend (headlamp shape): plain HTTP is redirected to HTTPS")
 	Eventually(func(g Gomega) {
@@ -516,6 +562,11 @@ var _ = Describe("K4All Operator", Ordered, func() {
 	// ── Ingress routes ──────────────────────────────────────────────────
 
 	Context("Ingress routes", func() {
+		if ip := dedicatedIP(traefikController); ingressController(initial) == traefikController && ip != "" {
+			It("should give Traefik its dedicated IP through MetalLB", func() {
+				expectTraefikOnDedicatedIP(ip)
+			})
+		}
 		It("should serve the k4all route shapes", func() {
 			controller := ingressController(initial)
 			if controller == "" {
@@ -654,7 +705,7 @@ var _ = Describe("K4All Operator", Ordered, func() {
 			It("should bring every component to its new version through upgradePath", func() {
 				upgradeTo(file, from, to)
 			})
-			if ingressController(from) == "nginx" && ingressController(to) == "traefik" {
+			if ingressController(from) == "nginx" && ingressController(to) == traefikController {
 				It("should hand the nginx routes over to Traefik", expectNginxHandedOverToTraefik)
 			}
 			if controller := ingressController(to); controller != "" {
@@ -687,9 +738,18 @@ var _ = Describe("K4All Operator", Ordered, func() {
 
 		By("capturing pod status across namespaces")
 		for _, ns := range []string{operatorNamespace, "tigera-operator", "cert-manager", "kube-system",
-			"ingress-nginx", "traefik", routesNamespace} {
+			"metallb-system", "ingress-nginx", "traefik", routesNamespace} {
 			pods, _ := kubectl("get", "pods", "-n", ns, "-o", "wide")
 			_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Pods in %s ===\n%s\n", ns, pods)
+		}
+
+		By("capturing the ingress services and MetalLB pools for diagnostics")
+		for _, args := range [][]string{
+			{"get", "svc", "-n", "traefik", "-o", "wide"},
+			{"get", "ipaddresspools,l2advertisements", "-n", "metallb-system", "-o", "yaml"},
+		} {
+			out, _ := kubectl(args...)
+			_, _ = fmt.Fprintf(GinkgoWriter, "\n=== kubectl %s ===\n%s\n", strings.Join(args, " "), out)
 		}
 
 		By("capturing ingress controller logs for diagnostics")
