@@ -18,7 +18,7 @@ env:
 
 jobs:
   test-e2e:
-    name: Run on Ubuntu
+    name: E2E (kind)
     # Same-repo PRs are already covered by the push run on the head commit
     # (its checks show up on the PR); only PRs from forks need their own run.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository

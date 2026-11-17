@@ -17,6 +17,11 @@ metadata:
     app.kubernetes.io/name: k4all-operator
     app.kubernetes.io/managed-by: kustomize
 spec:
+  # Deliberately not the scaffold's selector (which also has app.kubernetes.io/name):
+  # spec.selector is immutable and the operator updates itself by server-side
+  # applying a newer install.yaml, so changing it would fail on every existing
+  # cluster. The pod template carries the label, so Services and NetworkPolicies
+  # can still select on it.
   selector:
     matchLabels:
       control-plane: controller-manager
