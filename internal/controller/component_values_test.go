@@ -132,3 +132,94 @@ func TestComponentValues_OverrideHelmArgsAreAppliedWithHelmTypes(t *testing.T) {
 	expectValue(t, got, false, "hubble", "enabled")
 	expectValue(t, got, float64(2), "operator", "replicas")
 }
+
+// Expected Cilium values below follow the pre-operator setup-cni-cilium.sh
+// (fcos-k8s, removed in c98474c), which each installer option mapped onto.
+
+func TestComponentValues_CiliumL2AnnouncementsFollowClusterConfig(t *testing.T) {
+	r := newValuesReconciler()
+
+	t.Run("off by default", func(t *testing.T) {
+		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, ciliumConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := valueAt(got, "l2announcements", "enabled"); ok && v == true {
+			t.Errorf("l2announcements.enabled = true without spec.networking.cni.cilium.l2announcements")
+		}
+	})
+
+	t.Run("on when enabled", func(t *testing.T) {
+		config := ciliumConfig()
+		config.Networking.CNI.Cilium.L2Announcements = true
+		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectValue(t, got, true, "l2announcements", "enabled")
+	})
+}
+
+func TestComponentValues_CiliumHubbleDeploysRelayAndUI(t *testing.T) {
+	r := newValuesReconciler()
+	config := ciliumConfig()
+	config.Networking.CNI.Cilium.Hubble = true
+
+	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectValue(t, got, true, "hubble", "relay", "enabled")
+	expectValue(t, got, true, "hubble", "ui", "enabled")
+}
+
+func TestComponentValues_CiliumGatewayAPI(t *testing.T) {
+	r := newValuesReconciler()
+	config := ciliumConfig()
+	config.Networking.CNI.Cilium.GatewayAPI = true
+
+	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectValue(t, got, true, "gatewayAPI", "enabled")
+}
+
+func TestComponentValues_CiliumDevices(t *testing.T) {
+	r := newValuesReconciler()
+	devicesFor := func(t *testing.T, ovsBridge bool, additional ...string) (interface{}, bool) {
+		t.Helper()
+		config := ciliumConfig()
+		config.Features.OVSBridge.Enabled = ovsBridge
+		config.Networking.CNI.Cilium.AdditionalDevices = additional
+		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return valueAt(normalize(t, got), "devices")
+	}
+
+	t.Run("auto-detected without additional devices", func(t *testing.T) {
+		if devices, ok := devicesFor(t, true); ok {
+			t.Errorf("devices = %v, want unset so Cilium auto-detects", devices)
+		}
+	})
+
+	t.Run("ovs-bridge first, then the additional devices", func(t *testing.T) {
+		devices, _ := devicesFor(t, true, "eth1", "eth2")
+		want := []interface{}{"ovs-bridge", "eth1", "eth2"}
+		if !reflect.DeepEqual(devices, want) {
+			t.Errorf("devices = %v, want %v", devices, want)
+		}
+	})
+
+	t.Run("only the additional devices without the OVS bridge", func(t *testing.T) {
+		devices, _ := devicesFor(t, false, "eth1")
+		want := []interface{}{"eth1"}
+		if !reflect.DeepEqual(devices, want) {
+			t.Errorf("devices = %v, want %v", devices, want)
+		}
+	})
+}
