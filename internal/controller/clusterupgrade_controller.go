@@ -88,11 +88,12 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("list nodes: %w", err)
 	}
 	in := clusterupgrade.Input{
-		Spec:     cu.Spec,
-		Previous: cu.Status,
-		PodsLeft: map[string]int{},
-		GraphURL: cu.Spec.GraphURL,
-		Now:      r.now(),
+		Spec:       cu.Spec,
+		Previous:   cu.Status,
+		PodsLeft:   map[string]int{},
+		GraphURL:   cu.Spec.GraphURL,
+		Now:        r.now(),
+		Generation: cu.Generation,
 	}
 	if in.GraphURL == "" {
 		in.GraphURL = k4allv1alpha1.DefaultUpgradeGraphURL
@@ -124,7 +125,6 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	base := cu.DeepCopy()
 	status.ObservedGeneration = cu.Generation
-	status.Conditions = cu.Status.Conditions
 	cu.Status = status
 	if err := r.Status().Patch(ctx, cu, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, fmt.Errorf("patch ClusterUpgrade status: %w", err)

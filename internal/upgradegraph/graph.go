@@ -259,3 +259,17 @@ func (g *Graph) Newer(current string) []Release {
 	}
 	return out
 }
+
+// Find returns the release named version, blocked or not.
+func (g *Graph) Find(version string) (Release, bool) {
+	want, err := parseVersion(normalize(version))
+	if err != nil {
+		return Release{}, false
+	}
+	for _, r := range g.Releases {
+		if r.key.Equal(want) {
+			return r, true
+		}
+	}
+	return Release{}, false
+}

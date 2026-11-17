@@ -107,6 +107,8 @@ spec:
                 items:
                   description: ReleaseInfo describes a release of the upgrade graph.
                   properties:
+                    crio:
+                      type: string
                     fedora:
                       format: int32
                       type: integer
@@ -114,8 +116,17 @@ spec:
                       type: string
                     kubernetes:
                       type: string
+                    minFrom:
+                      type: string
                     notes:
                       type: string
+                    path:
+                      description: |-
+                        Hops from currentRelease to this release, as the operator would plan
+                        them; empty when the graph has no way there. Only in availableReleases.
+                      items:
+                        type: string
+                      type: array
                     version:
                       type: string
                   required:
@@ -123,6 +134,11 @@ spec:
                   type: object
                 type: array
               conditions:
+                description: |-
+                  GraphAvailable (the graph was read; False with the error), and
+                  Progressing, Succeeded, Failed, True in the phase of the same name.
+                  Their reason is machine-readable: the phase, a NodeUpgradeReason, or
+                  for Failed without a node NoPath, Downgrade, NodeNotReported.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -185,6 +201,35 @@ spec:
                 description: 'The oldest release among the nodes: the one the whole
                   cluster runs.'
                 type: string
+              currentReleaseInfo:
+                description: The graph's entry for currentRelease (Kubernetes, CRI-O,
+                  Fedora).
+                properties:
+                  crio:
+                    type: string
+                  fedora:
+                    format: int32
+                    type: integer
+                  kind:
+                    type: string
+                  kubernetes:
+                    type: string
+                  minFrom:
+                    type: string
+                  notes:
+                    type: string
+                  path:
+                    description: |-
+                      Hops from currentRelease to this release, as the operator would plan
+                      them; empty when the graph has no way there. Only in availableReleases.
+                    items:
+                      type: string
+                    type: array
+                  version:
+                    type: string
+                required:
+                - version
+                type: object
               graphUrl:
                 description: Graph the path was planned on.
                 type: string
@@ -195,9 +240,14 @@ spec:
                 items:
                   description: NodeUpgradeStatus is one node's part in the upgrade.
                   properties:
+                    completedAt:
+                      description: When the node finished its latest hop.
+                      format: date-time
+                      type: string
                     drainStartedAt:
-                      description: When the operator cordoned the node for the current
-                        hop.
+                      description: |-
+                        When the operator cordoned the node for the current hop. A retry
+                        starts it over.
                       format: date-time
                       type: string
                     hostPhase:
@@ -218,6 +268,17 @@ spec:
                       - Done
                       - Failed
                       type: string
+                    reason:
+                      description: Why the node failed, or what the upgrade waits
+                        for on it.
+                      enum:
+                      - DrainTimeout
+                      - HostHold
+                      - Abandoned
+                      - TargetRejected
+                      - RollbackRebooted
+                      - NodeNotReady
+                      type: string
                     release:
                       description: Release the node runs (the release annotation).
                       type: string
@@ -225,6 +286,11 @@ spec:
                       description: |-
                         bootstrap, control or worker (the node-type annotation). Nodes are
                         upgraded in this order, one at a time.
+                      type: string
+                    startedAt:
+                      description: When the operator started the node's latest hop
+                        (its cordon).
+                      format: date-time
                       type: string
                   required:
                   - name
@@ -241,6 +307,10 @@ spec:
                 items:
                   description: Hop is one release of the path.
                   properties:
+                    completedAt:
+                      description: When every node had run it.
+                      format: date-time
+                      type: string
                     kind:
                       type: string
                     phase:
@@ -251,6 +321,10 @@ spec:
                       - Pending
                       type: string
                     release:
+                      type: string
+                    startedAt:
+                      description: When the hop became InProgress.
+                      format: date-time
                       type: string
                   required:
                   - phase

@@ -36,13 +36,20 @@ const (
 	NodeUpgradePhaseAnnotation   = "k4all.magesgate.com/upgrade-phase"   // hop phase, e.g. STAGE, REBOOT, HOLD
 	NodeUpgradeMessageAnnotation = "k4all.magesgate.com/upgrade-message" // why the hop is in HOLD
 	NodeUpgradeDoneAnnotation    = "k4all.magesgate.com/upgrade-done"    // release of the hop just finished
+	// Optional, next to HOLD: why, as a NodeUpgradeReason (TargetRejected,
+	// RollbackRebooted). Without it a HOLD is HostHold.
+	NodeUpgradeReasonAnnotation = "k4all.magesgate.com/upgrade-reason"
 
 	// Written by the operator.
 	NodeUpgradeTargetAnnotation   = "k4all.magesgate.com/upgrade-target"   // release of the hop the node must run
 	NodeUpgradeCordonedAnnotation = "k4all.magesgate.com/upgrade-cordoned" // the operator cordoned the node, so it uncordons it
 
-	// Set by the user (or the UI) on the ClusterUpgrade: retry the nodes
-	// whose drain failed. The operator removes it.
+	// Set by the user (or the UI) on the ClusterUpgrade, with any value: the
+	// operator runs again the node that failed with reason DrainTimeout or
+	// Abandoned (cordoned, with no upgrade-target), starting its drain over
+	// with a full drain timeout, then asking for the hop again. It does not
+	// touch a node in HOLD, which k4all-upgrade resumes on the node. The
+	// operator removes the annotation after the reconcile that read it.
 	ClusterUpgradeRetryAnnotation = "k4all.magesgate.com/retry"
 )
 
@@ -131,20 +138,52 @@ const (
 	NodeUpgradeFailed NodeUpgradePhase = "Failed"
 )
 
+// NodeUpgradeReason says, in a machine-readable way, why a node failed or
+// what the upgrade waits for on it.
+// +kubebuilder:validation:Enum=DrainTimeout;HostHold;Abandoned;TargetRejected;RollbackRebooted;NodeNotReady
+type NodeUpgradeReason string
+
+const (
+	// Failed: the drain timed out (PodDisruptionBudgets). Retry annotation.
+	NodeReasonDrainTimeout NodeUpgradeReason = "DrainTimeout"
+	// Failed: k4all-upgrade put the hop in HOLD; it goes on once resumed on the node.
+	NodeReasonHostHold NodeUpgradeReason = "HostHold"
+	// Failed: the hop was abandoned on the node (clear-hold --abandon). Retry annotation.
+	NodeReasonAbandoned NodeUpgradeReason = "Abandoned"
+	// Failed: k4all-upgrade refused the upgrade-target (upgrade-reason annotation).
+	NodeReasonTargetRejected NodeUpgradeReason = "TargetRejected"
+	// Failed: k4all-upgrade rolled the node back and rebooted it (upgrade-reason annotation).
+	NodeReasonRollbackRebooted NodeUpgradeReason = "RollbackRebooted"
+	// Not failed: the upgrade waits for this node to be Ready.
+	NodeReasonNotReady NodeUpgradeReason = "NodeNotReady"
+)
+
 // Hop is one release of the path.
 type Hop struct {
 	Release string   `json:"release"`
 	Kind    string   `json:"kind,omitempty"` // minor | patch
 	Phase   HopPhase `json:"phase"`
+	// When the hop became InProgress.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// When every node had run it.
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 }
 
 // ReleaseInfo describes a release of the upgrade graph.
 type ReleaseInfo struct {
 	Version    string `json:"version"`
 	Kind       string `json:"kind,omitempty"`       // minor | patch
+	MinFrom    string `json:"minFrom,omitempty"`    // oldest release that may switch straight to it
 	Kubernetes string `json:"kubernetes,omitempty"` // kubelet version in the image
+	Crio       string `json:"crio,omitempty"`       // CRI-O minor in the image
 	Fedora     int32  `json:"fedora,omitempty"`
 	Notes      string `json:"notes,omitempty"`
+	// Hops from currentRelease to this release, as the operator would plan
+	// them; empty when the graph has no way there. Only in availableReleases.
+	// +optional
+	Path []string `json:"path,omitempty"`
 }
 
 // NodeUpgradeStatus is one node's part in the upgrade.
@@ -161,9 +200,19 @@ type NodeUpgradeStatus struct {
 	HostPhase string `json:"hostPhase,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
-	// When the operator cordoned the node for the current hop.
+	// Why the node failed, or what the upgrade waits for on it.
+	// +optional
+	Reason NodeUpgradeReason `json:"reason,omitempty"`
+	// When the operator cordoned the node for the current hop. A retry
+	// starts it over.
 	// +optional
 	DrainStartedAt *metav1.Time `json:"drainStartedAt,omitempty"`
+	// When the operator started the node's latest hop (its cordon).
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// When the node finished its latest hop.
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 }
 
 // ClusterUpgradeStatus is the observed state of the upgrade.
@@ -176,6 +225,9 @@ type ClusterUpgradeStatus struct {
 	// The oldest release among the nodes: the one the whole cluster runs.
 	// +optional
 	CurrentRelease string `json:"currentRelease,omitempty"`
+	// The graph's entry for currentRelease (Kubernetes, CRI-O, Fedora).
+	// +optional
+	CurrentReleaseInfo *ReleaseInfo `json:"currentReleaseInfo,omitempty"`
 	// Release of the hop in progress.
 	// +optional
 	CurrentHop string `json:"currentHop,omitempty"`
@@ -194,9 +246,21 @@ type ClusterUpgradeStatus struct {
 	GraphURL string `json:"graphUrl,omitempty"`
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// GraphAvailable (the graph was read; False with the error), and
+	// Progressing, Succeeded, Failed, True in the phase of the same name.
+	// Their reason is machine-readable: the phase, a NodeUpgradeReason, or
+	// for Failed without a node NoPath, Downgrade, NodeNotReported.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
+
+// ClusterUpgrade condition types.
+const (
+	ConditionGraphAvailable = "GraphAvailable"
+	ConditionProgressing    = "Progressing"
+	ConditionSucceeded      = "Succeeded"
+	ConditionFailed         = "Failed"
+)
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

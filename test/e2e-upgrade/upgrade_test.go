@@ -33,6 +33,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 )
@@ -376,10 +377,15 @@ var _ = Describe("ClusterUpgrade", Ordered, func() {
 
 		cu, err := clusterUpgrade()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(cu.Status.Path).To(Equal([]k4allv1alpha1.Hop{
-			{Release: "v2.6.0", Kind: "minor", Phase: k4allv1alpha1.HopDone},
-			{Release: targetRelease, Kind: "patch", Phase: k4allv1alpha1.HopDone},
-		}))
+		var path []string
+		for _, h := range cu.Status.Path {
+			Expect(h.StartedAt).NotTo(BeNil(), "hop %s has no startedAt", h.Release)
+			Expect(h.CompletedAt).NotTo(BeNil(), "hop %s has no completedAt", h.Release)
+			path = append(path, h.Release+" "+h.Kind+" "+string(h.Phase))
+		}
+		Expect(path).To(Equal([]string{"v2.6.0 minor Done", targetRelease + " patch Done"}))
+		Expect(meta.IsStatusConditionTrue(cu.Status.Conditions, k4allv1alpha1.ConditionSucceeded)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(cu.Status.Conditions, k4allv1alpha1.ConditionGraphAvailable)).To(BeTrue())
 		kubectlMustSucceed("rollout", "status", "-n", testNamespace, "deployment/workload", "--timeout=3m")
 	})
 })

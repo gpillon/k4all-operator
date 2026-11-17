@@ -10,6 +10,7 @@ import (
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/upgradegraph"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -57,6 +58,8 @@ type Input struct {
 	Now      time.Time
 	// Retry asks again for the nodes that failed: the retry annotation.
 	Retry bool
+	// Generation of the ClusterUpgrade, for the conditions.
+	Generation int64
 }
 
 var roleOrder = map[string]int{"bootstrap": 0, "control": 1, "worker": 2}
@@ -65,6 +68,14 @@ var roleOrder = map[string]int{"bootstrap": 0, "control": 1, "worker": 2}
 // moves at most one node: the one the operator cordoned, or else the next
 // one behind the current hop.
 func Decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action) {
+	status, actions, reason := decide(in)
+	setConditions(in, &status, reason)
+	return status, actions
+}
+
+// decide returns the status, the actions and, for a Failed upgrade with no
+// failed node, the reason of the Failed condition.
+func decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action, string) {
 	nodes := sortedNodes(in.Nodes)
 	status := observe(in, nodes)
 
@@ -75,7 +86,7 @@ func Decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action) {
 		}
 	}
 
-	hop, phase, message := plan(in, &status)
+	hop, phase, message, reason := plan(in, &status)
 	if hop != "" {
 		for i := range status.Nodes {
 			if older(status.Nodes[i].Release, hop) {
@@ -86,20 +97,58 @@ func Decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action) {
 
 	status.Phase, status.Message = phase, message
 	if inFlight >= 0 {
-		return status, moveInFlight(in, nodes[inFlight], &status, inFlight, hop)
+		return status, moveInFlight(in, nodes[inFlight], &status, inFlight, hop), reason
 	}
 	if hop == "" {
-		return status, nil
+		return status, nil, reason
 	}
 	if in.Spec.Paused {
 		status.Phase = k4allv1alpha1.ClusterUpgradePaused
-		return status, nil
+		return status, nil, ""
 	}
-	if wait := waitFor(nodes); wait != "" {
+	if wait, i := waitFor(nodes); wait != "" {
 		status.Message = hop + ": " + wait
-		return status, nil
+		if !nodes[i].Ready {
+			status.Nodes[i].Reason = k4allv1alpha1.NodeReasonNotReady
+		}
+		return status, nil, ""
 	}
-	return status, cordonNext(in, &status, hop)
+	return status, cordonNext(in, &status, hop), ""
+}
+
+// setConditions derives the conditions from the phase, keeping the
+// transition times of the previous ones.
+func setConditions(in Input, status *k4allv1alpha1.ClusterUpgradeStatus, reason string) {
+	status.Conditions = append([]metav1.Condition(nil), in.Previous.Conditions...)
+	set := func(typ string, on bool, reason, message string) {
+		c := metav1.Condition{Type: typ, Status: metav1.ConditionFalse, Reason: reason, Message: message,
+			ObservedGeneration: in.Generation, LastTransitionTime: metav1.NewTime(in.Now)}
+		if on {
+			c.Status = metav1.ConditionTrue
+		}
+		meta.SetStatusCondition(&status.Conditions, c)
+	}
+	if in.Graph != nil {
+		set(k4allv1alpha1.ConditionGraphAvailable, true, "Read", in.GraphURL)
+	} else {
+		set(k4allv1alpha1.ConditionGraphAvailable, false, "ReadFailed", fmt.Sprint(in.GraphErr))
+	}
+	phase := string(status.Phase)
+	failed := phase
+	if status.Phase == k4allv1alpha1.ClusterUpgradeFailed {
+		failed = reason
+		for _, n := range status.Nodes {
+			if n.Phase == k4allv1alpha1.NodeUpgradeFailed && n.Reason != "" {
+				failed = string(n.Reason)
+			}
+		}
+	}
+	if failed == "" { // a Condition reason may not be empty
+		failed = string(k4allv1alpha1.ClusterUpgradeFailed)
+	}
+	set(k4allv1alpha1.ConditionProgressing, status.Phase == k4allv1alpha1.ClusterUpgradeProgressing, phase, status.Message)
+	set(k4allv1alpha1.ConditionSucceeded, status.Phase == k4allv1alpha1.ClusterUpgradeSucceeded, phase, status.Message)
+	set(k4allv1alpha1.ConditionFailed, status.Phase == k4allv1alpha1.ClusterUpgradeFailed, failed, status.Message)
 }
 
 // observe fills in what the nodes and the graph say, before any decision.
@@ -110,58 +159,96 @@ func observe(in Input, nodes []Node) k4allv1alpha1.ClusterUpgradeStatus {
 	}
 	for _, n := range nodes {
 		release := n.Annotations[k4allv1alpha1.NodeReleaseAnnotation]
+		prev := previous(in, n.Name)
 		status.Nodes = append(status.Nodes, k4allv1alpha1.NodeUpgradeStatus{
-			Name:    n.Name,
-			Role:    n.Annotations[k4allv1alpha1.NodeTypeAnnotation],
-			Release: release,
-			Phase:   k4allv1alpha1.NodeUpgradeDone,
+			Name:        n.Name,
+			Role:        n.Annotations[k4allv1alpha1.NodeTypeAnnotation],
+			Release:     release,
+			Phase:       k4allv1alpha1.NodeUpgradeDone,
+			HostPhase:   n.Annotations[k4allv1alpha1.NodeUpgradePhaseAnnotation],
+			StartedAt:   prev.StartedAt,
+			CompletedAt: prev.CompletedAt,
 		})
 		if release != "" && (status.CurrentRelease == "" || older(release, status.CurrentRelease)) {
 			status.CurrentRelease = release
 		}
 	}
 	if in.Graph != nil && status.CurrentRelease != "" {
+		if r, ok := in.Graph.Find(status.CurrentRelease); ok {
+			info := releaseInfo(r)
+			status.CurrentReleaseInfo = &info
+		}
 		for _, r := range in.Graph.Newer(status.CurrentRelease) {
-			status.AvailableReleases = append(status.AvailableReleases, k4allv1alpha1.ReleaseInfo{
-				Version: r.Version, Kind: r.Kind, Kubernetes: r.Kubernetes, Fedora: int32(r.Fedora), Notes: r.Notes,
-			})
+			info := releaseInfo(r)
+			if hops, err := in.Graph.Plan(status.CurrentRelease, r.Version); err == nil {
+				for _, h := range hops {
+					info.Path = append(info.Path, h.Version)
+				}
+			}
+			status.AvailableReleases = append(status.AvailableReleases, info)
 		}
 	}
 	return status
 }
 
+func releaseInfo(r upgradegraph.Release) k4allv1alpha1.ReleaseInfo {
+	return k4allv1alpha1.ReleaseInfo{
+		Version: r.Version, Kind: r.Kind, MinFrom: r.MinFrom, Kubernetes: r.Kubernetes, Crio: r.Crio,
+		Fedora: int32(r.Fedora), Notes: r.Notes,
+	}
+}
+
 // plan sets the path towards spec.targetRelease and returns its first hop,
-// or "" with the phase and message of an upgrade that has no hop to run.
-func plan(in Input, status *k4allv1alpha1.ClusterUpgradeStatus) (string, k4allv1alpha1.ClusterUpgradePhase, string) {
+// or "" with the phase and message of an upgrade that has no hop to run, and
+// the reason when that phase is Failed.
+func plan(in Input, status *k4allv1alpha1.ClusterUpgradeStatus) (string, k4allv1alpha1.ClusterUpgradePhase, string, string) {
 	target := in.Spec.TargetRelease
+	noGraph := fmt.Sprintf("cannot read the upgrade graph: %v", in.GraphErr)
 	switch {
+	case target == "" && in.Graph == nil:
+		return "", k4allv1alpha1.ClusterUpgradeIdle, noGraph, ""
 	case target == "":
-		return "", k4allv1alpha1.ClusterUpgradeIdle, ""
+		return "", k4allv1alpha1.ClusterUpgradeIdle, "", ""
 	case missingAnnotation(in.Nodes) != "":
-		return "", k4allv1alpha1.ClusterUpgradeFailed, missingAnnotation(in.Nodes)
+		return "", k4allv1alpha1.ClusterUpgradeFailed, missingAnnotation(in.Nodes), "NodeNotReported"
 	case in.Graph == nil:
-		return "", k4allv1alpha1.ClusterUpgradeProgressing, fmt.Sprintf("cannot read the upgrade graph: %v", in.GraphErr)
+		return "", k4allv1alpha1.ClusterUpgradeProgressing, noGraph, ""
 	case older(target, status.CurrentRelease):
 		return "", k4allv1alpha1.ClusterUpgradeFailed,
-			fmt.Sprintf("targetRelease %s is older than the cluster's release %s", target, status.CurrentRelease)
+			fmt.Sprintf("targetRelease %s is older than the cluster's release %s", target, status.CurrentRelease), "Downgrade"
 	}
 	hops, err := in.Graph.Plan(status.CurrentRelease, target)
 	if err != nil {
-		return "", k4allv1alpha1.ClusterUpgradeFailed, err.Error()
+		return "", k4allv1alpha1.ClusterUpgradeFailed, err.Error(), "NoPath"
 	}
-	status.Path = doneHops(in.Previous.Path, status.CurrentRelease, target)
+	status.Path = doneHops(in, status.CurrentRelease, target)
 	if len(hops) == 0 {
-		return "", k4allv1alpha1.ClusterUpgradeSucceeded, ""
+		return "", k4allv1alpha1.ClusterUpgradeSucceeded, "", ""
 	}
 	for i, r := range hops {
-		phase := k4allv1alpha1.HopPending
+		hop := k4allv1alpha1.Hop{Release: r.Version, Kind: r.Kind, Phase: k4allv1alpha1.HopPending}
 		if i == 0 {
-			phase = k4allv1alpha1.HopInProgress
+			hop.Phase = k4allv1alpha1.HopInProgress
+			hop.StartedAt = previousHop(in, r.Version).StartedAt
+			if hop.StartedAt == nil {
+				started := metav1.NewTime(in.Now)
+				hop.StartedAt = &started
+			}
 		}
-		status.Path = append(status.Path, k4allv1alpha1.Hop{Release: r.Version, Kind: r.Kind, Phase: phase})
+		status.Path = append(status.Path, hop)
 	}
 	status.CurrentHop = hops[0].Version
-	return hops[0].Version, k4allv1alpha1.ClusterUpgradeProgressing, ""
+	return hops[0].Version, k4allv1alpha1.ClusterUpgradeProgressing, "", ""
+}
+
+// previousHop is the hop of the previous path with that release.
+func previousHop(in Input, release string) k4allv1alpha1.Hop {
+	for _, h := range in.Previous.Path {
+		if h.Release == release {
+			return h
+		}
+	}
+	return k4allv1alpha1.Hop{Release: release}
 }
 
 // missingAnnotation names the first node k4all-upgrade has not described.
@@ -216,18 +303,18 @@ func askedHop(node Node, hop string) string {
 	return hop
 }
 
-// waitFor says what keeps the next node from starting: a node not Ready, or
-// a hop k4all-upgrade runs on its own.
-func waitFor(nodes []Node) string {
-	for _, n := range nodes {
+// waitFor says what keeps the next node from starting, and which node: one
+// not Ready, or one running a hop of its own.
+func waitFor(nodes []Node) (string, int) {
+	for i, n := range nodes {
 		if !n.Ready {
-			return "waiting for " + n.Name + " to be Ready"
+			return "waiting for " + n.Name + " to be Ready", i
 		}
 		if hop := n.Annotations[upgradeInProgressAnnotation]; hop != "" {
-			return fmt.Sprintf("waiting for the hop %s runs on its own (%s)", n.Name, hop)
+			return fmt.Sprintf("waiting for the hop %s runs on its own (%s)", n.Name, hop), i
 		}
 	}
-	return ""
+	return "", -1
 }
 
 // upgradeInProgressAnnotation is the pause gate k4all-upgrade sets during any hop.
@@ -242,7 +329,7 @@ func cordonNext(in Input, status *k4allv1alpha1.ClusterUpgradeStatus, hop string
 		}
 		n.Phase = k4allv1alpha1.NodeUpgradeDraining
 		started := metav1.NewTime(in.Now)
-		n.DrainStartedAt = &started
+		n.DrainStartedAt, n.StartedAt, n.CompletedAt = &started, &started, nil
 		actions := []Action{{Kind: Cordon, Node: n.Name}}
 		if len(in.Nodes) == 1 {
 			n.Phase = k4allv1alpha1.NodeUpgradeUpgrading
@@ -263,13 +350,19 @@ func step(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) [
 	n.DrainStartedAt = previous(in, n.Name).DrainStartedAt
 	if node.Annotations[k4allv1alpha1.NodeUpgradeDoneAnnotation] == target && !older(n.Release, target) {
 		n.Phase = k4allv1alpha1.NodeUpgradeDone
+		completed := metav1.NewTime(in.Now)
+		n.CompletedAt = &completed
 		return []Action{{Kind: Finish, Node: n.Name}}
 	}
 	n.Phase = k4allv1alpha1.NodeUpgradeUpgrading
-	n.HostPhase = node.Annotations[k4allv1alpha1.NodeUpgradePhaseAnnotation]
 	if n.HostPhase == hostHold {
 		n.Phase = k4allv1alpha1.NodeUpgradeFailed
 		n.Message = hostMessage(node, "k4all-upgrade stopped the hop")
+		n.Reason = k4allv1alpha1.NodeReasonHostHold
+		switch r := k4allv1alpha1.NodeUpgradeReason(node.Annotations[k4allv1alpha1.NodeUpgradeReasonAnnotation]); r {
+		case k4allv1alpha1.NodeReasonTargetRejected, k4allv1alpha1.NodeReasonRollbackRebooted:
+			n.Reason = r
+		}
 	}
 	return nil
 }
@@ -289,13 +382,18 @@ func hostMessage(node Node, fallback string) string {
 
 // doneHops keeps the hops of the previous path the cluster has finished,
 // as long as the path still leads to target.
-func doneHops(path []k4allv1alpha1.Hop, current, target string) []k4allv1alpha1.Hop {
+func doneHops(in Input, current, target string) []k4allv1alpha1.Hop {
+	path := in.Previous.Path
 	if len(path) == 0 || path[len(path)-1].Release != target {
 		return nil
 	}
 	var done []k4allv1alpha1.Hop
 	for _, h := range path {
 		if !older(current, h.Release) {
+			if h.Phase != k4allv1alpha1.HopDone || h.CompletedAt == nil {
+				completed := metav1.NewTime(in.Now)
+				h.CompletedAt = &completed
+			}
 			h.Phase = k4allv1alpha1.HopDone
 			done = append(done, h)
 		}
@@ -312,12 +410,14 @@ func drain(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) 
 		switch {
 		case node.Annotations[k4allv1alpha1.NodeUpgradePhaseAnnotation] == hostAbandoned:
 			n.Phase, n.Message = k4allv1alpha1.NodeUpgradeFailed, hostMessage(node, "the hop was abandoned on the node")
+			n.Reason = k4allv1alpha1.NodeReasonAbandoned
 			return nil
 		case prev.Phase == k4allv1alpha1.NodeUpgradeUpgrading:
 			n.Phase, n.Message = k4allv1alpha1.NodeUpgradeFailed, "upgrade-target was removed before the hop was done"
+			n.Reason = k4allv1alpha1.NodeReasonAbandoned
 			return nil
 		case prev.Phase == k4allv1alpha1.NodeUpgradeFailed:
-			n.Phase, n.Message = k4allv1alpha1.NodeUpgradeFailed, prev.Message
+			n.Phase, n.Message, n.Reason = k4allv1alpha1.NodeUpgradeFailed, prev.Message, prev.Reason
 			return nil
 		}
 	} else {
@@ -337,6 +437,7 @@ func drain(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) 
 		case !in.Spec.Drain.ContinueOnTimeout:
 			n.Phase = k4allv1alpha1.NodeUpgradeFailed
 			n.Message = fmt.Sprintf("drain timed out after %d minutes, %d pods left", drainTimeoutMinutes(in.Spec), left)
+			n.Reason = k4allv1alpha1.NodeReasonDrainTimeout
 			return nil
 		}
 	}

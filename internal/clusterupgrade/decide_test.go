@@ -118,7 +118,7 @@ func TestDecide_StartsWithTheBootstrapNode(t *testing.T) {
 		{Release: "v2.6.1", Kind: "patch", Phase: k4allv1alpha1.HopPending},
 		{Release: "v2.7.0", Kind: "minor", Phase: k4allv1alpha1.HopPending},
 	}
-	if !reflect.DeepEqual(status.Path, wantPath) {
+	if !reflect.DeepEqual(hops(status.Path), hops(wantPath)) {
 		t.Errorf("path = %+v, want %+v", status.Path, wantPath)
 	}
 	if want := map[string]k4allv1alpha1.NodeUpgradePhase{
@@ -229,7 +229,7 @@ func TestDecide_StartsTheNextHopFromTheBootstrapNode(t *testing.T) {
 		{Release: "v2.6.1", Kind: "patch", Phase: k4allv1alpha1.HopInProgress},
 		{Release: "v2.7.0", Kind: "minor", Phase: k4allv1alpha1.HopPending},
 	}
-	if !reflect.DeepEqual(status.Path, wantPath) {
+	if !reflect.DeepEqual(hops(status.Path), hops(wantPath)) {
 		t.Errorf("path = %+v, want %+v", status.Path, wantPath)
 	}
 }
@@ -361,7 +361,7 @@ func TestDecide_SucceedsWhenEveryNodeRunsTheTarget(t *testing.T) {
 
 	expectActions(t, actions)
 	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeSucceeded, "")
-	if want := []k4allv1alpha1.Hop{{Release: "v2.6.0", Kind: "minor", Phase: k4allv1alpha1.HopDone}}; !reflect.DeepEqual(status.Path, want) {
+	if want := []k4allv1alpha1.Hop{{Release: "v2.6.0", Kind: "minor", Phase: k4allv1alpha1.HopDone}}; !reflect.DeepEqual(hops(status.Path), hops(want)) {
 		t.Errorf("path = %+v, want %+v", status.Path, want)
 	}
 }
@@ -446,4 +446,148 @@ func TestDecide_DrainingNodeWaitsForTheGraph(t *testing.T) {
 	status, actions := Decide(in)
 	expectActions(t, actions)
 	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, "cannot read the upgrade graph: GET upgrade-graph.json: 503")
+}
+
+// ── Status for the UI: reasons, graph, times, conditions ─────────────────
+
+func TestDecide_FailedNodesCarryAMachineReadableReason(t *testing.T) {
+	cases := map[string]struct {
+		in   Input
+		want k4allv1alpha1.NodeUpgradeReason
+	}{
+		"drain timeout": {draining(t, now.Add(-31*time.Minute), 2), k4allv1alpha1.NodeReasonDrainTimeout},
+		"hold":          {upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "HOLD"), k4allv1alpha1.NodeReasonHostHold},
+		"rejected target": {upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "HOLD",
+			k4allv1alpha1.NodeUpgradeReasonAnnotation, "TargetRejected"), k4allv1alpha1.NodeReasonTargetRejected},
+		"rollback": {upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "HOLD",
+			k4allv1alpha1.NodeUpgradeReasonAnnotation, "RollbackRebooted"), k4allv1alpha1.NodeReasonRollbackRebooted},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, _ := Decide(c.in)
+			if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeFailed || got.Reason != c.want {
+				t.Errorf("cp-0 = %s/%s, want Failed/%s", got.Phase, got.Reason, c.want)
+			}
+			if failed := condition(status, k4allv1alpha1.ConditionFailed); failed == nil || failed.Reason != string(c.want) {
+				t.Errorf("Failed condition = %+v, want reason %s", failed, c.want)
+			}
+		})
+	}
+}
+
+func TestDecide_AbandonedHopShowsTheHostPhase(t *testing.T) {
+	in := upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "ABANDONED")
+	delete(in.Nodes[2].Annotations, k4allv1alpha1.NodeUpgradeTargetAnnotation)
+
+	status, _ := Decide(in)
+	if got := status.Nodes[0]; got.Reason != k4allv1alpha1.NodeReasonAbandoned || got.HostPhase != "ABANDONED" {
+		t.Errorf("cp-0 = %s/%q, want Abandoned with hostPhase ABANDONED", got.Reason, got.HostPhase)
+	}
+}
+
+func TestDecide_NamesTheNodeItWaitsFor(t *testing.T) {
+	nodes := threeNodes("v2.5.0")
+	nodes[0].Ready = false
+	status, _ := Decide(Input{Spec: target("v2.7.0"), Nodes: nodes, Graph: graph(t), Now: now})
+
+	for _, n := range status.Nodes {
+		want := k4allv1alpha1.NodeUpgradeReason("")
+		if n.Name == "w-0" {
+			want = k4allv1alpha1.NodeReasonNotReady
+		}
+		if n.Reason != want {
+			t.Errorf("%s reason = %q, want %q", n.Name, n.Reason, want)
+		}
+	}
+}
+
+// An unreadable graph must not look like an up-to-date cluster.
+func TestDecide_UnreadableGraphShowsWithoutATarget(t *testing.T) {
+	status, _ := Decide(Input{Nodes: threeNodes("v2.5.0"), Now: now, GraphErr: errors.New("GET upgrade-graph.json: 503")})
+
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeIdle, "cannot read the upgrade graph: GET upgrade-graph.json: 503")
+	graphOK := condition(status, k4allv1alpha1.ConditionGraphAvailable)
+	if graphOK == nil || graphOK.Status != metav1.ConditionFalse || graphOK.Message != "GET upgrade-graph.json: 503" {
+		t.Errorf("GraphAvailable = %+v, want False with the error", graphOK)
+	}
+}
+
+func TestDecide_AvailableReleasesCarryTheirRulesAndPath(t *testing.T) {
+	status, _ := Decide(Input{Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now})
+
+	last := status.AvailableReleases[len(status.AvailableReleases)-1]
+	if last.Version != "v2.7.0" || last.MinFrom != firstHop || last.Crio != "1.36" {
+		t.Errorf("v2.7.0 = %+v, want minFrom v2.6.0 and crio 1.36", last)
+	}
+	if want := []string{firstHop, "v2.6.1", "v2.7.0"}; !reflect.DeepEqual(last.Path, want) {
+		t.Errorf("path to v2.7.0 = %v, want %v", last.Path, want)
+	}
+	if cur := status.CurrentReleaseInfo; cur == nil || cur.Version != "v2.5.0" || cur.Kubernetes != "1.35.10" || cur.Fedora != 45 {
+		t.Errorf("currentReleaseInfo = %+v, want v2.5.0 with Kubernetes 1.35.10 on Fedora 45", cur)
+	}
+}
+
+func TestDecide_TimesHopsAndNodes(t *testing.T) {
+	status, _ := Decide(Input{Spec: target("v2.7.0"), Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now})
+	if h := status.Path[0]; h.StartedAt == nil || !h.StartedAt.Time.Equal(now) {
+		t.Errorf("hop %s startedAt = %v, want %v", h.Release, h.StartedAt, now)
+	}
+	if n := status.Nodes[0]; n.StartedAt == nil || !n.StartedAt.Time.Equal(now) || n.CompletedAt != nil {
+		t.Errorf("cp-0 started %v completed %v, want started now", n.StartedAt, n.CompletedAt)
+	}
+
+	// cp-0 finishes ten minutes later; the hop keeps its start.
+	in := upgrading(t, "v2.6.0", k4allv1alpha1.NodeUpgradeDoneAnnotation, firstHop)
+	in.Previous.Path, in.Previous.Nodes[0].StartedAt = status.Path, status.Nodes[0].StartedAt
+	in.Now = now.Add(10 * time.Minute)
+	later, _ := Decide(in)
+	if h := later.Path[0]; !h.StartedAt.Time.Equal(now) {
+		t.Errorf("hop startedAt moved to %v", h.StartedAt)
+	}
+	if n := later.Nodes[0]; !n.StartedAt.Time.Equal(now) || n.CompletedAt == nil || !n.CompletedAt.Time.Equal(in.Now) {
+		t.Errorf("cp-0 started %v completed %v, want %v and %v", n.StartedAt, n.CompletedAt, now, in.Now)
+	}
+
+	// Every node at v2.6.0: the hop is done from then on.
+	done, _ := Decide(Input{Spec: target("v2.7.0"), Nodes: threeNodes(firstHop), Previous: later, Graph: graph(t), Now: now.Add(30 * time.Minute)})
+	if h := done.Path[0]; h.Phase != k4allv1alpha1.HopDone || !h.StartedAt.Time.Equal(now) || !h.CompletedAt.Time.Equal(now.Add(30*time.Minute)) {
+		t.Errorf("hop %s = %s from %v to %v", h.Release, h.Phase, h.StartedAt, h.CompletedAt)
+	}
+}
+
+func TestDecide_ConditionsFollowThePhase(t *testing.T) {
+	status, _ := Decide(Input{Spec: target("v2.7.0"), Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now})
+	for typ, want := range map[string]metav1.ConditionStatus{
+		k4allv1alpha1.ConditionGraphAvailable: metav1.ConditionTrue,
+		k4allv1alpha1.ConditionProgressing:    metav1.ConditionTrue,
+		k4allv1alpha1.ConditionSucceeded:      metav1.ConditionFalse,
+		k4allv1alpha1.ConditionFailed:         metav1.ConditionFalse,
+	} {
+		if c := condition(status, typ); c == nil || c.Status != want {
+			t.Errorf("%s = %+v, want %s", typ, c, want)
+		}
+	}
+
+	refused, _ := Decide(Input{Spec: target("v2.4.0"), Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now})
+	if c := condition(refused, k4allv1alpha1.ConditionFailed); c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Downgrade" {
+		t.Errorf("Failed = %+v, want True/Downgrade", c)
+	}
+}
+
+// hops drops the times of a path, for the cases about its shape.
+func hops(path []k4allv1alpha1.Hop) []string {
+	out := make([]string, 0, len(path))
+	for _, h := range path {
+		out = append(out, h.Release+" "+h.Kind+" "+string(h.Phase))
+	}
+	return out
+}
+
+func condition(status k4allv1alpha1.ClusterUpgradeStatus, typ string) *metav1.Condition {
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == typ {
+			return &status.Conditions[i]
+		}
+	}
+	return nil
 }
