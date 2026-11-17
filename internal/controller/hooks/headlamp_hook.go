@@ -16,6 +16,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const (
+	// headlampDefaultNamespace is used when the component spec does not set a namespace.
+	headlampDefaultNamespace = "headlamp"
+	// headlampReleaseName is the name of the Helm-managed ServiceAccount, Service and Ingress.
+	headlampReleaseName = "headlamp"
+	// headlampAdminName is the name of the operator-managed admin ServiceAccount and ClusterRoleBinding.
+	headlampAdminName = "headlamp-admin"
+)
+
 // HeadlampHook handles post-install configuration for the Headlamp dashboard:
 //   - Creates admin ServiceAccount + ClusterRoleBinding
 //   - Creates long-lived token Secret
@@ -33,7 +42,7 @@ func NewHeadlampHook(c client.Client, log logr.Logger) *HeadlampHook {
 func (h *HeadlampHook) PostInstall(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error {
 	ns := spec.Namespace
 	if ns == "" {
-		ns = "headlamp"
+		ns = headlampDefaultNamespace
 	}
 
 	if err := h.ensureAdminSA(ctx, ns); err != nil {
@@ -63,7 +72,7 @@ func (h *HeadlampHook) PostInstall(ctx context.Context, spec k4allv1alpha1.Compo
 func (h *HeadlampHook) ensureAdminSA(ctx context.Context, namespace string) error {
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "headlamp-admin",
+			Name:      headlampAdminName,
 			Namespace: namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "k4all-operator",
@@ -84,7 +93,7 @@ func (h *HeadlampHook) ensureAdminSA(ctx context.Context, namespace string) erro
 func (h *HeadlampHook) ensureClusterRoleBinding(ctx context.Context, namespace string) error {
 	desired := &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "headlamp-admin",
+			Name: headlampAdminName,
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "k4all-operator",
 			},
@@ -97,7 +106,7 @@ func (h *HeadlampHook) ensureClusterRoleBinding(ctx context.Context, namespace s
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      "headlamp-admin",
+				Name:      headlampAdminName,
 				Namespace: namespace,
 			},
 		},
@@ -120,7 +129,7 @@ func (h *HeadlampHook) ensureClusterRoleBinding(ctx context.Context, namespace s
 
 	found := false
 	for _, s := range existing.Subjects {
-		if s.Kind == "ServiceAccount" && s.Name == "headlamp-admin" && s.Namespace == namespace {
+		if s.Kind == "ServiceAccount" && s.Name == headlampAdminName && s.Namespace == namespace {
 			found = true
 			break
 		}
@@ -150,7 +159,7 @@ func (h *HeadlampHook) ensurePodClusterRoleBinding(ctx context.Context, namespac
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      "headlamp",
+				Name:      headlampReleaseName,
 				Namespace: namespace,
 			},
 		},
@@ -175,7 +184,7 @@ func (h *HeadlampHook) ensureTokenSecret(ctx context.Context, namespace string) 
 				"app.kubernetes.io/managed-by": "k4all-operator",
 			},
 			Annotations: map[string]string{
-				"kubernetes.io/service-account.name": "headlamp-admin",
+				"kubernetes.io/service-account.name": headlampAdminName,
 			},
 		},
 		Type: corev1.SecretTypeServiceAccountToken,
@@ -206,7 +215,7 @@ func (h *HeadlampHook) ensureIngress(ctx context.Context, namespace string, _ k4
 
 	desired := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "headlamp",
+			Name:      headlampReleaseName,
 			Namespace: namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by":  "k4all-operator",
@@ -229,7 +238,7 @@ func (h *HeadlampHook) ensureIngress(ctx context.Context, namespace string, _ k4
 									PathType: &pathType,
 									Backend: networkingv1.IngressBackend{
 										Service: &networkingv1.IngressServiceBackend{
-											Name: "headlamp",
+											Name: headlampReleaseName,
 											Port: networkingv1.ServiceBackendPort{Number: headlampDefaultPort},
 										},
 									},
@@ -257,7 +266,7 @@ func (h *HeadlampHook) ensureIngress(ctx context.Context, namespace string, _ k4
 }
 
 func (h *HeadlampHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha1.ClusterConfigSpec) error {
-	ns := "headlamp"
+	ns := headlampDefaultNamespace
 	h.log.Info("cleaning up headlamp resources", "namespace", ns)
 
 	secret := &corev1.Secret{}
@@ -268,14 +277,14 @@ func (h *HeadlampHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha1.Cl
 	}
 
 	sa := &corev1.ServiceAccount{}
-	sa.Name = "headlamp-admin"
+	sa.Name = headlampAdminName
 	sa.Namespace = ns
 	if err := h.client.Delete(ctx, sa); err != nil && !errors.IsNotFound(err) {
 		h.log.V(1).Info("headlamp SA delete (best-effort)", "error", err)
 	}
 
 	crb := &rbacv1.ClusterRoleBinding{}
-	crb.Name = "headlamp-admin"
+	crb.Name = headlampAdminName
 	if err := h.client.Delete(ctx, crb); err != nil && !errors.IsNotFound(err) {
 		h.log.V(1).Info("headlamp CRB delete (best-effort)", "error", err)
 	}
@@ -287,7 +296,7 @@ func (h *HeadlampHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha1.Cl
 	}
 
 	ingress := &networkingv1.Ingress{}
-	ingress.Name = "headlamp"
+	ingress.Name = headlampReleaseName
 	ingress.Namespace = ns
 	if err := h.client.Delete(ctx, ingress); err != nil && !errors.IsNotFound(err) {
 		h.log.V(1).Info("headlamp ingress delete (best-effort)", "error", err)

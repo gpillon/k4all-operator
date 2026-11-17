@@ -51,11 +51,6 @@ type NodeConfigReconciler struct {
 	APIReader client.Reader
 }
 
-var (
-	nncpGVR = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1", Resource: "nodenetworkconfigurationpolicies"}
-	nnsGVR  = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1beta1", Resource: "nodenetworkstates"}
-)
-
 func (r *NodeConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("node", req.Name)
 

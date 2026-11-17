@@ -1,0 +1,126 @@
+name: E2E Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KIND_VERSION: v0.33.0
+  # Same Kubernetes minor as the k4all bootc image (pkgs.k8s.io core:/stable:/v1.35).
+  KIND_NODE_IMAGE: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+  KIND_CLUSTER: k4all-operator-test-e2e
+  E2E_IMG: localhost/k4all-operator:e2e-test
+
+jobs:
+  test-e2e:
+    name: E2E (kind)
+    # Same-repo PRs are already covered by the push run on the head commit
+    # (its checks show up on the PR); only PRs from forks need their own run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      # setup-go's built-in cache uses one key for every job, so lint/test/e2e
+      # race to save it; a per-job key keeps each job's build cache relevant.
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ github.job }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ github.job }}-
+
+      # controller-gen and kustomize, pinned in the Makefile.
+      - name: Cache tool binaries
+        uses: actions/cache@v6
+        with:
+          path: bin
+          key: bin-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Makefile', 'go.mod') }}
+
+      # ── Operator image ────────────────────────────────────────────────
+      # Layers (base image, go mod download) come from the GHA layer cache;
+      # the Go build cache mount is persisted with buildkit-cache-dance.
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Go build cache for the image build
+        id: docker-go-cache
+        uses: actions/cache@v6
+        with:
+          path: docker-go-build-cache
+          key: docker-go-build-${{ runner.os }}-e2e-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            docker-go-build-${{ runner.os }}-e2e-
+
+      - name: Inject Go build cache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "docker-go-build-cache": "/root/.cache/go-build"
+            }
+          skip-extraction: ${{ steps.docker-go-cache.outputs.cache-hit }}
+
+      - name: Build operator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          provenance: false
+          tags: ${{ env.E2E_IMG }}
+          cache-from: type=gha,scope=e2e
+          cache-to: type=gha,mode=max,scope=e2e
+
+      # ── Cluster and tests ─────────────────────────────────────────────
+      - name: Install kind
+        run: |
+          curl -sSLo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      # 'make setup-test-e2e' (called by test-e2e) skips creation when the
+      # cluster already exists, so the pinned node image is used.
+      - name: Create kind cluster
+        run: kind create cluster --name "${KIND_CLUSTER}" --image "${KIND_NODE_IMAGE}" --wait 2m
+
+      - name: Load operator image into kind
+        run: make kind-load-image IMG="${E2E_IMG}" CONTAINER_TOOL=docker KIND_CLUSTER="${KIND_CLUSTER}"
+
+      - name: Render dist/install.yaml
+        run: make build-installer IMG="${E2E_IMG}"
+
+      - name: Running Test e2e
+        run: make test-e2e KIND_CLUSTER="${KIND_CLUSTER}"
+
+      # ── Diagnostics on failure ────────────────────────────────────────
+      - name: Export kind logs
+        if: failure()
+        run: kind export logs ./kind-logs --name "${KIND_CLUSTER}" || true
+
+      - name: Upload kind logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kind-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: kind-logs
+          retention-days: 7
+          if-no-files-found: ignore

@@ -1,3 +1,7 @@
 # More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
 # Ignore build and test binaries.
 bin/
+# CI cache directories (actions/cache + buildkit-cache-dance) and e2e logs.
+docker-go-build-cache/
+scratch/
+kind-logs/

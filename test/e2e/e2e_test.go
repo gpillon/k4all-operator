@@ -160,7 +160,6 @@ var _ = Describe("K4All Operator", Ordered, func() {
 			"nodeconfigs.k4all.magesgate.com",
 		}
 		for _, crd := range crds {
-			crd := crd
 			It(fmt.Sprintf("should have CRD %s", crd), func() {
 				out := kubectlMustSucceed("get", "crd", crd)
 				Expect(out).To(ContainSubstring(crd))
@@ -209,7 +208,6 @@ var _ = Describe("K4All Operator", Ordered, func() {
 
 	Context("Component States", func() {
 		for _, comp := range expectedComponents {
-			comp := comp
 			It(fmt.Sprintf("should have %q in Installed state", comp), func() {
 				state := componentState(comp)
 				Expect(state).To(Equal("Installed"),
@@ -380,7 +378,7 @@ var _ = Describe("K4All Operator", Ordered, func() {
 			var status map[string]interface{}
 			if err := json.Unmarshal([]byte(out), &status); err == nil {
 				formatted, _ := json.MarshalIndent(status, "", "  ")
-				fmt.Fprintf(GinkgoWriter, "\n=== ReleaseManifest Status ===\n%s\n", formatted)
+				_, _ = fmt.Fprintf(GinkgoWriter, "\n=== ReleaseManifest Status ===\n%s\n", formatted)
 			}
 		}
 
@@ -388,12 +386,12 @@ var _ = Describe("K4All Operator", Ordered, func() {
 		logs, _ := kubectl("logs", "-n", operatorNamespace,
 			"-l", "control-plane=controller-manager",
 			"--tail=200")
-		fmt.Fprintf(GinkgoWriter, "\n=== Operator Logs (last 200 lines) ===\n%s\n", logs)
+		_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Operator Logs (last 200 lines) ===\n%s\n", logs)
 
 		By("capturing pod status across namespaces")
 		for _, ns := range []string{operatorNamespace, "tigera-operator", "cert-manager", "kube-system"} {
 			pods, _ := kubectl("get", "pods", "-n", ns, "-o", "wide")
-			fmt.Fprintf(GinkgoWriter, "\n=== Pods in %s ===\n%s\n", ns, pods)
+			_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Pods in %s ===\n%s\n", ns, pods)
 		}
 	})
 })

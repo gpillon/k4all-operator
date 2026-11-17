@@ -92,7 +92,7 @@ func (h *MetalLBHook) patchKubeProxyStrictARP(ctx context.Context) error {
 }
 
 func (h *MetalLBHook) ensureIPAddressPool(ctx context.Context, ips []string) error {
-	var addresses []interface{}
+	addresses := make([]interface{}, 0, len(ips))
 	for _, ip := range ips {
 		addresses = append(addresses, ip+"/32")
 	}
