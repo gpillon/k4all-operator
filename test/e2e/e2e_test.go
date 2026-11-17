@@ -382,6 +382,38 @@ var _ = Describe("K4All Operator", Ordered, func() {
 		})
 	})
 
+	// ── Upgrade Path ────────────────────────────────────────────────────
+
+	Context("Upgrade Path", func() {
+		It("should upgrade cert-manager one minor at a time through upgradePath", func() {
+			By("moving cert-manager from v1.14.5 to v1.16.5 through v1.15.5")
+			patch := `{"spec":{"components":{"cert-manager":{` +
+				`"version":"v1.16.5","helmArgs":["--set crds.enabled=true"],` +
+				`"upgradePath":[{"version":"v1.15.5"}]}}}}`
+			kubectlMustSucceed("patch", "releasemanifest", releaseManifestName, "--type", "merge", "-p", patch)
+
+			By("waiting for cert-manager to be Installed at v1.16.5")
+			Eventually(func() string {
+				out, _ := kubectl("get", "releasemanifest", releaseManifestName, "-o",
+					"jsonpath={.status.components.cert-manager.state}/{.status.components.cert-manager.installedVersion}")
+				return out
+			}, 2*testTimeout, pollInterval).Should(Equal("Installed/v1.16.5"),
+				"cert-manager message: %s", componentMessage("cert-manager"))
+
+			By("checking that the v1.15.5 step really ran")
+			// Every helm upgrade rolls a new ReplicaSet; the old ones keep their image.
+			out := kubectlMustSucceed("get", "replicasets", "-n", "cert-manager",
+				"-l", "app.kubernetes.io/name=cert-manager,app.kubernetes.io/component=controller",
+				"-o", "jsonpath={.items[*].spec.template.spec.containers[0].image}")
+			Expect(out).To(ContainSubstring(":v1.15.5"), "controller ReplicaSet images: %s", out)
+			Expect(out).To(ContainSubstring(":v1.16.5"), "controller ReplicaSet images: %s", out)
+
+			Eventually(func() bool {
+				return deploymentReady("cert-manager-webhook", "cert-manager")
+			}, testTimeout, pollInterval).Should(BeTrue())
+		})
+	})
+
 	// ── Diagnostics ─────────────────────────────────────────────────────
 
 	AfterAll(func() {

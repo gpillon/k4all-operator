@@ -162,6 +162,35 @@ spec:
                       - binary
                       - static-pod
                       type: string
+                    upgradePath:
+                      description: |-
+                        Intermediate versions the component must pass through, one per
+                        reconcile, when upgrading from an older installed version to version
+                        (e.g. cert-manager one minor at a time). Only versions strictly between
+                        the installed version and version are applied; fresh installs go
+                        straight to version.
+                      items:
+                        description: UpgradeStep is one intermediate version of a
+                          component's upgradePath.
+                        properties:
+                          helmArgs:
+                            description: Helm arguments for this step; when set they
+                              replace the component's helmArgs
+                            items:
+                              type: string
+                            type: array
+                          values:
+                            description: Inline Helm values for this step; when set
+                              they replace the component's values
+                            x-kubernetes-preserve-unknown-fields: true
+                          version:
+                            description: Version to install at this step, in the same
+                              format as the component version
+                            type: string
+                        required:
+                        - version
+                        type: object
+                      type: array
                     values:
                       description: Inline Helm values (arbitrary YAML)
                       x-kubernetes-preserve-unknown-fields: true

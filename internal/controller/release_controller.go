@@ -82,6 +82,9 @@ const ForceResyncAnnotation = "k4all.magesgate.com/force-resync"
 // operator self-update and no re-resolution of "latest" versions.
 const UpgradeInProgressAnnotation = "k4all.magesgate.com/upgrade-in-progress"
 
+// upgradeStepInterval is how soon the next upgradePath step is applied.
+const upgradeStepInterval = 10 * time.Second
+
 // upgradePollInterval is how often a paused reconcile checks whether the hop is over.
 const upgradePollInterval = 30 * time.Second
 
@@ -146,7 +149,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	markUnmanagedComponents(rm)
 	inactiveOK := r.reconcileInactiveComponents(ctx, log, rm, active, config.Spec)
-	activeOK := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
+	activeOK, stepsLeft := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
 	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
 
@@ -158,6 +161,9 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Update ClusterConfig status
 	r.updateClusterConfigStatus(ctx, config, rm)
 
+	if stepsLeft {
+		return ctrl.Result{RequeueAfter: upgradeStepInterval}, nil
+	}
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 }
 
@@ -279,12 +285,13 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 
 // reconcileActiveComponents installs or upgrades the active components in
 // dependency order, running the PreInstall/PostInstall hooks around each one.
-// It returns false if any component failed.
+// A component with an upgradePath moves by one step per call. It returns false
+// if any component failed, and stepsLeft when some component is mid-path.
 func (r *ReleaseReconciler) reconcileActiveComponents(
 	ctx context.Context, log logr.Logger, rm *k4allv1alpha1.ReleaseManifest, order []string,
 	active map[string]k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
-) bool {
-	allOK := true
+) (allOK, stepsLeft bool) {
+	allOK = true
 	for _, name := range order {
 		spec := active[name]
 		currentStatus := rm.Status.Components[name]
@@ -303,9 +310,11 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			}
 		}
 
-		log.Info("reconciling component", "name", name, "type", spec.Type, "version", spec.Version)
+		toApply, intermediate := engine.UpgradeStep(spec, currentStatus.InstalledVersion)
+		log.Info("reconciling component", "name", name, "type", spec.Type, "version", toApply.Version,
+			"target", spec.Version)
 
-		extraValues, valuesErr := r.componentValues(ctx, name, spec, config)
+		extraValues, valuesErr := r.componentValues(ctx, name, toApply, config)
 		if valuesErr != nil {
 			log.Error(valuesErr, "preparing component values failed", "name", name)
 			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
@@ -317,14 +326,28 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			continue
 		}
 
-		st, err := r.engine.ReconcileComponent(ctx, name, spec, extraValues)
+		var opts []engine.ReconcileOption
+		if intermediate {
+			opts = append(opts, engine.WaitUntilReady())
+		}
+		st, err := r.engine.ReconcileComponent(ctx, name, toApply, extraValues, opts...)
 		if err != nil {
 			log.Error(err, "component reconciliation failed", "name", name)
 			allOK = false
+			// Keep the version still running: the next attempt resumes the path from it.
+			st.InstalledVersion = currentStatus.InstalledVersion
+			if intermediate {
+				st.Message = fmt.Sprintf("upgrade step %s (towards %s): %s", toApply.Version, spec.Version, st.Message)
+			}
 			rm.Status.Components[name] = *st
 			continue
 		}
 		st.AppliedHash = hash
+		if intermediate {
+			stepsLeft = true
+			st.State = k4allv1alpha1.ComponentStateUpgrading
+			st.Message = fmt.Sprintf("upgrade step %s installed, upgrading towards %s", toApply.Version, spec.Version)
+		}
 		rm.Status.Components[name] = *st
 
 		// Run PostInstall hook for post-install configuration
@@ -336,7 +359,7 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			}
 		}
 	}
-	return allOK
+	return allOK, stepsLeft
 }
 
 // reconcileRemovedComponents uninstalls components explicitly set to

@@ -38,7 +38,9 @@ func NewHelmInstaller(restConfig *rest.Config, log logr.Logger) *HelmInstaller {
 	}
 }
 
-func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, values map[string]interface{}) error {
+// Reconcile installs or upgrades the release. With wait it returns only once
+// the release's resources are ready (used for intermediate upgradePath steps).
+func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, values map[string]interface{}, wait bool) error {
 	cfg, err := h.actionConfig(spec.Namespace)
 	if err != nil {
 		return fmt.Errorf("helm action config: %w", err)
@@ -65,7 +67,7 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 		install.ReleaseName = name
 		install.Namespace = spec.Namespace
 		install.CreateNamespace = true
-		install.Wait = false
+		install.Wait = wait
 		install.Timeout = 10 * time.Minute
 		_, err = install.RunWithContext(ctx, chart, values)
 		return err
@@ -79,7 +81,7 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 		"from", currentVersion, "to", spec.Version)
 	upgrade := action.NewUpgrade(cfg)
 	upgrade.Namespace = spec.Namespace
-	upgrade.Wait = false
+	upgrade.Wait = wait
 	upgrade.Timeout = 10 * time.Minute
 	upgrade.MaxHistory = 3
 	_, err = upgrade.RunWithContext(ctx, name, chart, values)
