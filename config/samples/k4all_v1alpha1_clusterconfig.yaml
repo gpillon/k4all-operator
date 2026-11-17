@@ -31,8 +31,8 @@ spec:
     ha:
       type: none
   ingress:
-    # Traefik serves the routes from k4all v2.6.0. Without this key it takes
-    # the settings of ingress.nginx, as on clusters installed earlier.
+    # Traefik serves the routes from k4all v2.6.0. ingress.nginx is
+    # deprecated: on clusters installed earlier the operator moves it here.
     traefik:
       dedicatedIP: ""
       isDefault: true

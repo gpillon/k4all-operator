@@ -72,10 +72,7 @@ func traefikConfig(ingress k4allv1alpha1.IngressConfig) k4allv1alpha1.TraefikIng
 	if ingress.Traefik != nil {
 		return *ingress.Traefik
 	}
-	return k4allv1alpha1.TraefikIngressConfig{
-		DedicatedIP: ingress.Nginx.DedicatedIP,
-		IsDefault:   ingress.Nginx.IsDefault,
-	}
+	return k4allv1alpha1.TraefikIngressConfig(ingress.NginxSettings())
 }
 
 // nested returns the map at path inside values, creating missing levels.

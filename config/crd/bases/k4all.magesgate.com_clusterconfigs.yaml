@@ -158,7 +158,9 @@ spec:
                         type: string
                     type: object
                   nginx:
-                    description: NginxIngressConfig configures the NGINX ingress controller.
+                    description: |-
+                      Deprecated since k4all v2.6.0: use ingress.traefik. From v2.6.0 the
+                      operator moves these settings to ingress.traefik and removes this key.
                     properties:
                       dedicatedIP:
                         description: Dedicated LoadBalancer IP; leave empty to use

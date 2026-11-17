@@ -1,7 +1,8 @@
 # Component set of k4all v2.4.0 (fcos-k8s bootc/overlay/usr/local/share/k4all-release.yaml),
 # limited to the components the e2e suite installs. On Kubernetes 1.35 the
 # suite installs releasemanifest.yaml (the v2.2.x set), then applies this file
-# as the v2.4.0 ReleaseManifest sync does, then releasemanifest-v2.6.yaml.
+# as the v2.4.0 ReleaseManifest sync does, then releasemanifest-v2.6.yaml; with
+# clusterconfig-v2.4-nginx-dedicated-ip.yaml it installs this file directly.
 apiVersion: k4all.magesgate.com/v1alpha1
 kind: ReleaseManifest
 metadata:
@@ -80,6 +81,15 @@ spec:
           type: strategic
           patch: '{"spec":{"template":{"spec":{"containers":[{"name":"metrics-server","args":["--cert-dir=/tmp","--secure-port=10250","--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname","--kubelet-use-node-status-port","--metric-resolution=15s","--kubelet-insecure-tls"]}]}}}}'
 
+    # MetalLB announces ingress.nginx.dedicatedIP; without one it is not installed.
+    metallb:
+      type: manifest
+      version: "v0.16.2"
+      source: "https://raw.githubusercontent.com/metallb/metallb/{{ version }}/config/manifests/metallb-native.yaml"
+      namespace: metallb-system
+      dependsOn:
+        - calico
+
     # Ingress — the k4all route shapes are served through it before v2.6.0.
     ingress-nginx:
       type: helm
@@ -98,5 +108,24 @@ spec:
           nodeSelector:
             kubernetes.io/os: linux
             node-role.kubernetes.io/control-plane: ""
+      dependsOn:
+        - cert-manager
+        - metallb
+
+    # Dashboard — the operator's headlamp hook publishes it on
+    # dashboard.<ip>.nip.io through the ingress controller. Without the k4all
+    # plugin initContainer of the real manifest.
+    headlamp:
+      type: helm
+      version: "0.46.0"
+      repo: "https://kubernetes-sigs.github.io/headlamp/"
+      chart: headlamp
+      namespace: headlamp
+      values:
+        service:
+          type: ClusterIP
+          port: 4466
+        ingress:
+          enabled: false
       dependsOn:
         - cert-manager

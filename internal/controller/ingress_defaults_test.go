@@ -61,7 +61,7 @@ func TestClusterConfig_IngressIsDefault(t *testing.T) {
 			Spec: k4allv1alpha1.ClusterConfigSpec{
 				Networking: k4allv1alpha1.NetworkingConfig{CNI: k4allv1alpha1.CNIConfig{Type: "calico"}},
 				Ingress: k4allv1alpha1.IngressConfig{
-					Nginx:   k4allv1alpha1.NginxIngressConfig{IsDefault: true},
+					Nginx:   &k4allv1alpha1.NginxIngressConfig{IsDefault: true},
 					Traefik: &k4allv1alpha1.TraefikIngressConfig{IsDefault: true},
 				},
 			},

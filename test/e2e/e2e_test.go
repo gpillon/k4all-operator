@@ -229,14 +229,23 @@ func nodeInternalIP() string {
 }
 
 // dedicatedIP is the ingress.*.dedicatedIP controller is published on, or ""
-// when it listens on the node IP. Traefik takes the nginx settings when the
-// ClusterConfig has no ingress.traefik.
+// when it listens on the node IP.
 func dedicatedIP(controller string) string {
-	ingress := mustReadClusterConfig(clusterConfigFile).Spec.Ingress
-	if controller == traefikController && ingress.Traefik != nil {
-		return ingress.Traefik.DedicatedIP
+	if controller == traefikController {
+		return expectedTraefik().DedicatedIP
 	}
-	return ingress.Nginx.DedicatedIP
+	return mustReadClusterConfig(clusterConfigFile).Spec.Ingress.NginxSettings().DedicatedIP
+}
+
+// expectedTraefik is ingress.traefik as the operator has it from k4all
+// v2.6.0: the one of the testdata ClusterConfig, or else its ingress.nginx,
+// which the operator moves there.
+func expectedTraefik() k4allv1alpha1.TraefikIngressConfig {
+	ingress := mustReadClusterConfig(clusterConfigFile).Spec.Ingress
+	if ingress.Traefik != nil {
+		return *ingress.Traefik
+	}
+	return k4allv1alpha1.TraefikIngressConfig(ingress.NginxSettings())
 }
 
 // routesIP is the address the k4all routes are published on through controller.
@@ -326,11 +335,15 @@ func expectNginxHandedOverToTraefik() {
 		return out
 	}, 5*time.Minute, pollInterval).Should(Equal("k8s.io/ingress-nginx"))
 
-	By("making Traefik's own class the default instead")
+	By("making Traefik's own class the default instead, if ingress.traefik.isDefault")
 	const isDefault = `{.metadata.annotations.ingressclass\.kubernetes\.io/is-default-class}`
 	defaults := kubectlMustSucceed("get", "ingressclass", "-o",
 		`jsonpath={range .items[*]}{.metadata.name}=`+isDefault+`{" "}{end}`)
-	Expect(defaults).To(ContainSubstring("traefik=true"))
+	if expectedTraefik().IsDefault {
+		Expect(defaults).To(ContainSubstring("traefik=true"))
+	} else {
+		Expect(defaults).NotTo(ContainSubstring("traefik=true"))
+	}
 	Expect(defaults).NotTo(ContainSubstring("nginx=true"))
 
 	By("labelling the Traefik service for check-ip.sh")
@@ -348,6 +361,70 @@ func expectNginxHandedOverToTraefik() {
 	By("accepting Ingress updates, as update-routes.sh makes them")
 	kubectlMustSucceed("annotate", "ingress", "passthrough", "-n", routesNamespace,
 		"k4all-e2e/touched="+time.Now().Format("150405"), "--overwrite")
+}
+
+// expectNginxSettingsMovedToTraefik checks the ClusterConfig migration of
+// k4all v2.6.0: ingress.traefik set, ingress.nginx gone.
+func expectNginxSettingsMovedToTraefik() {
+	want := expectedTraefik()
+	Eventually(func(g Gomega) {
+		out, err := kubectl("get", "clusterconfig", clusterConfigName, "-o", "json")
+		g.Expect(err).NotTo(HaveOccurred(), out)
+		cc := &k4allv1alpha1.ClusterConfig{}
+		g.Expect(json.Unmarshal([]byte(out), cc)).To(Succeed())
+		g.Expect(cc.Spec.Ingress.Nginx).To(BeNil(), "ingress.nginx is still there")
+		g.Expect(cc.Spec.Ingress.Traefik).To(Equal(&want))
+		g.Expect(cc.Annotations).To(HaveKeyWithValue("k4all.magesgate.com/migrations", "1"))
+	}, 5*time.Minute, pollInterval).Should(Succeed())
+}
+
+// installsHeadlamp says whether rm installs the dashboard.
+func installsHeadlamp(rm *k4allv1alpha1.ReleaseManifest) bool {
+	spec, ok := rm.Spec.Components["headlamp"]
+	return ok && managed(spec)
+}
+
+// expectDashboardServedBy checks the dashboard Ingress of the operator's
+// headlamp hook: on controller's class, and answering through it. Through
+// Traefik plain HTTP goes to HTTPS (the Middleware traefik/redirect-https).
+// It needs the client pod of expectRoutesServedBy.
+func expectDashboardServedBy(controller string) {
+	ip := routesIP(controller)
+	var host string
+	By("publishing the dashboard on the " + controller + " class")
+	Eventually(func(g Gomega) {
+		out, err := kubectl("get", "ingress", "headlamp", "-n", "headlamp", "-o",
+			`jsonpath={.spec.ingressClassName} {.metadata.annotations.k4all\.magesgate\.com/dashboard-host}`)
+		g.Expect(err).NotTo(HaveOccurred(), out)
+		class, owned, _ := strings.Cut(out, " ")
+		g.Expect(class).To(Equal(controller))
+		host = owned
+		g.Expect(host).NotTo(BeEmpty())
+	}, 5*time.Minute, pollInterval).Should(Succeed())
+
+	if controller != traefikController {
+		By("dashboard: HTTP reaches headlamp")
+		Eventually(func(g Gomega) {
+			out, err := routeRequest(ip, "http", host, "-o", "/dev/null", "-w", "%{http_code}")
+			g.Expect(err).NotTo(HaveOccurred(), out)
+			g.Expect(out).To(Equal("200"))
+		}, 5*time.Minute, pollInterval).Should(Succeed())
+		return
+	}
+
+	Expect(host).To(Equal("dashboard." + ip + ".nip.io"))
+	By("dashboard: plain HTTP is redirected to HTTPS")
+	Eventually(func(g Gomega) {
+		out, err := routeRequest(ip, "http", host, "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}")
+		g.Expect(err).NotTo(HaveOccurred(), out)
+		g.Expect(out).To(MatchRegexp(`^30[18] https://` + regexp.QuoteMeta(host) + `/$`))
+	}, 5*time.Minute, pollInterval).Should(Succeed())
+	By("dashboard: HTTPS reaches headlamp")
+	Eventually(func(g Gomega) {
+		out, err := routeRequest(ip, "https", host, "-k", "-o", "/dev/null", "-w", "%{http_code}")
+		g.Expect(err).NotTo(HaveOccurred(), out)
+		g.Expect(out).To(Equal("200"))
+	}, 2*time.Minute, pollInterval).Should(Succeed())
 }
 
 // upgradeTo applies the ReleaseManifest in file over from and waits for every
@@ -574,6 +651,11 @@ var _ = Describe("K4All Operator", Ordered, func() {
 			}
 			expectRoutesServedBy(controller)
 		})
+		if controller := ingressController(initial); controller != "" && installsHeadlamp(initial) {
+			It("should serve the dashboard through "+controller, func() {
+				expectDashboardServedBy(controller)
+			})
+		}
 	})
 
 	Context("ClusterConfig Status", func() {
@@ -706,12 +788,23 @@ var _ = Describe("K4All Operator", Ordered, func() {
 				upgradeTo(file, from, to)
 			})
 			if ingressController(from) == "nginx" && ingressController(to) == traefikController {
+				It("should move ingress.nginx to ingress.traefik", expectNginxSettingsMovedToTraefik)
 				It("should hand the nginx routes over to Traefik", expectNginxHandedOverToTraefik)
+				if ip := dedicatedIP(traefikController); ip != "" {
+					It("should give Traefik the dedicated IP through MetalLB", func() {
+						expectTraefikOnDedicatedIP(ip)
+					})
+				}
 			}
 			if controller := ingressController(to); controller != "" {
 				It("should serve the k4all route shapes through "+controller, func() {
 					expectRoutesServedBy(controller)
 				})
+				if installsHeadlamp(to) {
+					It("should serve the dashboard through "+controller, func() {
+						expectDashboardServedBy(controller)
+					})
+				}
 			}
 		})
 	}
