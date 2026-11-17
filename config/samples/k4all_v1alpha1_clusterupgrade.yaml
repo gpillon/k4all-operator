@@ -1,0 +1,11 @@
+# The only ClusterUpgrade. The operator creates it with an empty spec; set
+# targetRelease to one of status.availableReleases to start an upgrade.
+apiVersion: k4all.magesgate.com/v1alpha1
+kind: ClusterUpgrade
+metadata:
+  labels:
+    app.kubernetes.io/name: k4all-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: k4all
+spec:
+  targetRelease: v2.7.0

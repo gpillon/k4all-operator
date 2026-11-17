@@ -102,6 +102,7 @@ rules:
   - k4all.magesgate.com
   resources:
   - clusterconfigs/status
+  - clusterupgrades/status
   - nodeconfigs/status
   - releasemanifests/status
   verbs:
@@ -111,6 +112,7 @@ rules:
 - apiGroups:
   - k4all.magesgate.com
   resources:
+  - clusterupgrades
   - nodeconfigs
   - releasemanifests
   verbs:
@@ -124,6 +126,7 @@ rules:
 - apiGroups:
   - k4all.magesgate.com
   resources:
+  - clusterupgrades/finalizers
   - releasemanifests/finalizers
   verbs:
   - update
