@@ -39,7 +39,7 @@ func traefikValues(t *testing.T, config k4allv1alpha1.ClusterConfigSpec) map[str
 // node's own ports 80/443, as nginx did without a dedicated IP or kube-vip.
 func TestComponentValues_TraefikTakesOverNginxHostPorts(t *testing.T) {
 	config := k4allv1alpha1.ClusterConfigSpec{
-		Ingress: k4allv1alpha1.IngressConfig{Nginx: k4allv1alpha1.NginxIngressConfig{IsDefault: true}},
+		Ingress: k4allv1alpha1.IngressConfig{Nginx: &k4allv1alpha1.NginxIngressConfig{IsDefault: true}},
 	}
 
 	got := traefikValues(t, config)
@@ -57,7 +57,7 @@ func TestComponentValues_TraefikTakesOverNginxHostPorts(t *testing.T) {
 
 func TestComponentValues_TraefikDedicatedIPUsesALoadBalancer(t *testing.T) {
 	config := k4allv1alpha1.ClusterConfigSpec{
-		Ingress: k4allv1alpha1.IngressConfig{Nginx: k4allv1alpha1.NginxIngressConfig{
+		Ingress: k4allv1alpha1.IngressConfig{Nginx: &k4allv1alpha1.NginxIngressConfig{
 			DedicatedIP: "192.168.56.200", IsDefault: true,
 		}},
 	}
@@ -82,10 +82,10 @@ func TestComponentValues_TraefikWithoutHostPorts(t *testing.T) {
 	cases := map[string]k4allv1alpha1.ClusterConfigSpec{
 		"kube-vip": {
 			Cluster: k4allv1alpha1.ControlPlaneConfig{HA: k4allv1alpha1.HAConfig{Type: "kubevip"}},
-			Ingress: k4allv1alpha1.IngressConfig{Nginx: k4allv1alpha1.NginxIngressConfig{IsDefault: true}},
+			Ingress: k4allv1alpha1.IngressConfig{Nginx: &k4allv1alpha1.NginxIngressConfig{IsDefault: true}},
 		},
 		"not the default class": {
-			Ingress: k4allv1alpha1.IngressConfig{Nginx: k4allv1alpha1.NginxIngressConfig{IsDefault: false}},
+			Ingress: k4allv1alpha1.IngressConfig{Nginx: &k4allv1alpha1.NginxIngressConfig{IsDefault: false}},
 		},
 	}
 	for name, config := range cases {
@@ -117,7 +117,7 @@ func TestComponentValues_TraefikKubeVIPClass(t *testing.T) {
 func TestComponentValues_TraefikConfigWinsOverNginx(t *testing.T) {
 	config := k4allv1alpha1.ClusterConfigSpec{
 		Ingress: k4allv1alpha1.IngressConfig{
-			Nginx:   k4allv1alpha1.NginxIngressConfig{DedicatedIP: "192.168.56.200", IsDefault: true},
+			Nginx:   &k4allv1alpha1.NginxIngressConfig{DedicatedIP: "192.168.56.200", IsDefault: true},
 			Traefik: &k4allv1alpha1.TraefikIngressConfig{},
 		},
 	}

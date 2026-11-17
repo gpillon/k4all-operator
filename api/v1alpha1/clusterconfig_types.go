@@ -45,8 +45,10 @@ type ClusterConfigSpec struct {
 
 // IngressConfig defines the desired ingress controller settings.
 type IngressConfig struct {
+	// Deprecated since k4all v2.6.0: use ingress.traefik. From v2.6.0 the
+	// operator moves these settings to ingress.traefik and removes this key.
 	// +optional
-	Nginx NginxIngressConfig `json:"nginx,omitempty"`
+	Nginx *NginxIngressConfig `json:"nginx,omitempty"`
 	// +optional
 	Cilium CiliumIngressConfig `json:"cilium,omitempty"`
 	// Traefik replaces NGINX from k4all v2.6.0. When absent, Traefik takes the
@@ -55,7 +57,7 @@ type IngressConfig struct {
 	Traefik *TraefikIngressConfig `json:"traefik,omitempty"`
 }
 
-// NginxIngressConfig configures the NGINX ingress controller.
+// NginxIngressConfig configures the NGINX ingress controller (k4all before v2.6.0).
 type NginxIngressConfig struct {
 	// Dedicated LoadBalancer IP; leave empty to use the node IP directly
 	// +optional

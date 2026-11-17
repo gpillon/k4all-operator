@@ -59,7 +59,7 @@ func TestMetalLBHook_AnnouncesTraefikDedicatedIP(t *testing.T) {
 // nginx settings are copied over. MetalLB refuses a pool whose CIDRs overlap.
 func TestMetalLBHook_AnnouncesASharedIPOnce(t *testing.T) {
 	got := ingressPoolAddresses(t, k4allv1alpha1.IngressConfig{
-		Nginx:   k4allv1alpha1.NginxIngressConfig{DedicatedIP: "192.168.6.193", IsDefault: true},
+		Nginx:   &k4allv1alpha1.NginxIngressConfig{DedicatedIP: "192.168.6.193", IsDefault: true},
 		Traefik: &k4allv1alpha1.TraefikIngressConfig{DedicatedIP: "192.168.6.193", IsDefault: true},
 		Cilium:  k4allv1alpha1.CiliumIngressConfig{DedicatedIP: "192.168.6.194"},
 	})

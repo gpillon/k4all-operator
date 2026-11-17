@@ -22,7 +22,7 @@ func NewIngressNginxHook(c client.Client, log logr.Logger) *IngressNginxHook {
 }
 
 func (h *IngressNginxHook) PreInstall(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {
-	nginxCfg := config.Ingress.Nginx
+	nginxCfg := config.Ingress.NginxSettings()
 	haType := config.Cluster.HA.Type
 
 	controller, _ := values["controller"].(map[string]interface{})
