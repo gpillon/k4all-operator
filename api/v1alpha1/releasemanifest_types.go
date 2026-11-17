@@ -134,6 +134,13 @@ type ComponentSpec struct {
 	// User-customizable key-value pairs preserved across upgrades
 	// +optional
 	Custom map[string]string `json:"custom,omitempty"`
+	// Intermediate versions the component must pass through, one per
+	// reconcile, when upgrading from an older installed version to version
+	// (e.g. cert-manager one minor at a time). Only versions strictly between
+	// the installed version and version are applied; fresh installs go
+	// straight to version.
+	// +optional
+	UpgradePath []UpgradeStep `json:"upgradePath,omitempty"`
 	// If set, this component is only installed when the named feature is enabled in ClusterConfig
 	// +optional
 	FeatureGate string `json:"featureGate,omitempty"`
@@ -188,11 +195,29 @@ type ReleaseManifestStatus struct {
 	ResolvedOSImageTag string `json:"resolvedOSImageTag,omitempty"`
 }
 
+// UpgradeStep is one intermediate version of a component's upgradePath.
+type UpgradeStep struct {
+	// Version to install at this step, in the same format as the component version
+	Version string `json:"version"`
+	// Helm arguments for this step; when set they replace the component's helmArgs
+	// +optional
+	HelmArgs []string `json:"helmArgs,omitempty"`
+	// Inline Helm values for this step; when set they replace the component's values
+	// +optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	Values *apiextensionsv1.JSON `json:"values,omitempty"`
+}
+
 type ComponentStatus struct {
 	// Current state of the component
 	State ComponentState `json:"state,omitempty"`
 	// Currently installed version
 	InstalledVersion string `json:"installedVersion,omitempty"`
+	// Hash of the inputs last applied (component spec, its componentOverrides
+	// and, for components with a hook, the ClusterConfig spec). A change at the
+	// same version makes the operator apply the component again.
+	// +optional
+	AppliedHash string `json:"appliedHash,omitempty"`
 	// Human-readable message
 	Message string `json:"message,omitempty"`
 	// Last time the state transitioned

@@ -45,10 +45,30 @@ func New(c client.Client, restConfig *rest.Config, log logr.Logger, toolsImage s
 	}
 }
 
+// ReconcileOption tunes a single ReconcileComponent call.
+type ReconcileOption func(*reconcileOptions)
+
+type reconcileOptions struct {
+	waitUntilReady bool
+}
+
+// WaitUntilReady makes Helm components return only once their resources are
+// ready, so the next upgradePath step starts from a healthy release.
+func WaitUntilReady() ReconcileOption {
+	return func(o *reconcileOptions) { o.waitUntilReady = true }
+}
+
 // ReconcileComponent installs or upgrades a single component.
 // It resolves version templates, dispatches to the appropriate installer,
 // and applies any post-install patches.
-func (e *Engine) ReconcileComponent(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, extraValues map[string]interface{}) (*k4allv1alpha1.ComponentStatus, error) {
+func (e *Engine) ReconcileComponent(
+	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, extraValues map[string]interface{},
+	opts ...ReconcileOption,
+) (*k4allv1alpha1.ComponentStatus, error) {
+	var o reconcileOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	log := e.log.WithValues("component", name, "type", spec.Type)
 	st := &k4allv1alpha1.ComponentStatus{
 		State:              k4allv1alpha1.ComponentStateInstalling,
@@ -73,7 +93,7 @@ func (e *Engine) ReconcileComponent(ctx context.Context, name string, spec k4all
 
 	switch spec.Type {
 	case k4allv1alpha1.ComponentTypeHelm, k4allv1alpha1.ComponentTypeHelmOCI:
-		err = e.helm.Reconcile(ctx, name, spec, values)
+		err = e.helm.Reconcile(ctx, name, spec, values, o.waitUntilReady)
 	case k4allv1alpha1.ComponentTypeManifest:
 		err = e.manifest.Apply(ctx, name, spec)
 	case k4allv1alpha1.ComponentTypeBinary:
