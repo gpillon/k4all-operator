@@ -1,8 +1,7 @@
 # Component set of k4all v2.4.0 (fcos-k8s bootc/overlay/usr/local/share/k4all-release.yaml),
 # limited to the components the e2e suite installs. On Kubernetes 1.35 the
-# suite installs releasemanifest.yaml (the v2.2.x set) and then applies this
-# file, as the v2.4.0 ReleaseManifest sync does; on 1.36 and 1.37 it installs
-# this file directly.
+# suite installs releasemanifest.yaml (the v2.2.x set), then applies this file
+# as the v2.4.0 ReleaseManifest sync does, then releasemanifest-v2.6.yaml.
 apiVersion: k4all.magesgate.com/v1alpha1
 kind: ReleaseManifest
 metadata:
@@ -80,3 +79,24 @@ spec:
             namespace: kube-system
           type: strategic
           patch: '{"spec":{"template":{"spec":{"containers":[{"name":"metrics-server","args":["--cert-dir=/tmp","--secure-port=10250","--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname","--kubelet-use-node-status-port","--metric-resolution=15s","--kubelet-insecure-tls"]}]}}}}'
+
+    # Ingress — the k4all route shapes are served through it before v2.6.0.
+    ingress-nginx:
+      type: helm
+      version: "4.15.1"
+      repo: "https://kubernetes.github.io/ingress-nginx"
+      chart: ingress-nginx
+      namespace: ingress-nginx
+      values:
+        controller:
+          extraArgs:
+            enable-ssl-passthrough: ""
+          allowSnippetAnnotations: true
+          ingressClassResource:
+            enabled: true
+          kind: DaemonSet
+          nodeSelector:
+            kubernetes.io/os: linux
+            node-role.kubernetes.io/control-plane: ""
+      dependsOn:
+        - cert-manager
