@@ -224,6 +224,12 @@ spec:
               components:
                 additionalProperties:
                   properties:
+                    appliedHash:
+                      description: |-
+                        Hash of the inputs last applied (component spec, its componentOverrides
+                        and, for components with a hook, the ClusterConfig spec). A change at the
+                        same version makes the operator apply the component again.
+                      type: string
                     installedVersion:
                       description: Currently installed version
                       type: string

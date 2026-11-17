@@ -193,6 +193,11 @@ type ComponentStatus struct {
 	State ComponentState `json:"state,omitempty"`
 	// Currently installed version
 	InstalledVersion string `json:"installedVersion,omitempty"`
+	// Hash of the inputs last applied (component spec, its componentOverrides
+	// and, for components with a hook, the ClusterConfig spec). A change at the
+	// same version makes the operator apply the component again.
+	// +optional
+	AppliedHash string `json:"appliedHash,omitempty"`
 	// Human-readable message
 	Message string `json:"message,omitempty"`
 	// Last time the state transitioned

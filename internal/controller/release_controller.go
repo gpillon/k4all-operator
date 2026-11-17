@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -286,9 +288,19 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 	for _, name := range order {
 		spec := active[name]
 		currentStatus := rm.Status.Components[name]
+		hash := r.appliedHash(name, spec, config)
 
 		if r.engine.IsInstalled(ctx, name, spec, &currentStatus) {
-			continue
+			switch currentStatus.AppliedHash {
+			case hash:
+				continue
+			case "":
+				// Installed by an operator that did not record hashes: adopt it
+				// instead of reinstalling every component on operator upgrade.
+				currentStatus.AppliedHash = hash
+				rm.Status.Components[name] = currentStatus
+				continue
+			}
 		}
 
 		log.Info("reconciling component", "name", name, "type", spec.Type, "version", spec.Version)
@@ -312,6 +324,7 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			rm.Status.Components[name] = *st
 			continue
 		}
+		st.AppliedHash = hash
 		rm.Status.Components[name] = *st
 
 		// Run PostInstall hook for post-install configuration
@@ -490,6 +503,33 @@ func (r *ReleaseReconciler) getClusterConfig(ctx context.Context) (*k4allv1alpha
 		return nil, fmt.Errorf("no ClusterConfig found")
 	}
 	return &list.Items[0], nil
+}
+
+// appliedHash identifies what a component is applied from: its spec, its
+// componentOverrides and, when it has a hook, the rest of the ClusterConfig
+// spec the hook reads. Hooks are not run here: some prepare the cluster.
+func (r *ReleaseReconciler) appliedHash(
+	name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+) string {
+	inputs := struct {
+		Spec     k4allv1alpha1.ComponentSpec      `json:"spec"`
+		Override *k4allv1alpha1.ComponentOverride `json:"override,omitempty"`
+		Config   *k4allv1alpha1.ClusterConfigSpec `json:"config,omitempty"`
+	}{Spec: spec}
+	if override, ok := config.ComponentOverrides[name]; ok {
+		inputs.Override = &override
+	}
+	if r.hookReg.Get(name) != nil {
+		hookConfig := config
+		hookConfig.ComponentOverrides = nil
+		inputs.Config = &hookConfig
+	}
+	raw, err := json.Marshal(inputs)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // componentValues returns the values the engine layers on top of the
