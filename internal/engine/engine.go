@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"helm.sh/helm/v3/pkg/strvals"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -238,6 +239,27 @@ func goArchToK8s(goarch string) string {
 	}
 }
 
+// ApplyOverride layers a ClusterConfig componentOverride on top of values:
+// its values are deep-merged, then its helmArgs are applied like `helm --set`.
+func ApplyOverride(values map[string]interface{}, override k4allv1alpha1.ComponentOverride) (map[string]interface{}, error) {
+	if values == nil {
+		values = make(map[string]interface{})
+	}
+	if override.Values != nil && len(override.Values.Raw) > 0 {
+		overlay := make(map[string]interface{})
+		if err := json.Unmarshal(override.Values.Raw, &overlay); err != nil {
+			return nil, fmt.Errorf("unmarshal componentOverrides values: %w", err)
+		}
+		values = mergeMaps(values, overlay)
+	}
+	for _, arg := range override.HelmArgs {
+		if err := applySetArg(values, arg); err != nil {
+			return nil, fmt.Errorf("componentOverrides helmArg %q: %w", arg, err)
+		}
+	}
+	return values, nil
+}
+
 func mergeMaps(base, overlay map[string]interface{}) map[string]interface{} {
 	result := make(map[string]interface{}, len(base))
 	for k, v := range base {
@@ -255,30 +277,12 @@ func mergeMaps(base, overlay map[string]interface{}) map[string]interface{} {
 	return result
 }
 
+// applySetArg applies one "--set key=value" argument with Helm's own parser,
+// so types (bools, numbers), lists and escaped commas match `helm --set`.
 func applySetArg(values map[string]interface{}, arg string) error {
 	arg = strings.TrimPrefix(arg, "--set ")
 	arg = strings.TrimPrefix(arg, "--set=")
-	parts := strings.SplitN(arg, "=", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid --set arg: %s", arg)
-	}
-	setNestedValue(values, strings.Split(parts[0], "."), parts[1])
-	return nil
-}
-
-func setNestedValue(m map[string]interface{}, keys []string, value interface{}) {
-	for i, k := range keys {
-		if i == len(keys)-1 {
-			m[k] = value
-			return
-		}
-		next, ok := m[k].(map[string]interface{})
-		if !ok {
-			next = make(map[string]interface{})
-			m[k] = next
-		}
-		m = next
-	}
+	return strvals.ParseInto(arg, values)
 }
 
 // SetReadyCondition sets or updates the Ready condition on a ReleaseManifest.
