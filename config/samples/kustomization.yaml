@@ -3,4 +3,5 @@ resources:
 - k4all_v1alpha1_clusterconfig.yaml
 - k4all_v1alpha1_nodeconfig.yaml
 - k4all_v1alpha1_releasemanifest.yaml
+- k4all_v1alpha1_clusterupgrade.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

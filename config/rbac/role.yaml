@@ -36,7 +36,15 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/eviction
+  verbs:
+  - create
 - apiGroups:
   - admissionregistration.k8s.io
   resources:
@@ -102,6 +110,7 @@ rules:
   - k4all.magesgate.com
   resources:
   - clusterconfigs/status
+  - clusterupgrades/status
   - nodeconfigs/status
   - releasemanifests/status
   verbs:
@@ -111,6 +120,7 @@ rules:
 - apiGroups:
   - k4all.magesgate.com
   resources:
+  - clusterupgrades
   - nodeconfigs
   - releasemanifests
   verbs:
@@ -124,6 +134,7 @@ rules:
 - apiGroups:
   - k4all.magesgate.com
   resources:
+  - clusterupgrades/finalizers
   - releasemanifests/finalizers
   verbs:
   - update

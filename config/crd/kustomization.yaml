@@ -5,6 +5,7 @@ resources:
 - bases/k4all.magesgate.com_clusterconfigs.yaml
 - bases/k4all.magesgate.com_nodeconfigs.yaml
 - bases/k4all.magesgate.com_releasemanifests.yaml
+- bases/k4all.magesgate.com_clusterupgrades.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

@@ -36,4 +36,12 @@ resources:
   kind: ReleaseManifest
   path: github.com/gpillon/k4all-operator/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+  controller: true
+  domain: magesgate.com
+  group: k4all
+  kind: ClusterUpgrade
+  path: github.com/gpillon/k4all-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"

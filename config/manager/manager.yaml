@@ -70,6 +70,16 @@ spec:
         image: controller:latest
         imagePullPolicy: IfNotPresent
         name: manager
+        env:
+          # The ClusterUpgrade drain never evicts the operator's own pod.
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
         ports: []
         securityContext:
           allowPrivilegeEscalation: false
@@ -101,3 +111,10 @@ spec:
       volumes: []
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
+      # A ClusterUpgrade cordons the node of each hop. When that node runs the
+      # operator and its pod has to be recreated (a reboot longer than the
+      # not-ready eviction), it must still fit there to uncordon the node.
+      tolerations:
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule

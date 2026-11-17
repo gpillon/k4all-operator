@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
@@ -44,4 +45,14 @@ func TestMain(m *testing.M) {
 		_ = testEnv.Stop()
 	}
 	os.Exit(code)
+}
+
+// envtestClient is a client of the shared envtest API server.
+func envtestClient(t *testing.T) client.Client {
+	t.Helper()
+	c, err := client.New(envtestConfig(t), client.Options{Scheme: gateScheme(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

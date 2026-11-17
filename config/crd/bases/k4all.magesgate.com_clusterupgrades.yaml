@@ -1,0 +1,351 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: clusterupgrades.k4all.magesgate.com
+spec:
+  group: k4all.magesgate.com
+  names:
+    kind: ClusterUpgrade
+    listKind: ClusterUpgradeList
+    plural: clusterupgrades
+    singular: clusterupgrade
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.targetRelease
+      name: Target
+      type: string
+    - jsonPath: .status.currentRelease
+      name: Current
+      type: string
+    - jsonPath: .status.currentHop
+      name: Hop
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClusterUpgrade moves every node of the cluster to a k4all release, one hop
+          of the upgrade graph at a time and one node at a time. The operator cordons
+          and drains a node, then asks k4all-upgrade on it for the hop through the
+          node's annotations.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClusterUpgradeSpec is the release the cluster should reach.
+            properties:
+              drain:
+                default: {}
+                description: |-
+                  DrainSpec sets how a node is drained before its hop. A cluster with a
+                  single node is only cordoned: its pods have nowhere to go.
+                properties:
+                  continueOnTimeout:
+                    description: |-
+                      Run the hop anyway when the drain times out. The pods left on the node
+                      stop at its reboot.
+                    type: boolean
+                  timeoutMinutes:
+                    default: 30
+                    description: |-
+                      Minutes to wait for the evictions, which PodDisruptionBudgets can hold
+                      back. Then the node fails, unless continueOnTimeout is set.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
+              graphUrl:
+                description: |-
+                  Upgrade graph the path is planned on. It must be the graph the nodes'
+                  k4all-upgrade reads. Empty means the k4all release graph on GitHub.
+                type: string
+              paused:
+                description: |-
+                  Paused stops the upgrade before the next node. A node already
+                  upgrading finishes its hop.
+                type: boolean
+              targetRelease:
+                description: |-
+                  Release to bring every node to, e.g. v2.7.0. Empty means no upgrade is
+                  requested. Lowering it, or emptying it, stops the upgrade after the
+                  node in progress.
+                pattern: ^(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?$
+                type: string
+            type: object
+          status:
+            description: ClusterUpgradeStatus is the observed state of the upgrade.
+            properties:
+              availableReleases:
+                description: |-
+                  Releases newer than currentRelease that targetRelease can name, oldest
+                  first. Blocked releases are left out.
+                items:
+                  description: ReleaseInfo describes a release of the upgrade graph.
+                  properties:
+                    crio:
+                      type: string
+                    fedora:
+                      format: int32
+                      type: integer
+                    kind:
+                      type: string
+                    kubernetes:
+                      type: string
+                    minFrom:
+                      type: string
+                    notes:
+                      type: string
+                    path:
+                      description: |-
+                        Hops from currentRelease to this release, as the operator would plan
+                        them; empty when the graph has no way there. Only in availableReleases.
+                      items:
+                        type: string
+                      type: array
+                    version:
+                      type: string
+                  required:
+                  - version
+                  type: object
+                type: array
+              conditions:
+                description: |-
+                  GraphAvailable (the graph was read; False with the error), and
+                  Progressing, Succeeded, Failed, True in the phase of the same name.
+                  Their reason is machine-readable: the phase, a NodeUpgradeReason, or
+                  for Failed without a node NoPath, Downgrade, NodeNotReported.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              currentHop:
+                description: Release of the hop in progress.
+                type: string
+              currentRelease:
+                description: 'The oldest release among the nodes: the one the whole
+                  cluster runs.'
+                type: string
+              currentReleaseInfo:
+                description: The graph's entry for currentRelease (Kubernetes, CRI-O,
+                  Fedora).
+                properties:
+                  crio:
+                    type: string
+                  fedora:
+                    format: int32
+                    type: integer
+                  kind:
+                    type: string
+                  kubernetes:
+                    type: string
+                  minFrom:
+                    type: string
+                  notes:
+                    type: string
+                  path:
+                    description: |-
+                      Hops from currentRelease to this release, as the operator would plan
+                      them; empty when the graph has no way there. Only in availableReleases.
+                    items:
+                      type: string
+                    type: array
+                  version:
+                    type: string
+                required:
+                - version
+                type: object
+              graphUrl:
+                description: Graph the path was planned on.
+                type: string
+              message:
+                description: What the upgrade waits for, or why it stopped.
+                type: string
+              nodes:
+                items:
+                  description: NodeUpgradeStatus is one node's part in the upgrade.
+                  properties:
+                    completedAt:
+                      description: When the node finished its latest hop.
+                      format: date-time
+                      type: string
+                    drainStartedAt:
+                      description: |-
+                        When the operator cordoned the node for the current hop. A retry
+                        starts it over.
+                      format: date-time
+                      type: string
+                    hostPhase:
+                      description: k4all-upgrade's phase of the hop (the upgrade-phase
+                        annotation).
+                      type: string
+                    message:
+                      type: string
+                    name:
+                      type: string
+                    phase:
+                      description: NodeUpgradePhase is where one node stands in the
+                        current hop.
+                      enum:
+                      - Pending
+                      - Draining
+                      - Upgrading
+                      - Done
+                      - Failed
+                      type: string
+                    reason:
+                      description: Why the node failed, or what the upgrade waits
+                        for on it.
+                      enum:
+                      - DrainTimeout
+                      - HostHold
+                      - Abandoned
+                      - TargetRejected
+                      - RollbackRebooted
+                      - NodeNotReady
+                      type: string
+                    release:
+                      description: Release the node runs (the release annotation).
+                      type: string
+                    role:
+                      description: |-
+                        bootstrap, control or worker (the node-type annotation). Nodes are
+                        upgraded in this order, one at a time.
+                      type: string
+                    startedAt:
+                      description: When the operator started the node's latest hop
+                        (its cordon).
+                      format: date-time
+                      type: string
+                  required:
+                  - name
+                  - phase
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                type: integer
+              path:
+                description: |-
+                  Hops from the release the upgrade started at to targetRelease, in
+                  order. All nodes finish a hop before any node starts the next.
+                items:
+                  description: Hop is one release of the path.
+                  properties:
+                    completedAt:
+                      description: When every node had run it.
+                      format: date-time
+                      type: string
+                    kind:
+                      type: string
+                    phase:
+                      description: HopPhase is where one hop of the path stands.
+                      enum:
+                      - Done
+                      - InProgress
+                      - Pending
+                      type: string
+                    release:
+                      type: string
+                    startedAt:
+                      description: When the hop became InProgress.
+                      format: date-time
+                      type: string
+                  required:
+                  - phase
+                  - release
+                  type: object
+                type: array
+              phase:
+                description: ClusterUpgradePhase is where the whole upgrade stands.
+                enum:
+                - Idle
+                - Paused
+                - Progressing
+                - Succeeded
+                - Failed
+                type: string
+            type: object
+        type: object
+        x-kubernetes-validations:
+        - message: there is one ClusterUpgrade, named k4all
+          rule: self.metadata.name == 'k4all'
+    served: true
+    storage: true
+    subresources:
+      status: {}
