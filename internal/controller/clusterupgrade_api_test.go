@@ -46,4 +46,7 @@ func TestClusterUpgrade_DrainTimeoutDefaults(t *testing.T) {
 	if got.Spec.Drain.TimeoutMinutes != 30 {
 		t.Errorf("spec.drain.timeoutMinutes = %d, want 30", got.Spec.Drain.TimeoutMinutes)
 	}
+	if got.Spec.Drain.SettleMinutes == nil || *got.Spec.Drain.SettleMinutes != 10 {
+		t.Errorf("spec.drain.settleMinutes = %v, want 10", got.Spec.Drain.SettleMinutes)
+	}
 }

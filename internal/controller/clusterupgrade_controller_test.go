@@ -10,9 +10,11 @@ import (
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/upgradegraph"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -244,6 +246,58 @@ func TestClusterUpgrade_DrainLeavesThePodsPutBackOnTheNode(t *testing.T) {
 	}
 	if msg := cu.Status.Nodes[0].Message; !strings.Contains(msg, "default/app-back") {
 		t.Errorf("cu-cp message = %q, want app-back named", msg)
+	}
+}
+
+// The drain names the PodDisruptionBudget that refuses an eviction.
+func TestClusterUpgrade_DrainNamesThePDBThatRefuses(t *testing.T) {
+	b := newUpgradeTestbed(t,
+		upgradeNode("cu-cp", "bootstrap", "v2.5.0"),
+		upgradeNode("cu-w", "worker", "v2.5.0"))
+	b.reconcile()
+	app := b.pod("app")
+	app.Labels = map[string]string{"app": "pdb-guarded"}
+	if err := b.c.Update(context.Background(), app); err != nil {
+		t.Fatal(err)
+	}
+	// The eviction API ignores budgets for Pending pods: make it Running.
+	app.Status = corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+	}}
+	if err := b.c.Status().Update(context.Background(), app); err != nil {
+		t.Fatal(err)
+	}
+	minAvailable := intstr.FromInt32(1)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "app-pdb"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &minAvailable,
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "pdb-guarded"}},
+		},
+	}
+	if err := b.c.Create(context.Background(), pdb); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.c.Delete(context.Background(), pdb) })
+	// What the disruption controller, absent from envtest, would report.
+	pdb.Status = policyv1.PodDisruptionBudgetStatus{
+		ObservedGeneration: pdb.Generation, DisruptionsAllowed: 0, CurrentHealthy: 0, DesiredHealthy: 1, ExpectedPods: 1,
+	}
+	if err := b.c.Status().Update(context.Background(), pdb); err != nil {
+		t.Fatal(err)
+	}
+	b.targetNextRelease()
+	b.reconcile() // cordon
+
+	cu := b.reconcile()
+	if b.evicted(app) {
+		t.Fatalf("app was evicted despite its PodDisruptionBudget")
+	}
+	if msg := cu.Status.Nodes[0].Message; !strings.Contains(msg, "PDB default/app-pdb") {
+		t.Errorf("cu-cp message = %q, want the PodDisruptionBudget named", msg)
+	}
+	if !strings.Contains(cu.Status.Message, "PDB default/app-pdb") {
+		t.Errorf("message = %q, want the PodDisruptionBudget named", cu.Status.Message)
 	}
 }
 

@@ -303,6 +303,62 @@ func TestDecide_GoesOnWithTheNextNodeOfTheHop(t *testing.T) {
 }
 
 // Every node finishes a hop before any node starts the next one.
+// settled is the cluster after cp-0 finished the first hop finishedAgo,
+// with cp-1 next.
+func settled(t *testing.T, finishedAgo time.Duration, pdbs ...PDB) Input {
+	nodes := threeNodes("v2.5.0")
+	nodes[2].Annotations[k4allv1alpha1.NodeReleaseAnnotation] = firstHop
+	completed := metav1.NewTime(now.Add(-finishedAgo))
+	return Input{
+		Spec:  target("v2.7.0"),
+		Nodes: nodes,
+		Previous: k4allv1alpha1.ClusterUpgradeStatus{Nodes: []k4allv1alpha1.NodeUpgradeStatus{
+			{Name: "cp-0", Phase: k4allv1alpha1.NodeUpgradeDone, CompletedAt: &completed},
+		}},
+		UnhealthyPDBs: pdbs,
+		Graph:         graph(t),
+		Now:           now,
+	}
+}
+
+var calicoAPIServer = PDB{Namespace: "calico-system", Name: "calico-apiserver", Healthy: 1, Desired: 2}
+
+// After a node's hop its pods come back elsewhere; until every
+// PodDisruptionBudget has its healthy pods again, the next drain would be
+// refused (calico-apiserver, topolvm-controller on VMs 954-956).
+func TestDecide_WaitsForThePDBsBeforeTheNextNode(t *testing.T) {
+	t.Run("waits", func(t *testing.T) {
+		status, actions := Decide(settled(t, time.Minute, calicoAPIServer))
+		expectActions(t, actions)
+		expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing,
+			"v2.6.0: waiting for PDB calico-system/calico-apiserver: 1/2 healthy")
+	})
+
+	t.Run("goes on after settleMinutes", func(t *testing.T) {
+		_, actions := Decide(settled(t, 11*time.Minute, calicoAPIServer))
+		expectActions(t, actions, Action{Kind: Cordon, Node: "cp-1"})
+	})
+
+	t.Run("settleMinutes 0 does not wait", func(t *testing.T) {
+		in := settled(t, time.Minute, calicoAPIServer)
+		zero := int32(0)
+		in.Spec.Drain.SettleMinutes = &zero
+		_, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Cordon, Node: "cp-1"})
+	})
+
+	t.Run("healthy PDBs", func(t *testing.T) {
+		_, actions := Decide(settled(t, time.Minute))
+		expectActions(t, actions, Action{Kind: Cordon, Node: "cp-1"})
+	})
+
+	t.Run("not before the first node", func(t *testing.T) {
+		_, actions := Decide(Input{Spec: target("v2.7.0"), Nodes: threeNodes("v2.5.0"),
+			UnhealthyPDBs: []PDB{calicoAPIServer}, Graph: graph(t), Now: now})
+		expectActions(t, actions, Action{Kind: Cordon, Node: "cp-0"})
+	})
+}
+
 func TestDecide_StartsTheNextHopFromTheBootstrapNode(t *testing.T) {
 	status, actions := Decide(Input{
 		Spec:  k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: "v2.7.0"},

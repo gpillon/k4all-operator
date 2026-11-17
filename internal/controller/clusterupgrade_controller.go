@@ -19,7 +19,11 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,6 +71,7 @@ type ClusterUpgradeReconciler struct {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 
 // Reconcile moves the ClusterUpgrade one step on.
 func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -120,10 +125,24 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
+	pdbs, err := r.unhealthyPDBs(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	in.UnhealthyPDBs = pdbs
+
 	status, actions := clusterupgrade.Decide(in)
 	// Actions first: the status must never claim a step the Nodes do not show.
 	for _, a := range actions {
 		log.Info("cluster upgrade step", "action", a.Kind, "node", a.Node, "release", a.Release)
+		if a.Kind == clusterupgrade.Evict {
+			refused, err := r.evict(ctx, a.Pods)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("%s %s: %w", a.Kind, a.Node, err)
+			}
+			clusterupgrade.NoteRefusedEvictions(&status, a.Node, refused)
+			continue
+		}
 		if err := r.run(ctx, a); err != nil {
 			return ctrl.Result{}, fmt.Errorf("%s %s: %w", a.Kind, a.Node, err)
 		}
@@ -230,7 +249,8 @@ func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Act
 			"spec": map[string]interface{}{"unschedulable": true},
 		})
 	case clusterupgrade.Evict:
-		return r.evict(ctx, a.Pods)
+		_, err := r.evict(ctx, a.Pods)
+		return err
 	case clusterupgrade.Uncordon:
 		// From here a cordon on the node is the admin's: Finish leaves it.
 		return r.patchNode(ctx, a.Node, map[string]interface{}{
@@ -275,10 +295,11 @@ func (r *ClusterUpgradeReconciler) patchNode(ctx context.Context, name string, p
 }
 
 // evict asks the API server to evict the pods Decide chose (namespace/name).
-// A PodDisruptionBudget refusing it (429) is retried at the next reconcile,
-// until the drain timeout.
-func (r *ClusterUpgradeReconciler) evict(ctx context.Context, pods []string) error {
+// It returns why evictions were refused: a PodDisruptionBudget refusing one
+// (429) is retried at the next reconcile, until the drain timeout.
+func (r *ClusterUpgradeReconciler) evict(ctx context.Context, pods []string) ([]string, error) {
 	log := logf.FromContext(ctx)
+	var refused []string
 	for _, key := range pods {
 		namespace, name, _ := strings.Cut(key, "/")
 		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
@@ -287,12 +308,55 @@ func (r *ClusterUpgradeReconciler) evict(ctx context.Context, pods []string) err
 		switch {
 		case err == nil, apierrors.IsNotFound(err):
 		case apierrors.IsTooManyRequests(err):
-			log.Info("eviction refused for now", "pod", key, "reason", err.Error())
+			why := refusal(namespace, err)
+			log.Info("eviction refused for now", "pod", key, "reason", why)
+			if !slices.Contains(refused, why) {
+				refused = append(refused, why)
+			}
 		default:
-			return fmt.Errorf("evict %s: %w", key, err)
+			return refused, fmt.Errorf("evict %s: %w", key, err)
 		}
 	}
-	return nil
+	return refused, nil
+}
+
+// disruptionBudgetCause is how the eviction API names the budget it applies,
+// e.g. "The disruption budget calico-apiserver needs 1 healthy pods and has 0 currently".
+var disruptionBudgetCause = regexp.MustCompile(`^The disruption budget (\S+) (.+)$`)
+
+// refusal says why an eviction in namespace was refused, naming the
+// PodDisruptionBudget when the API server does.
+func refusal(namespace string, err error) string {
+	var status apierrors.APIStatus
+	if errors.As(err, &status) && status.Status().Details != nil {
+		for _, c := range status.Status().Details.Causes {
+			if m := disruptionBudgetCause.FindStringSubmatch(c.Message); m != nil {
+				return fmt.Sprintf("PDB %s/%s %s", namespace, m[1], m[2])
+			}
+		}
+	}
+	return err.Error()
+}
+
+// unhealthyPDBs lists, sorted, the PodDisruptionBudgets with fewer healthy
+// pods than they want, among the ones the disruption controller has seen.
+func (r *ClusterUpgradeReconciler) unhealthyPDBs(ctx context.Context) ([]clusterupgrade.PDB, error) {
+	list := &policyv1.PodDisruptionBudgetList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil, fmt.Errorf("list PodDisruptionBudgets: %w", err)
+	}
+	out := make([]clusterupgrade.PDB, 0, len(list.Items))
+	for _, p := range list.Items {
+		if p.Status.ObservedGeneration < p.Generation || p.Status.CurrentHealthy >= p.Status.DesiredHealthy {
+			continue
+		}
+		out = append(out, clusterupgrade.PDB{Namespace: p.Namespace, Name: p.Name,
+			Healthy: p.Status.CurrentHealthy, Desired: p.Status.DesiredHealthy})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Namespace+"/"+out[i].Name < out[j].Namespace+"/"+out[j].Name
+	})
+	return out, nil
 }
 
 // SetupWithManager sets up the controller with the Manager. Every Node
