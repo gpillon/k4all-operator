@@ -148,9 +148,11 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	markUnmanagedComponents(rm)
+	// Removals first: a replacement can then take over what the removed
+	// component held (traefik: the node's ports and the "nginx" IngressClass).
+	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	inactiveOK := r.reconcileInactiveComponents(ctx, log, rm, active, config.Spec)
 	activeOK, stepsLeft := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
-	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
 
 	if err := r.patchStatus(ctx, rm); err != nil {
