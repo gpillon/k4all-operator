@@ -2,8 +2,6 @@ package controller
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -13,7 +11,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/yaml"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/migrations"
@@ -116,14 +113,15 @@ func TestMigrations_RemoveTheNginxKey(t *testing.T) {
 	}
 }
 
-// Operator v0.5.0 runs from the k4all v2.4.0 sync: on the v2.4.0 and v2.5.0
-// ReleaseManifests (ingress-nginx, no traefik) the nginx-to-traefik
-// migration must neither convert nor count itself; on v2.6.0 it does both.
-func TestMigrations_WaitForTheV26ReleaseManifest(t *testing.T) {
+// At step 1/2 of the k4all v2.4.0 sync, operator v0.5.0 starts with the
+// cluster's v2.2.x ReleaseManifest (ingress-nginx, no traefik): until step
+// 2/2 brings Traefik, the nginx-to-traefik migration must neither convert
+// nor count itself. With Traefik in and ingress-nginx Removed, it does both.
+func TestMigrations_WaitForTraefikInTheReleaseManifest(t *testing.T) {
 	c := envtestClient(t)
 	ctx := context.Background()
 	cc := &k4allv1alpha1.ClusterConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: "migrate-from-v24"},
+		ObjectMeta: metav1.ObjectMeta{Name: "migrate-at-v24-sync"},
 		Spec: k4allv1alpha1.ClusterConfigSpec{
 			Networking: k4allv1alpha1.NetworkingConfig{CNI: k4allv1alpha1.CNIConfig{Type: "calico"}},
 			Ingress: k4allv1alpha1.IngressConfig{
@@ -143,45 +141,46 @@ func TestMigrations_WaitForTheV26ReleaseManifest(t *testing.T) {
 		}
 		return got
 	}
+	manifest := func(components map[string]k4allv1alpha1.ComponentManagement) *k4allv1alpha1.ReleaseManifest {
+		rm := &k4allv1alpha1.ReleaseManifest{Spec: k4allv1alpha1.ReleaseManifestSpec{
+			Components: map[string]k4allv1alpha1.ComponentSpec{},
+		}}
+		for name, m := range components {
+			rm.Spec.Components[name] = k4allv1alpha1.ComponentSpec{Type: "helm", Version: "1", Management: m}
+		}
+		return rm
+	}
 
-	v24 := releaseManifestFile(t, "releasemanifest-v2.4.yaml")
-	if changed, err := migrations.Run(ctx, c, v24, stored()); err != nil || changed {
-		t.Fatalf("v2.4.0: changed %t, err %v; want no change", changed, err)
+	v22 := manifest(map[string]k4allv1alpha1.ComponentManagement{
+		"ingress-nginx": k4allv1alpha1.ComponentManagementManaged,
+		"headlamp":      k4allv1alpha1.ComponentManagementManaged,
+	})
+	if changed, err := migrations.Run(ctx, c, v22, stored()); err != nil || changed {
+		t.Fatalf("v2.2.x manifest: changed %t, err %v; want no change", changed, err)
 	}
 	got := stored()
 	if got.Spec.Ingress.Nginx == nil || got.Spec.Ingress.Traefik != nil {
-		t.Errorf("v2.4.0: ingress = nginx %+v, traefik %+v; want it untouched", got.Spec.Ingress.Nginx, got.Spec.Ingress.Traefik)
+		t.Errorf("v2.2.x manifest: ingress = nginx %+v, traefik %+v; want it untouched", got.Spec.Ingress.Nginx, got.Spec.Ingress.Traefik)
 	}
 	if v, ok := got.Annotations[migrations.AppliedAnnotation]; ok {
-		t.Errorf("v2.4.0: %s = %q, want none", migrations.AppliedAnnotation, v)
+		t.Errorf("v2.2.x manifest: %s = %q, want none", migrations.AppliedAnnotation, v)
 	}
 
-	v26 := releaseManifestFile(t, "releasemanifest-v2.6.yaml")
-	if changed, err := migrations.Run(ctx, c, v26, stored()); err != nil || !changed {
-		t.Fatalf("v2.6.0: changed %t, err %v; want a change", changed, err)
+	v24 := manifest(map[string]k4allv1alpha1.ComponentManagement{
+		"ingress-nginx": k4allv1alpha1.ComponentManagementRemoved,
+		"traefik":       k4allv1alpha1.ComponentManagementManaged,
+		"headlamp":      k4allv1alpha1.ComponentManagementManaged,
+	})
+	if changed, err := migrations.Run(ctx, c, v24, stored()); err != nil || !changed {
+		t.Fatalf("v2.4.0 manifest: changed %t, err %v; want a change", changed, err)
 	}
 	got = stored()
 	want := k4allv1alpha1.TraefikIngressConfig{DedicatedIP: "192.168.6.193", IsDefault: false}
 	if got.Spec.Ingress.Nginx != nil || got.Spec.Ingress.Traefik == nil || *got.Spec.Ingress.Traefik != want {
-		t.Errorf("v2.6.0: ingress = nginx %+v, traefik %+v; want only traefik %+v",
+		t.Errorf("v2.4.0 manifest: ingress = nginx %+v, traefik %+v; want only traefik %+v",
 			got.Spec.Ingress.Nginx, got.Spec.Ingress.Traefik, want)
 	}
 	if v := got.Annotations[migrations.AppliedAnnotation]; v != "1" {
-		t.Errorf("v2.6.0: %s = %q, want \"1\"", migrations.AppliedAnnotation, v)
+		t.Errorf("v2.4.0 manifest: %s = %q, want \"1\"", migrations.AppliedAnnotation, v)
 	}
-}
-
-// releaseManifestFile reads a ReleaseManifest of the e2e suite, the shapes of
-// the real k4all releases.
-func releaseManifestFile(t *testing.T, name string) *k4allv1alpha1.ReleaseManifest {
-	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "test", "e2e", "testdata", name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rm := &k4allv1alpha1.ReleaseManifest{}
-	if err := yaml.Unmarshal(raw, rm); err != nil {
-		t.Fatalf("%s: %v", name, err)
-	}
-	return rm
 }
