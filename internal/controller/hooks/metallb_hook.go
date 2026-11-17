@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,10 +32,10 @@ func NewMetalLBHook(c client.Client, log logr.Logger) *MetalLBHook {
 }
 
 func (h *MetalLBHook) PostInstall(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error {
-	dedicatedIPs := config.Ingress.DedicatedIPs()
+	dedicatedIPs := metalLBAddresses(config)
 	if len(dedicatedIPs) == 0 {
-		h.log.Info("no dedicated IPs configured, skipping MetalLB pool creation")
-		return nil
+		h.log.Info("no dedicated IPs for MetalLB, no k4all-ingress-pool")
+		return h.deletePool(ctx)
 	}
 
 	if err := h.patchKubeProxyStrictARP(ctx); err != nil {
@@ -50,6 +51,38 @@ func (h *MetalLBHook) PostInstall(ctx context.Context, spec k4allv1alpha1.Compon
 	}
 
 	h.log.Info("MetalLB post-install complete", "ips", dedicatedIPs)
+	return nil
+}
+
+// metalLBAddresses are the dedicated ingress IPs MetalLB announces: all but
+// the one the host's kube-vip announces (HA kube-vip).
+func metalLBAddresses(config k4allv1alpha1.ClusterConfigSpec) []string {
+	kubeVIP := kubeVIPIngressIP(config)
+	var ips []string
+	for _, ip := range config.Ingress.DedicatedIPs() {
+		if ip != kubeVIP {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}
+
+// deletePool removes k4all-ingress-pool and its L2Advertisement, left from
+// when MetalLB had addresses to announce.
+func (h *MetalLBHook) deletePool(ctx context.Context) error {
+	for _, kind := range []string{"L2Advertisement", "IPAddressPool"} {
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion("metallb.io/v1beta1")
+		obj.SetKind(kind)
+		obj.SetNamespace("metallb-system")
+		obj.SetName("k4all-ingress-pool")
+		if kind == "L2Advertisement" {
+			obj.SetName("k4all-l2adv")
+		}
+		if err := h.client.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) && !meta.IsNoMatchError(err) {
+			return fmt.Errorf("delete %s: %w", kind, err)
+		}
+	}
 	return nil
 }
 
