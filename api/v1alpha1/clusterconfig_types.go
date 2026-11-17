@@ -60,9 +60,10 @@ type NginxIngressConfig struct {
 	// Dedicated LoadBalancer IP; leave empty to use the node IP directly
 	// +optional
 	DedicatedIP string `json:"dedicatedIP,omitempty"`
-	// Whether NGINX should be the default IngressClass
+	// Whether NGINX should be the default IngressClass. Left out, it is.
 	// +optional
-	IsDefault bool `json:"isDefault,omitempty"`
+	// +kubebuilder:default=true
+	IsDefault bool `json:"isDefault"` // no omitempty: a Go client must send false, or the default turns it true
 }
 
 // TraefikIngressConfig configures the Traefik ingress controller.
@@ -70,9 +71,10 @@ type TraefikIngressConfig struct {
 	// Dedicated LoadBalancer IP; leave empty to use the node IP directly
 	// +optional
 	DedicatedIP string `json:"dedicatedIP,omitempty"`
-	// Whether Traefik should be the default IngressClass
+	// Whether Traefik should be the default IngressClass. Left out, it is.
 	// +optional
-	IsDefault bool `json:"isDefault,omitempty"`
+	// +kubebuilder:default=true
+	IsDefault bool `json:"isDefault"` // no omitempty: a Go client must send false, or the default turns it true
 }
 
 // CiliumIngressConfig configures the Cilium ingress.

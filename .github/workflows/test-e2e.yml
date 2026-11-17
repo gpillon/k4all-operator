@@ -27,7 +27,8 @@ jobs:
     # the ones published with KIND_VERSION. On 1.35 the suite walks the
     # component sets an existing cluster goes through (v2.2.x, v2.4.0, then
     # v2.6.0 with Traefik replacing ingress-nginx); a cluster reaches 1.36 only
-    # from v2.6.0, so 1.36 and 1.37 install that set, with its default config.
+    # from v2.6.0, so 1.36 and 1.37 install that set: 1.36 with its default
+    # config, 1.37 with a dedicated ingress IP that MetalLB announces.
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +51,7 @@ jobs:
             release-manifest: test/e2e/testdata/releasemanifest-v2.6.yaml
           - kubernetes: "1.37"
             node-image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
-            cluster-config: test/e2e/testdata/clusterconfig-v2.6.yaml
+            cluster-config: test/e2e/testdata/clusterconfig-v2.6-dedicated-ip.yaml
             release-manifest: test/e2e/testdata/releasemanifest-v2.6.yaml
     env:
       KIND_NODE_IMAGE: ${{ matrix.node-image }}

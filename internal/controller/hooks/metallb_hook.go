@@ -31,7 +31,7 @@ func NewMetalLBHook(c client.Client, log logr.Logger) *MetalLBHook {
 }
 
 func (h *MetalLBHook) PostInstall(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error {
-	dedicatedIPs := h.collectDedicatedIPs(config)
+	dedicatedIPs := config.Ingress.DedicatedIPs()
 	if len(dedicatedIPs) == 0 {
 		h.log.Info("no dedicated IPs configured, skipping MetalLB pool creation")
 		return nil
@@ -51,17 +51,6 @@ func (h *MetalLBHook) PostInstall(ctx context.Context, spec k4allv1alpha1.Compon
 
 	h.log.Info("MetalLB post-install complete", "ips", dedicatedIPs)
 	return nil
-}
-
-func (h *MetalLBHook) collectDedicatedIPs(config k4allv1alpha1.ClusterConfigSpec) []string {
-	var ips []string
-	if ip := config.Ingress.Nginx.DedicatedIP; ip != "" {
-		ips = append(ips, ip)
-	}
-	if ip := config.Ingress.Cilium.DedicatedIP; ip != "" {
-		ips = append(ips, ip)
-	}
-	return ips
 }
 
 func (h *MetalLBHook) patchKubeProxyStrictARP(ctx context.Context) error {
