@@ -192,6 +192,35 @@ func TestDecide_ReportsTheHostPhaseOfTheHop(t *testing.T) {
 	}
 }
 
+// Past the reboot the node is Ready on the new release, and the SYNC of
+// k4all-upgrade may start pods that only fit on it (a single node, or a pod
+// bound to the bootstrap node): the cordon ends there, not at upgrade-done.
+func TestDecide_UncordonsTheNodeOnceTheHostIsPastTheReboot(t *testing.T) {
+	for _, hostPhase := range []string{"SYNC", "COMMIT"} {
+		t.Run(hostPhase, func(t *testing.T) {
+			status, actions := Decide(upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, hostPhase))
+
+			expectActions(t, actions, Action{Kind: Uncordon, Node: "cp-0"})
+			if got := nodePhases(status)["cp-0"]; got != k4allv1alpha1.NodeUpgradeUpgrading {
+				t.Errorf("cp-0 phase = %s, want Upgrading", got)
+			}
+		})
+	}
+	for _, hostPhase := range []string{"STAGE", "REBOOT"} {
+		t.Run("not on "+hostPhase, func(t *testing.T) {
+			_, actions := Decide(upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, hostPhase))
+			expectActions(t, actions)
+		})
+	}
+	for _, mark := range []string{k4allv1alpha1.NodeCordonReleased, k4allv1alpha1.NodeCordonedAlready} {
+		t.Run("not when upgrade-cordoned is "+mark, func(t *testing.T) {
+			_, actions := Decide(upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "SYNC",
+				k4allv1alpha1.NodeUpgradeCordonedAnnotation, mark))
+			expectActions(t, actions)
+		})
+	}
+}
+
 func TestDecide_FinishesTheNodeWhenTheHostIsDone(t *testing.T) {
 	status, actions := Decide(upgrading(t, "v2.6.0", k4allv1alpha1.NodeUpgradeDoneAnnotation, "v2.6.0"))
 

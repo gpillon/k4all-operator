@@ -84,13 +84,14 @@ func (b *upgradeTestbed) reconcile() k4allv1alpha1.ClusterUpgrade {
 	return cu
 }
 
-func (b *upgradeTestbed) setTarget(release string) {
+// targetNextRelease sets spec.targetRelease to nextRelease.
+func (b *upgradeTestbed) targetNextRelease() {
 	b.t.Helper()
 	cu := &k4allv1alpha1.ClusterUpgrade{}
 	if err := b.c.Get(context.Background(), types.NamespacedName{Name: k4allv1alpha1.ClusterUpgradeName}, cu); err != nil {
 		b.t.Fatal(err)
 	}
-	cu.Spec.TargetRelease = release
+	cu.Spec.TargetRelease = nextRelease
 	if err := b.c.Update(context.Background(), cu); err != nil {
 		b.t.Fatal(err)
 	}
@@ -177,7 +178,7 @@ func TestClusterUpgrade_DrainsTheNodeThenAsksForTheHop(t *testing.T) {
 	app := b.pod("app", "cu-cp")
 	ds := b.pod("ds", "cu-cp", metav1.OwnerReference{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "ds", UID: "ds-uid"})
 	self := b.pod("k4all-operator", "cu-cp")
-	b.setTarget(nextRelease)
+	b.targetNextRelease()
 
 	b.reconcile()
 	if n := b.node("cu-cp"); !n.Spec.Unschedulable || n.Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation] != "true" {
@@ -217,7 +218,7 @@ func TestClusterUpgrade_FinishesTheNodeWhenTheHostIsDone(t *testing.T) {
 	n.Spec.Unschedulable = true
 	b := newUpgradeTestbed(t, n)
 	b.reconcile()
-	b.setTarget(nextRelease)
+	b.targetNextRelease()
 
 	cu := b.reconcile()
 
@@ -236,12 +237,54 @@ func TestClusterUpgrade_FinishesTheNodeWhenTheHostIsDone(t *testing.T) {
 }
 
 // A node the admin had cordoned stays cordoned after its hop.
+func TestClusterUpgrade_UncordonsTheNodeAfterItsReboot(t *testing.T) {
+	n := upgradeNode("cu-sync", "bootstrap", "v2.5.0",
+		k4allv1alpha1.NodeUpgradeCordonedAnnotation, "true",
+		k4allv1alpha1.NodeUpgradeTargetAnnotation, nextRelease,
+		k4allv1alpha1.NodeUpgradePhaseAnnotation, "SYNC")
+	n.Spec.Unschedulable = true
+	b := newUpgradeTestbed(t, n)
+	b.reconcile()
+	b.targetNextRelease()
+
+	b.reconcile()
+
+	got := b.node("cu-sync")
+	if got.Spec.Unschedulable {
+		t.Fatalf("cu-sync is still cordoned during the SYNC")
+	}
+	if v := got.Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation]; v != k4allv1alpha1.NodeCordonReleased {
+		t.Errorf("upgrade-cordoned = %q, want %q", v, k4allv1alpha1.NodeCordonReleased)
+	}
+	if v := got.Annotations[k4allv1alpha1.NodeUpgradeTargetAnnotation]; v != nextRelease {
+		t.Errorf("upgrade-target = %q, want %q until upgrade-done", v, nextRelease)
+	}
+
+	// A cordon set after the release is the admin's: the end of the hop keeps it.
+	got.Spec.Unschedulable = true
+	delete(got.Annotations, k4allv1alpha1.NodeUpgradePhaseAnnotation)
+	got.Annotations[k4allv1alpha1.NodeReleaseAnnotation] = nextRelease
+	got.Annotations[k4allv1alpha1.NodeUpgradeDoneAnnotation] = nextRelease
+	if err := b.c.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	b.reconcile()
+
+	got = b.node("cu-sync")
+	if !got.Spec.Unschedulable {
+		t.Errorf("the operator undid a cordon set after it released cu-sync")
+	}
+	if v, ok := got.Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation]; ok {
+		t.Errorf("upgrade-cordoned = %q left on the node", v)
+	}
+}
+
 func TestClusterUpgrade_LeavesAnAdminCordonInPlace(t *testing.T) {
 	n := upgradeNode("cu-admin", "bootstrap", "v2.5.0")
 	n.Spec.Unschedulable = true
 	b := newUpgradeTestbed(t, n)
 	b.reconcile()
-	b.setTarget(nextRelease)
+	b.targetNextRelease()
 	b.reconcile() // cordon (already) + target: a single node is not drained
 
 	got := b.node("cu-admin")

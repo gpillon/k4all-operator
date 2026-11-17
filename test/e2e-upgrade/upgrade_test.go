@@ -20,6 +20,7 @@ limitations under the License.
 package e2eupgrade
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -104,12 +105,15 @@ type hopRecord struct {
 	cordoned      bool
 	podsLeft      []string // pods the drain should have moved
 	otherTargets  []string // other nodes asked for a hop at the same time
+	syncPod       string   // bootstrap only: how the SYNC pod ended, Ready or Pending
 }
 
 // fakeAgent answers upgrade-target like k4all-upgrade (contract §5.4): it
 // writes release and node-type, runs a hop in a few seconds through the
-// phases STAGE and REBOOT under upgrade-in-progress, then commits the release
-// and writes upgrade-done.
+// phases STAGE and REBOOT under upgrade-in-progress, then SYNC, then commits
+// the release and writes upgrade-done. In the SYNC the bootstrap node waits
+// for a pod that can only run on it, as the real one waits for the
+// components of the release; past syncTimeout it goes to HOLD.
 type fakeAgent struct {
 	roles map[string]string // node -> node-type it reports
 	stop  chan struct{}
@@ -117,9 +121,22 @@ type fakeAgent struct {
 
 	mu      sync.Mutex
 	hops    []hopRecord
-	started map[string]time.Time // node -> start of its running hop
+	running map[string]*hopRun // node -> its running hop
 	errs    []string
 }
+
+// hopRun is a hop the fake agent is running on a node.
+type hopRun struct {
+	started, syncStarted time.Time
+	record               int // index in fakeAgent.hops
+}
+
+const (
+	rebootFor   = 4 * time.Second // the fake hop is in REBOOT until then
+	syncTimeout = 2 * time.Minute
+	hostSync    = "SYNC"
+	hostHold    = "HOLD"
+)
 
 func (a *fakeAgent) run() {
 	defer close(a.done)
@@ -151,52 +168,136 @@ func (a *fakeAgent) pass() error {
 		return err
 	}
 	for _, n := range nodes.Items {
-		ann := n.Annotations
-		if ann[k4allv1alpha1.NodeReleaseAnnotation] == "" {
-			if err := annotate(n.Name, k4allv1alpha1.NodeReleaseAnnotation+"="+startRelease,
-				k4allv1alpha1.NodeTypeAnnotation+"="+a.roles[n.Name]); err != nil {
-				return err
-			}
-			continue
-		}
-		target, release := ann[k4allv1alpha1.NodeUpgradeTargetAnnotation], ann[k4allv1alpha1.NodeReleaseAnnotation]
-		a.mu.Lock()
-		started, running := a.started[n.Name]
-		a.mu.Unlock()
-		switch {
-		case target == "" || ann[k4allv1alpha1.NodeUpgradeDoneAnnotation] == target:
-		case target == release && !running:
-			if err := annotate(n.Name, k4allv1alpha1.NodeUpgradeDoneAnnotation+"="+target); err != nil {
-				return err
-			}
-		case !running:
-			a.record(n, target, nodes)
-			if err := annotate(n.Name, "k4all.magesgate.com/upgrade-in-progress="+release+"->"+target,
-				k4allv1alpha1.NodeUpgradePhaseAnnotation+"=STAGE"); err != nil {
-				return err
-			}
-		case time.Since(started) < 4*time.Second:
-			if err := annotate(n.Name, k4allv1alpha1.NodeUpgradePhaseAnnotation+"=REBOOT"); err != nil {
-				return err
-			}
-		default: // COMMIT
-			if err := annotate(n.Name, k4allv1alpha1.NodeReleaseAnnotation+"="+target,
-				"k4all.magesgate.com/upgrade-in-progress-", k4allv1alpha1.NodeUpgradePhaseAnnotation+"-"); err != nil {
-				return err
-			}
-			if err := annotate(n.Name, k4allv1alpha1.NodeUpgradeDoneAnnotation+"="+target); err != nil {
-				return err
-			}
-			a.mu.Lock()
-			delete(a.started, n.Name)
-			a.mu.Unlock()
+		if err := a.step(n, nodes); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// record notes the state of the cluster as node n starts its hop to target.
-func (a *fakeAgent) record(n corev1.Node, target string, nodes *corev1.NodeList) {
+// step moves the hop of node n on by at most one phase.
+func (a *fakeAgent) step(n corev1.Node, nodes *corev1.NodeList) error {
+	ann := n.Annotations
+	if ann[k4allv1alpha1.NodeReleaseAnnotation] == "" {
+		return annotate(n.Name, k4allv1alpha1.NodeReleaseAnnotation+"="+startRelease,
+			k4allv1alpha1.NodeTypeAnnotation+"="+a.roles[n.Name])
+	}
+	target, release := ann[k4allv1alpha1.NodeUpgradeTargetAnnotation], ann[k4allv1alpha1.NodeReleaseAnnotation]
+	a.mu.Lock()
+	hop, running := a.running[n.Name]
+	a.mu.Unlock()
+	switch {
+	case target == "" || ann[k4allv1alpha1.NodeUpgradeDoneAnnotation] == target:
+		return nil
+	case target == release && !running:
+		return annotate(n.Name, k4allv1alpha1.NodeUpgradeDoneAnnotation+"="+target)
+	case !running:
+		a.start(n, target, nodes)
+		return annotate(n.Name, "k4all.magesgate.com/upgrade-in-progress="+release+"->"+target,
+			k4allv1alpha1.NodeUpgradePhaseAnnotation+"=STAGE")
+	case ann[k4allv1alpha1.NodeUpgradePhaseAnnotation] == hostHold:
+		return nil // stays there until the test ends
+	case time.Since(hop.started) < rebootFor:
+		return annotate(n.Name, k4allv1alpha1.NodeUpgradePhaseAnnotation+"=REBOOT")
+	case ann[k4allv1alpha1.NodeUpgradePhaseAnnotation] != hostSync:
+		// Rebooted healthy on target.
+		if a.roles[n.Name] == roleBootstrap {
+			if err := createSyncPod(n.Name, target); err != nil {
+				return err
+			}
+		}
+		hop.syncStarted = time.Now() // hopRun is the agent goroutine's alone
+		return annotate(n.Name, k4allv1alpha1.NodeUpgradePhaseAnnotation+"="+hostSync)
+	}
+	if a.roles[n.Name] == roleBootstrap {
+		ready, err := syncPodReady(target)
+		if err != nil {
+			return err
+		}
+		if !ready && time.Since(hop.syncStarted) < syncTimeout {
+			return nil
+		}
+		a.mu.Lock()
+		a.hops[hop.record].syncPod = map[bool]string{true: "Ready", false: "Pending"}[ready]
+		a.mu.Unlock()
+		if !ready {
+			return annotate(n.Name, k4allv1alpha1.NodeUpgradePhaseAnnotation+"="+hostHold,
+				k4allv1alpha1.NodeUpgradeMessageAnnotation+"=SYNC: pod "+syncPodName(target)+
+					" still Pending after "+syncTimeout.String())
+		}
+		if out, err := kubectl("delete", "pod", "-n", testNamespace, syncPodName(target), "--wait"); err != nil {
+			return fmt.Errorf("delete the SYNC pod: %s", out)
+		}
+	}
+	return a.commit(n.Name, target)
+}
+
+// commit ends the hop: release first, then upgrade-done.
+func (a *fakeAgent) commit(node, target string) error {
+	if err := annotate(node, k4allv1alpha1.NodeReleaseAnnotation+"="+target,
+		"k4all.magesgate.com/upgrade-in-progress-", k4allv1alpha1.NodeUpgradePhaseAnnotation+"-"); err != nil {
+		return err
+	}
+	if err := annotate(node, k4allv1alpha1.NodeUpgradeDoneAnnotation+"="+target); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	delete(a.running, node)
+	a.mu.Unlock()
+	return nil
+}
+
+func syncPodName(release string) string {
+	return "sync-" + strings.NewReplacer(".", "-").Replace(release)
+}
+
+// createSyncPod starts a pod bound to node through the scheduler, like a Job
+// of a release component pinned to the bootstrap node: no toleration for
+// node.kubernetes.io/unschedulable, so it runs only once the node is
+// uncordoned.
+func createSyncPod(node, release string) error {
+	pod := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata":   map[string]interface{}{"name": syncPodName(release), "namespace": testNamespace},
+		"spec": map[string]interface{}{
+			"nodeSelector": map[string]string{corev1.LabelHostname: node},
+			"tolerations": []map[string]string{
+				{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists"},
+			},
+			"terminationGracePeriodSeconds": 1,
+			"containers": []map[string]interface{}{{
+				"name": "sleep", "image": "busybox:1.37", "command": []string{"sleep", "infinity"},
+			}},
+		},
+	}
+	data, err := json.Marshal(pod)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Dir, cmd.Stdin = root, bytes.NewReader(data)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("create the SYNC pod: %s", out)
+	}
+	return nil
+}
+
+func syncPodReady(release string) (bool, error) {
+	pod := &corev1.Pod{}
+	if err := getJSON(pod, "get", "pod", "-n", testNamespace, syncPodName(release)); err != nil {
+		return false, err
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue, nil
+		}
+	}
+	return false, nil
+}
+
+// start notes the state of the cluster as node n starts its hop to target.
+func (a *fakeAgent) start(n corev1.Node, target string, nodes *corev1.NodeList) {
 	rec := hopRecord{node: n.Name, release: target, cordoned: n.Spec.Unschedulable}
 	for _, other := range nodes.Items {
 		if other.Name != n.Name && other.Annotations[k4allv1alpha1.NodeUpgradeTargetAnnotation] != "" &&
@@ -214,7 +315,7 @@ func (a *fakeAgent) record(n corev1.Node, target string, nodes *corev1.NodeList)
 	}
 	a.mu.Lock()
 	a.hops = append(a.hops, rec)
-	a.started[n.Name] = time.Now()
+	a.running[n.Name] = &hopRun{started: time.Now(), record: len(a.hops) - 1}
 	a.mu.Unlock()
 }
 
@@ -276,7 +377,7 @@ var _ = Describe("ClusterUpgrade", Ordered, func() {
 		roles[workers[0]], roles[workers[1]] = roleControl, roleWorker
 		order = append(order, workers...)
 		agent = &fakeAgent{
-			roles: roles, stop: make(chan struct{}), done: make(chan struct{}), started: map[string]time.Time{},
+			roles: roles, stop: make(chan struct{}), done: make(chan struct{}), running: map[string]*hopRun{},
 		}
 		go agent.run()
 	})
@@ -286,8 +387,8 @@ var _ = Describe("ClusterUpgrade", Ordered, func() {
 			close(agent.stop)
 			<-agent.done
 			for _, h := range agent.hops {
-				_, _ = fmt.Fprintf(GinkgoWriter, "hop %s on %s: cordoned=%v podsLeft=%v others=%v\n",
-					h.release, h.node, h.cordoned, h.podsLeft, h.otherTargets)
+				_, _ = fmt.Fprintf(GinkgoWriter, "hop %s on %s: cordoned=%v podsLeft=%v others=%v syncPod=%s\n",
+					h.release, h.node, h.cordoned, h.podsLeft, h.otherTargets, h.syncPod)
 			}
 			for _, e := range agent.errs {
 				_, _ = fmt.Fprintf(GinkgoWriter, "fake agent: %s\n", e)
@@ -334,6 +435,9 @@ var _ = Describe("ClusterUpgrade", Ordered, func() {
 		Eventually(func(g Gomega) {
 			cu, err := clusterUpgrade()
 			g.Expect(err).NotTo(HaveOccurred())
+			if cu.Status.Phase == k4allv1alpha1.ClusterUpgradeFailed {
+				StopTrying("the upgrade failed: " + cu.Status.Message).Now()
+			}
 			g.Expect(cu.Status.Phase).To(Equal(k4allv1alpha1.ClusterUpgradeSucceeded),
 				"%s: %s", cu.Status.Phase, cu.Status.Message)
 		}, 20*time.Minute, pollInterval).Should(Succeed())
@@ -358,6 +462,13 @@ var _ = Describe("ClusterUpgrade", Ordered, func() {
 			Expect(h.cordoned).To(BeTrue(), "%s started %s uncordoned", h.node, h.release)
 			Expect(h.podsLeft).To(BeEmpty(), "%s started %s with pods to move", h.node, h.release)
 			Expect(h.otherTargets).To(BeEmpty(), "%s started %s while other nodes had a hop", h.node, h.release)
+		}
+
+		By("checking the bootstrap node took pods again in its SYNC, past the reboot")
+		for _, h := range hops {
+			if h.node == order[0] {
+				Expect(h.syncPod).To(Equal("Ready"), "the SYNC pod of %s on %s", h.release, h.node)
+			}
 		}
 
 		By("checking the nodes are uncordoned and the protocol annotations cleared")
