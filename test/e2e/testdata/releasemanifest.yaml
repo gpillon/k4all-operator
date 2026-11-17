@@ -50,8 +50,9 @@ spec:
     # Monitoring — manifest type with patches, tests patching
     metrics-server:
       type: manifest
-      version: "latest"
-      source: "https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml"
+      # Keep in sync with bootc/overlay/usr/local/share/k4all-release.yaml in fcos-k8s.
+      version: "v0.9.1"
+      source: "https://github.com/kubernetes-sigs/metrics-server/releases/download/{{ version }}/components.yaml"
       namespace: kube-system
       dependsOn:
         - calico
