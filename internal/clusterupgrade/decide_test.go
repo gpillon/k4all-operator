@@ -3,7 +3,9 @@ package clusterupgrade
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,7 +133,17 @@ func TestDecide_StartsWithTheBootstrapNode(t *testing.T) {
 	}
 }
 
-// draining is the state after the operator cordoned cp-0 at drainStart.
+// appPods are n pods of an app on cp-0 since before the drain.
+func appPods(n int, drainStart time.Time) []Pod {
+	pods := make([]Pod, 0, n)
+	for i := 0; i < n; i++ {
+		pods = append(pods, Pod{Namespace: "default", Name: fmt.Sprintf("app-%d", i), Created: drainStart.Add(-time.Hour)})
+	}
+	return pods
+}
+
+// draining is the state after the operator cordoned cp-0 at drainStart,
+// with podsLeft of the pods it had then still on it.
 func draining(t *testing.T, drainStart time.Time, podsLeft int) Input {
 	nodes := threeNodes("v2.5.0")
 	nodes[2].Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation] = "true"
@@ -143,18 +155,70 @@ func draining(t *testing.T, drainStart time.Time, podsLeft int) Input {
 		Previous: k4allv1alpha1.ClusterUpgradeStatus{Nodes: []k4allv1alpha1.NodeUpgradeStatus{
 			{Name: "cp-0", Phase: k4allv1alpha1.NodeUpgradeDraining, DrainStartedAt: &started},
 		}},
-		PodsLeft: map[string]int{"cp-0": podsLeft},
-		Graph:    graph(t),
-		Now:      now,
+		Pods:  map[string][]Pod{"cp-0": appPods(podsLeft, drainStart)},
+		Graph: graph(t),
+		Now:   now,
 	}
 }
 
 func TestDecide_EvictsUntilTheNodeIsDrained(t *testing.T) {
 	status, actions := Decide(draining(t, now.Add(-time.Minute), 2))
 
-	expectActions(t, actions, Action{Kind: Evict, Node: "cp-0"})
+	expectActions(t, actions, Action{Kind: Evict, Node: "cp-0", Pods: []string{"default/app-0", "default/app-1"}})
 	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeDraining || !got.DrainStartedAt.Time.Equal(now.Add(-time.Minute)) {
 		t.Errorf("cp-0 = %s since %v, want Draining since the cordon", got.Phase, got.DrainStartedAt)
+	}
+	if got := status.Nodes[0].Message; got != "2 pods left: default/app-0, default/app-1" {
+		t.Errorf("cp-0 message = %q, want the pods named", got)
+	}
+}
+
+// Like kubectl drain: the drain moves the pods the node had when it started.
+// A pod that tolerates the cordon can be put back on the node by its
+// controller; it is neither evicted again nor waited for, only named.
+func TestDecide_DrainsThePodsTheNodeHadWhenItStarted(t *testing.T) {
+	drainStart := now.Add(-time.Minute)
+	back := Pod{Namespace: "tigera-operator", Name: "tigera-operator-7d9f", Created: drainStart.Add(30 * time.Second)}
+
+	t.Run("evicts only the pods from before", func(t *testing.T) {
+		in := draining(t, drainStart, 1)
+		in.Pods["cp-0"] = append(in.Pods["cp-0"], back)
+
+		_, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Evict, Node: "cp-0", Pods: []string{"default/app-0"}})
+	})
+
+	t.Run("asks for the hop with only the pods that came back", func(t *testing.T) {
+		in := draining(t, drainStart, 0)
+		in.Pods["cp-0"] = []Pod{back}
+
+		status, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: SetTarget, Node: "cp-0", Release: firstHop})
+		if got := status.Nodes[0].Message; !strings.Contains(got, "tigera-operator/tigera-operator-7d9f") {
+			t.Errorf("cp-0 message = %q, want the pod that came back named", got)
+		}
+	})
+
+	t.Run("a terminating pod is waited for, not evicted again", func(t *testing.T) {
+		in := draining(t, drainStart, 2)
+		in.Pods["cp-0"][0].Terminating = true
+
+		status, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Evict, Node: "cp-0", Pods: []string{"default/app-1"}})
+		if got := status.Nodes[0].Phase; got != k4allv1alpha1.NodeUpgradeDraining {
+			t.Errorf("cp-0 phase = %s, want Draining", got)
+		}
+	})
+}
+
+// The note about pods that came back stays while the node runs its hop.
+func TestDecide_KeepsTheNoteAboutPodsThatCameBack(t *testing.T) {
+	in := upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "STAGE")
+	in.Previous.Nodes[0].Message = "back on the node after the drain started: tigera-operator/tigera-operator-7d9f"
+
+	status, _ := Decide(in)
+	if got := status.Nodes[0].Message; got != in.Previous.Nodes[0].Message {
+		t.Errorf("cp-0 message = %q, want %q", got, in.Previous.Nodes[0].Message)
 	}
 }
 
@@ -320,7 +384,7 @@ func TestDecide_DrainTimeoutFailsTheNode(t *testing.T) {
 	status, actions := Decide(draining(t, now.Add(-31*time.Minute), 2))
 
 	expectActions(t, actions)
-	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeFailed || got.Message != "drain timed out after 30 minutes, 2 pods left" {
+	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeFailed || got.Message != "drain timed out after 30 minutes, 2 pods left: default/app-0, default/app-1" {
 		t.Errorf("cp-0 = %s %q, want Failed on the drain timeout", got.Phase, got.Message)
 	}
 	if status.Phase != k4allv1alpha1.ClusterUpgradeFailed {
@@ -343,7 +407,7 @@ func TestDecide_RetryDrainsTheFailedNodeAgain(t *testing.T) {
 	in.Retry = true
 
 	status, actions := Decide(in)
-	expectActions(t, actions, Action{Kind: Evict, Node: "cp-0"})
+	expectActions(t, actions, Action{Kind: Evict, Node: "cp-0", Pods: []string{"default/app-0", "default/app-1"}})
 	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeDraining || !got.DrainStartedAt.Time.Equal(now) {
 		t.Errorf("cp-0 = %s since %v, want Draining again from now", got.Phase, got.DrainStartedAt)
 	}

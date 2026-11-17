@@ -6,6 +6,7 @@ package clusterupgrade
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
@@ -43,16 +44,27 @@ const (
 type Action struct {
 	Kind    ActionKind
 	Node    string
-	Release string // SetTarget only
+	Release string   // SetTarget only
+	Pods    []string // Evict only: namespace/name
 }
+
+// Pod is a pod the drain moves off its node: not a DaemonSet, static or
+// finished pod, nor the operator itself.
+type Pod struct {
+	Namespace, Name string
+	Created         time.Time
+	Terminating     bool
+}
+
+func (p Pod) String() string { return p.Namespace + "/" + p.Name }
 
 // Input is the state Decide works from.
 type Input struct {
 	Spec     k4allv1alpha1.ClusterUpgradeSpec
 	Previous k4allv1alpha1.ClusterUpgradeStatus
 	Nodes    []Node
-	// Pods still to evict, for the nodes the operator cordoned.
-	PodsLeft map[string]int
+	// The pods on the nodes the operator cordoned.
+	Pods map[string][]Pod
 	// Graph is nil when it could not be read (GraphErr).
 	Graph    *upgradegraph.Graph
 	GraphErr error
@@ -357,6 +369,9 @@ func step(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) [
 		return []Action{{Kind: Finish, Node: n.Name}}
 	}
 	n.Phase = k4allv1alpha1.NodeUpgradeUpgrading
+	if prev := previous(in, n.Name).Message; strings.HasPrefix(prev, backMessagePrefix) {
+		n.Message = prev
+	}
 	switch n.HostPhase {
 	case hostHold:
 		n.Phase = k4allv1alpha1.NodeUpgradeFailed
@@ -439,22 +454,65 @@ func drain(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) 
 		started := metav1.NewTime(in.Now)
 		n.DrainStartedAt = &started
 	}
-	if left := in.PodsLeft[n.Name]; left > 0 && len(in.Nodes) > 1 {
+	left, back := splitPods(in.Pods[n.Name], n.DrainStartedAt.Time)
+	if len(left) > 0 && len(in.Nodes) > 1 {
 		timeout := time.Duration(drainTimeoutMinutes(in.Spec)) * time.Minute
 		switch {
 		case in.Now.Sub(n.DrainStartedAt.Time) < timeout:
 			n.Phase = k4allv1alpha1.NodeUpgradeDraining
-			n.Message = fmt.Sprintf("%d pods left", left)
-			return []Action{{Kind: Evict, Node: n.Name}}
+			n.Message = fmt.Sprintf("%d pods left: %s", len(left), podList(left))
+			var evict []string
+			for _, p := range left {
+				if !p.Terminating {
+					evict = append(evict, p.String())
+				}
+			}
+			return []Action{{Kind: Evict, Node: n.Name, Pods: evict}}
 		case !in.Spec.Drain.ContinueOnTimeout:
 			n.Phase = k4allv1alpha1.NodeUpgradeFailed
-			n.Message = fmt.Sprintf("drain timed out after %d minutes, %d pods left", drainTimeoutMinutes(in.Spec), left)
+			n.Message = fmt.Sprintf("drain timed out after %d minutes, %d pods left: %s",
+				drainTimeoutMinutes(in.Spec), len(left), podList(left))
 			n.Reason = k4allv1alpha1.NodeReasonDrainTimeout
 			return nil
 		}
 	}
 	n.Phase = k4allv1alpha1.NodeUpgradeUpgrading
+	if len(back) > 0 {
+		n.Message = backMessagePrefix + podList(back)
+	}
 	return []Action{{Kind: SetTarget, Node: n.Name, Release: hop}}
+}
+
+// backMessagePrefix starts the node message that names the pods put back on
+// it after the drain started; it stays for the rest of the hop.
+const backMessagePrefix = "back on the node after the drain started: "
+
+// splitPods sorts the pods of a node being drained: the ones it had when the
+// drain started, which the drain moves, and the ones put back on it since,
+// which tolerate the cordon or were bound to the node. Like kubectl drain,
+// the drain neither evicts nor waits for the second ones.
+func splitPods(pods []Pod, drainStarted time.Time) (left, back []Pod) {
+	for _, p := range pods {
+		if p.Created.After(drainStarted) {
+			back = append(back, p)
+		} else {
+			left = append(left, p)
+		}
+	}
+	return left, back
+}
+
+// podList names up to three pods.
+func podList(pods []Pod) string {
+	names := make([]string, 0, 3)
+	for i, p := range pods {
+		if i == 3 {
+			names = append(names, fmt.Sprintf("and %d more", len(pods)-3))
+			break
+		}
+		names = append(names, p.String())
+	}
+	return strings.Join(names, ", ")
 }
 
 // drainTimeoutMinutes is spec.drain.timeoutMinutes, 30 when unset.

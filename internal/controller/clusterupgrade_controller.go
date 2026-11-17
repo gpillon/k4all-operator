@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -90,7 +91,7 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	in := clusterupgrade.Input{
 		Spec:       cu.Spec,
 		Previous:   cu.Status,
-		PodsLeft:   map[string]int{},
+		Pods:       map[string][]clusterupgrade.Pod{},
 		GraphURL:   cu.Spec.GraphURL,
 		Now:        r.now(),
 		Generation: cu.Generation,
@@ -110,7 +111,12 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			in.PodsLeft[n.Name] = len(pods)
+			for _, p := range pods {
+				in.Pods[n.Name] = append(in.Pods[n.Name], clusterupgrade.Pod{
+					Namespace: p.Namespace, Name: p.Name, Created: p.CreationTimestamp.Time,
+					Terminating: p.DeletionTimestamp != nil,
+				})
+			}
 		}
 	}
 
@@ -224,7 +230,7 @@ func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Act
 			"spec": map[string]interface{}{"unschedulable": true},
 		})
 	case clusterupgrade.Evict:
-		return r.evict(ctx, a.Node)
+		return r.evict(ctx, a.Pods)
 	case clusterupgrade.Uncordon:
 		// From here a cordon on the node is the admin's: Finish leaves it.
 		return r.patchNode(ctx, a.Node, map[string]interface{}{
@@ -268,28 +274,22 @@ func (r *ClusterUpgradeReconciler) patchNode(ctx context.Context, name string, p
 	return r.Patch(ctx, node, client.RawPatch(types.MergePatchType, data))
 }
 
-// evict asks the API server to evict each pod the drain moves. A
-// PodDisruptionBudget refusing it (429) is retried at the next reconcile,
+// evict asks the API server to evict the pods Decide chose (namespace/name).
+// A PodDisruptionBudget refusing it (429) is retried at the next reconcile,
 // until the drain timeout.
-func (r *ClusterUpgradeReconciler) evict(ctx context.Context, nodeName string) error {
+func (r *ClusterUpgradeReconciler) evict(ctx context.Context, pods []string) error {
 	log := logf.FromContext(ctx)
-	pods, err := r.podsToEvict(ctx, nodeName)
-	if err != nil {
-		return err
-	}
-	for i := range pods {
-		p := &pods[i]
-		if p.DeletionTimestamp != nil {
-			continue
-		}
-		eviction := &policyv1.Eviction{ObjectMeta: metav1.ObjectMeta{Name: p.Name, Namespace: p.Namespace}}
+	for _, key := range pods {
+		namespace, name, _ := strings.Cut(key, "/")
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+		eviction := &policyv1.Eviction{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
 		err := r.SubResource("eviction").Create(ctx, p, eviction)
 		switch {
 		case err == nil, apierrors.IsNotFound(err):
 		case apierrors.IsTooManyRequests(err):
-			log.Info("eviction refused for now", "pod", client.ObjectKeyFromObject(p), "reason", err.Error())
+			log.Info("eviction refused for now", "pod", key, "reason", err.Error())
 		default:
-			return fmt.Errorf("evict %s/%s: %w", p.Namespace, p.Name, err)
+			return fmt.Errorf("evict %s: %w", key, err)
 		}
 	}
 	return nil

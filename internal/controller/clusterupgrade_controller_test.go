@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/upgradegraph"
@@ -106,12 +108,12 @@ func (b *upgradeTestbed) node(name string) *corev1.Node {
 	return n
 }
 
-// pod creates a running pod bound to nodeName.
-func (b *upgradeTestbed) pod(name, nodeName string, owners ...metav1.OwnerReference) *corev1.Pod {
+// pod creates a running pod bound to the node cu-cp, the one drained first.
+func (b *upgradeTestbed) pod(name string, owners ...metav1.OwnerReference) *corev1.Pod {
 	b.t.Helper()
 	p := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, OwnerReferences: owners},
-		Spec:       corev1.PodSpec{NodeName: nodeName, Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+		Spec:       corev1.PodSpec{NodeName: "cu-cp", Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
 	}
 	if err := b.c.Create(context.Background(), p); err != nil {
 		b.t.Fatal(err)
@@ -175,9 +177,9 @@ func TestClusterUpgrade_DrainsTheNodeThenAsksForTheHop(t *testing.T) {
 		upgradeNode("cu-cp", "bootstrap", "v2.5.0"),
 		upgradeNode("cu-w", "worker", "v2.5.0"))
 	b.reconcile()
-	app := b.pod("app", "cu-cp")
-	ds := b.pod("ds", "cu-cp", metav1.OwnerReference{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "ds", UID: "ds-uid"})
-	self := b.pod("k4all-operator", "cu-cp")
+	app := b.pod("app")
+	ds := b.pod("ds", metav1.OwnerReference{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "ds", UID: "ds-uid"})
+	self := b.pod("k4all-operator")
 	b.targetNextRelease()
 
 	b.reconcile()
@@ -207,6 +209,41 @@ func TestClusterUpgrade_DrainsTheNodeThenAsksForTheHop(t *testing.T) {
 	}
 	if cu.Status.Nodes[0].Phase != k4allv1alpha1.NodeUpgradeUpgrading {
 		t.Errorf("cu-cp phase = %s, want Upgrading", cu.Status.Nodes[0].Phase)
+	}
+}
+
+// A pod that tolerates the cordon is put back on the node by its controller
+// (tigera-operator in the lab): the drain neither evicts it again nor waits
+// for it, and names it.
+func TestClusterUpgrade_DrainLeavesThePodsPutBackOnTheNode(t *testing.T) {
+	b := newUpgradeTestbed(t,
+		upgradeNode("cu-cp", "bootstrap", "v2.5.0"),
+		upgradeNode("cu-w", "worker", "v2.5.0"))
+	b.reconcile()
+	app := b.pod("app")
+	b.targetNextRelease()
+	b.reconcile() // cordon
+
+	time.Sleep(1100 * time.Millisecond) // creation times have a one-second resolution
+	back := b.pod("app-back")
+	b.reconcile()
+	if !b.evicted(app) {
+		t.Fatalf("pod app was not evicted")
+	}
+	if b.evicted(back) {
+		t.Errorf("evicted app-back, put on the node after the drain started")
+	}
+
+	// The kubelet finishes the eviction of app.
+	if err := b.c.Delete(context.Background(), app, client.GracePeriodSeconds(0)); client.IgnoreNotFound(err) != nil {
+		t.Fatal(err)
+	}
+	cu := b.reconcile()
+	if got := b.node("cu-cp").Annotations[k4allv1alpha1.NodeUpgradeTargetAnnotation]; got != nextRelease {
+		t.Errorf("cu-cp upgrade-target = %q with only app-back left, want %s", got, nextRelease)
+	}
+	if msg := cu.Status.Nodes[0].Message; !strings.Contains(msg, "default/app-back") {
+		t.Errorf("cu-cp message = %q, want app-back named", msg)
 	}
 }
 
