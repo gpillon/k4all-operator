@@ -118,7 +118,7 @@ KIND_CLUSTER ?= k4all-operator-test-e2e
 # Fully-qualified on purpose: podman stores unqualified tags as localhost/<name>, while the
 # kubelet would resolve an unqualified image to docker.io/library/<name> and fail to find it.
 E2E_IMG ?= localhost/k4all-operator:e2e-test
-E2E_TIMEOUT ?= 20m
+E2E_TIMEOUT ?= 75m
 
 .PHONY: test-all
 test-all: ## Full e2e: build image, create Kind cluster, deploy, test, cleanup

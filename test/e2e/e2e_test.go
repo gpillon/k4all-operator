@@ -28,6 +28,9 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"sigs.k8s.io/yaml"
+
+	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 )
 
 func TestE2E(t *testing.T) {
@@ -46,6 +49,20 @@ const (
 )
 
 var root string
+
+// releaseManifestFile is the ReleaseManifest installed first; upgradeTo, when
+// set, is applied afterwards by "Upgrade to the next release set".
+var (
+	releaseManifestFile = envOr("E2E_RELEASE_MANIFEST", "test/e2e/testdata/releasemanifest.yaml")
+	upgradeTo           = os.Getenv("E2E_UPGRADE_TO")
+)
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 func init() {
 	root = discoverProjectRoot()
@@ -88,6 +105,22 @@ func componentState(name string) string {
 	out, _ := kubectl("get", "releasemanifest", releaseManifestName,
 		"-o", fmt.Sprintf("jsonpath={.status.components.%s.state}", name))
 	return out
+}
+
+// componentStatus returns "<state>/<installedVersion>" for a component.
+func componentStatus(name string) string {
+	out, _ := kubectl("get", "releasemanifest", releaseManifestName, "-o", fmt.Sprintf(
+		"jsonpath={.status.components.%s.state}/{.status.components.%s.installedVersion}", name, name))
+	return out
+}
+
+// readReleaseManifest parses a testdata ReleaseManifest (path relative to the project root).
+func readReleaseManifest(path string) *k4allv1alpha1.ReleaseManifest {
+	raw, err := os.ReadFile(filepath.Join(root, path))
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	rm := &k4allv1alpha1.ReleaseManifest{}
+	ExpectWithOffset(1, yaml.Unmarshal(raw, rm)).To(Succeed())
+	return rm
 }
 
 func componentMessage(name string) string {
@@ -176,7 +209,7 @@ var _ = Describe("K4All Operator", Ordered, func() {
 		})
 
 		It("should accept a ReleaseManifest CR", func() {
-			out, err := kubectl("apply", "-f", "test/e2e/testdata/releasemanifest.yaml")
+			out, err := kubectl("apply", "-f", releaseManifestFile)
 			Expect(err).NotTo(HaveOccurred(), "apply ReleaseManifest: %s", out)
 		})
 	})
@@ -382,32 +415,53 @@ var _ = Describe("K4All Operator", Ordered, func() {
 		})
 	})
 
-	// ── Upgrade Path ────────────────────────────────────────────────────
+	// ── Upgrade to the next release set ─────────────────────────────────
 
-	Context("Upgrade Path", func() {
-		It("should upgrade cert-manager one minor at a time through upgradePath", func() {
-			By("moving cert-manager from v1.14.5 to v1.16.5 through v1.15.5")
-			patch := `{"spec":{"components":{"cert-manager":{` +
-				`"version":"v1.16.5","helmArgs":["--set crds.enabled=true"],` +
-				`"upgradePath":[{"version":"v1.15.5"}]}}}}`
-			kubectlMustSucceed("patch", "releasemanifest", releaseManifestName, "--type", "merge", "-p", patch)
+	// With E2E_UPGRADE_TO set, the installed set is replaced by that
+	// ReleaseManifest, as the k4all v2.4.0 sync does on existing clusters.
+	Context("Upgrade to the next release set", func() {
+		It("should bring every component to its new version through upgradePath", func() {
+			if upgradeTo == "" {
+				Skip("E2E_UPGRADE_TO not set: fresh install only")
+			}
+			target := readReleaseManifest(upgradeTo)
 
-			By("waiting for cert-manager to be Installed at v1.16.5")
-			Eventually(func() string {
-				out, _ := kubectl("get", "releasemanifest", releaseManifestName, "-o",
-					"jsonpath={.status.components.cert-manager.state}/{.status.components.cert-manager.installedVersion}")
-				return out
-			}, 2*testTimeout, pollInterval).Should(Equal("Installed/v1.16.5"),
-				"cert-manager message: %s", componentMessage("cert-manager"))
+			By("applying " + upgradeTo)
+			start := time.Now()
+			kubectlMustSucceed("apply", "-f", upgradeTo)
 
-			By("checking that the v1.15.5 step really ran")
-			// Every helm upgrade rolls a new ReplicaSet; the old ones keep their image.
-			out := kubectlMustSucceed("get", "replicasets", "-n", "cert-manager",
+			reached := map[string]time.Duration{}
+			Eventually(func() []string {
+				var pending []string
+				for name, comp := range target.Spec.Components {
+					if _, done := reached[name]; done {
+						continue
+					}
+					if componentStatus(name) == "Installed/"+comp.Version {
+						reached[name] = time.Since(start).Round(time.Second)
+						_, _ = fmt.Fprintf(GinkgoWriter, "upgrade: %s at %s after %s\n", name, comp.Version, reached[name])
+						continue
+					}
+					pending = append(pending, fmt.Sprintf("%s=%s (%s)", name, componentStatus(name), componentMessage(name)))
+				}
+				return pending
+			}, 60*time.Minute, pollInterval).Should(BeEmpty(), "components not at their target version")
+
+			By("checking that cert-manager ran every intermediate step")
+			// Every helm upgrade rolls a new controller ReplicaSet; old ones keep their image.
+			images := kubectlMustSucceed("get", "replicasets", "-n", "cert-manager",
 				"-l", "app.kubernetes.io/name=cert-manager,app.kubernetes.io/component=controller",
 				"-o", "jsonpath={.items[*].spec.template.spec.containers[0].image}")
-			Expect(out).To(ContainSubstring(":v1.15.5"), "controller ReplicaSet images: %s", out)
-			Expect(out).To(ContainSubstring(":v1.16.5"), "controller ReplicaSet images: %s", out)
+			for _, step := range target.Spec.Components["cert-manager"].UpgradePath {
+				Expect(images).To(ContainSubstring(":"+step.Version), "controller ReplicaSet images: %s", images)
+			}
 
+			By("waiting for the ReleaseManifest to be Ready again")
+			Eventually(func() string {
+				out, _ := kubectl("get", "releasemanifest", releaseManifestName,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+				return out
+			}, testTimeout, pollInterval).Should(Equal("True"))
 			Eventually(func() bool {
 				return deploymentReady("cert-manager-webhook", "cert-manager")
 			}, testTimeout, pollInterval).Should(BeTrue())
