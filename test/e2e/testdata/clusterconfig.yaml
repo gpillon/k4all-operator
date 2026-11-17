@@ -31,3 +31,11 @@ spec:
     httpProxy: ""
     httpsProxy: ""
     noProxy: ""
+  # Checked by "should apply ClusterConfig componentOverrides to the cert-manager release".
+  componentOverrides:
+    cert-manager:
+      values:
+        podLabels:
+          k4all-e2e: values
+      helmArgs:
+        - "--set webhook.podLabels.k4all-e2e=helmargs"
