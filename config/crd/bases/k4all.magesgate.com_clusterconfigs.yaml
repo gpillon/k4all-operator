@@ -165,7 +165,9 @@ spec:
                           the node IP directly
                         type: string
                       isDefault:
-                        description: Whether NGINX should be the default IngressClass
+                        default: true
+                        description: Whether NGINX should be the default IngressClass.
+                          Left out, it is.
                         type: boolean
                     type: object
                   traefik:
@@ -178,7 +180,9 @@ spec:
                           the node IP directly
                         type: string
                       isDefault:
-                        description: Whether Traefik should be the default IngressClass
+                        default: true
+                        description: Whether Traefik should be the default IngressClass.
+                          Left out, it is.
                         type: boolean
                     type: object
                 type: object
