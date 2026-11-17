@@ -489,17 +489,16 @@ func isComponentInstalled(rm *k4allv1alpha1.ReleaseManifest, name string) bool {
 
 // patchStatus writes the ReleaseManifest status via a merge-patch, avoiding
 // resourceVersion conflicts that happen when the spec/metadata was modified
-// while the reconcile loop was running.
+// while the reconcile loop was running. The patch is computed against the
+// stored status, so fields rm.Status no longer sets are cleared, not kept.
 func (r *ReleaseReconciler) patchStatus(ctx context.Context, rm *k4allv1alpha1.ReleaseManifest) error {
-	statusPayload := map[string]interface{}{
-		"status": rm.Status,
+	stored := &k4allv1alpha1.ReleaseManifest{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(rm), stored); err != nil {
+		return fmt.Errorf("read status to patch: %w", err)
 	}
-	raw, err := json.Marshal(statusPayload)
-	if err != nil {
-		return fmt.Errorf("marshal status patch: %w", err)
-	}
-	patch := client.RawPatch(types.MergePatchType, raw)
-	return r.Status().Patch(ctx, rm, patch)
+	base := rm.DeepCopy()
+	base.Status = stored.Status
+	return r.Status().Patch(ctx, rm, client.MergeFrom(base))
 }
 
 // nodesUpgrading lists the Nodes carrying UpgradeInProgressAnnotation as
