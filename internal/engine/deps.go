@@ -141,8 +141,7 @@ func shouldInstall(name string, spec k4allv1alpha1.ComponentSpec, config k4allv1
 	// MetalLB is skipped when Cilium handles L2 announcements and no dedicated IPs
 	if name == "metallb" {
 		if config.Networking.CNI.Type == cniCilium {
-			hasIPs := config.Ingress.Nginx.DedicatedIP != "" || config.Ingress.Cilium.DedicatedIP != ""
-			if !hasIPs {
+			if len(config.Ingress.DedicatedIPs()) == 0 {
 				return false
 			}
 		}
