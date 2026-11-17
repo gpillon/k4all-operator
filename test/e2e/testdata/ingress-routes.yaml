@@ -1,0 +1,191 @@
+# The three shapes of the routes k4all ships (fcos-k8s
+# bootc/overlay/usr/local/share/*-ingress-routes.yaml), all with
+# ingressClassName nginx, as existing clusters have them:
+#   http-backend   headlamp / kubevirt-manager: HTTP backend, forced HTTPS
+#   https-backend  argocd: HTTPS backend, TLS terminated by the controller
+#   passthrough    cdi-uploadproxy: TLS passed through to the backend
+# whoami-tls serves its own certificate (CN=passthrough.k4all.test), so a
+# client can tell passthrough from termination by the certificate it gets.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k4all-e2e-routes
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned
+  namespace: k4all-e2e-routes
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: whoami-tls
+  namespace: k4all-e2e-routes
+spec:
+  secretName: whoami-tls
+  commonName: passthrough.k4all.test
+  dnsNames:
+    - passthrough.k4all.test
+  issuerRef:
+    name: selfsigned
+    kind: Issuer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami-tls
+  namespace: k4all-e2e-routes
+spec:
+  selector:
+    matchLabels:
+      app: whoami-tls
+  template:
+    metadata:
+      labels:
+        app: whoami-tls
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.12.0
+          args: ["--port=8443", "--cert=/certs/tls.crt", "--key=/certs/tls.key"]
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: certs
+          secret:
+            secretName: whoami-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami-tls
+  namespace: k4all-e2e-routes
+spec:
+  selector:
+    app: whoami-tls
+  ports:
+    - port: 443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami-http
+  namespace: k4all-e2e-routes
+spec:
+  selector:
+    matchLabels:
+      app: whoami-http
+  template:
+    metadata:
+      labels:
+        app: whoami-http
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.12.0
+          args: ["--port=8080"]
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami-http
+  namespace: k4all-e2e-routes
+spec:
+  selector:
+    app: whoami-http
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: http-backend
+  namespace: k4all-e2e-routes
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: HTTP
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: http-backend.k4all.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: whoami-http
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: https-backend
+  namespace: k4all-e2e-routes
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: https-backend.k4all.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: whoami-tls
+                port:
+                  number: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: passthrough
+  namespace: k4all-e2e-routes
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+    nginx.ingress.kubernetes.io/proxy-body-size: '0'
+    nginx.ingress.kubernetes.io/ssl-passthrough: 'true'
+    nginx.ingress.kubernetes.io/ssl-redirect: 'true'
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: '3600'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '3600'
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: passthrough.k4all.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: whoami-tls
+                port:
+                  number: 443
+---
+# Requests come from inside the cluster, to the node IP, as from the LAN.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: k4all-e2e-routes
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:8.22.0
+      command: ["sleep", "infinity"]

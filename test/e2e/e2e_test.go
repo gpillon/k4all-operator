@@ -22,6 +22,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -50,12 +52,25 @@ const (
 
 var root string
 
-// releaseManifestFile is the ReleaseManifest installed first; upgradeTo, when
-// set, is applied afterwards by "Upgrade to the next release set".
+// releaseManifestFile is the ReleaseManifest installed first; upgradeChain
+// (E2E_UPGRADE_TO, comma-separated) lists the ones applied after it, in order,
+// as successive k4all releases sync them on an existing cluster.
+// clusterConfigFile is the ClusterConfig the cluster was installed with.
 var (
+	clusterConfigFile   = envOr("E2E_CLUSTER_CONFIG", "test/e2e/testdata/clusterconfig.yaml")
 	releaseManifestFile = envOr("E2E_RELEASE_MANIFEST", "test/e2e/testdata/releasemanifest.yaml")
-	upgradeTo           = os.Getenv("E2E_UPGRADE_TO")
+	upgradeChain        = splitList(os.Getenv("E2E_UPGRADE_TO"))
 )
+
+func splitList(v string) []string {
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -114,13 +129,45 @@ func componentStatus(name string) string {
 	return out
 }
 
-// readReleaseManifest parses a testdata ReleaseManifest (path relative to the project root).
-func readReleaseManifest(path string) *k4allv1alpha1.ReleaseManifest {
+// mustReadReleaseManifest parses a testdata ReleaseManifest (path relative to
+// the project root) while the spec tree is built, which needs its components.
+func mustReadReleaseManifest(path string) *k4allv1alpha1.ReleaseManifest {
 	raw, err := os.ReadFile(filepath.Join(root, path))
-	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	if err != nil {
+		panic(err)
+	}
 	rm := &k4allv1alpha1.ReleaseManifest{}
-	ExpectWithOffset(1, yaml.Unmarshal(raw, rm)).To(Succeed())
+	if err := yaml.Unmarshal(raw, rm); err != nil {
+		panic(fmt.Sprintf("%s: %v", path, err))
+	}
 	return rm
+}
+
+func managed(spec k4allv1alpha1.ComponentSpec) bool {
+	return spec.Management != k4allv1alpha1.ComponentManagementRemoved &&
+		spec.Management != k4allv1alpha1.ComponentManagementUnmanaged
+}
+
+// activeComponents lists, sorted, the components the operator installs from rm.
+func activeComponents(rm *k4allv1alpha1.ReleaseManifest) []string {
+	var names []string
+	for name, spec := range rm.Spec.Components {
+		if managed(spec) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ingressController is the controller serving the k4all routes once rm is installed.
+func ingressController(rm *k4allv1alpha1.ReleaseManifest) string {
+	for _, name := range []string{"traefik", "ingress-nginx"} {
+		if spec, ok := rm.Spec.Components[name]; ok && managed(spec) {
+			return strings.TrimPrefix(name, "ingress-")
+		}
+	}
+	return ""
 }
 
 func componentMessage(name string) string {
@@ -141,15 +188,176 @@ func deploymentReady(name, namespace string) bool {
 	return err == nil && out != "" && out != "0"
 }
 
-// expectedComponents lists components that the operator should install in
-// the Kind test cluster (matching testdata/releasemanifest.yaml).
-var expectedComponents = []string{
-	"calico",
-	"cert-manager",
-	"metrics-server",
+// ── Ingress routes ──────────────────────────────────────────────────
+
+const (
+	routesFile      = "test/e2e/testdata/ingress-routes.yaml"
+	routesNamespace = "k4all-e2e-routes"
+)
+
+// defaultCertSubject is the certificate each controller serves when it
+// terminates TLS for a host without a secret of its own.
+var defaultCertSubject = map[string]string{
+	"nginx":   "Kubernetes Ingress Controller Fake Certificate",
+	"traefik": "TRAEFIK DEFAULT CERT",
+}
+
+func certSubject(cn string) *regexp.Regexp {
+	return regexp.MustCompile(`(?i)subject:.*CN ?= ?` + regexp.QuoteMeta(cn))
+}
+
+func nodeInternalIP() string {
+	return kubectlMustSucceed("get", "nodes",
+		"-o", `jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}`)
+}
+
+// routeRequest runs curl in the fixture's client pod against host, resolved
+// to the node IP, the address k4all routes are published on.
+func routeRequest(ip, scheme, host string, curlArgs ...string) (string, error) {
+	port := "443"
+	if scheme == "http" {
+		port = "80"
+	}
+	args := append([]string{"exec", "-n", routesNamespace, "client", "--",
+		"curl", "-sS", "--max-time", "10", "--resolve", host + ":" + port + ":" + ip}, curlArgs...)
+	return kubectl(append(args, scheme+"://"+host+"/")...)
+}
+
+// expectRoutesServedBy checks the three k4all route shapes (testdata/ingress-routes.yaml)
+// through controller ("nginx" or "traefik").
+func expectRoutesServedBy(controller string) {
+	By("deploying the k4all route shapes")
+	kubectlMustSucceed("apply", "-f", routesFile)
+	for _, name := range []string{"whoami-tls", "whoami-http"} {
+		Eventually(func() bool {
+			return deploymentAvailable(name, routesNamespace)
+		}, 5*time.Minute, pollInterval).Should(BeTrue(), "deployment %s not available", name)
+	}
+	Eventually(func() string {
+		out, _ := kubectl("get", "pod", "client", "-n", routesNamespace, "-o", "jsonpath={.status.phase}")
+		return out
+	}, 3*time.Minute, pollInterval).Should(Equal("Running"))
+	ip := nodeInternalIP()
+
+	By("http-backend (headlamp shape): plain HTTP is redirected to HTTPS")
+	Eventually(func(g Gomega) {
+		out, err := routeRequest(ip, "http", "http-backend.k4all.test",
+			"-o", "/dev/null", "-w", "%{http_code} %{redirect_url}")
+		g.Expect(err).NotTo(HaveOccurred(), out)
+		g.Expect(out).To(MatchRegexp(`^30[18] https://http-backend\.k4all\.test/$`))
+	}, 5*time.Minute, pollInterval).Should(Succeed())
+
+	By("http-backend: HTTPS reaches the HTTP backend")
+	Eventually(func(g Gomega) {
+		out, err := routeRequest(ip, "https", "http-backend.k4all.test", "-k")
+		g.Expect(err).NotTo(HaveOccurred(), out)
+		g.Expect(out).To(ContainSubstring("Hostname: whoami-http"))
+	}, 2*time.Minute, pollInterval).Should(Succeed())
+
+	By("https-backend (argocd shape): TLS terminated by " + controller + ", HTTPS to the backend")
+	Eventually(func(g Gomega) {
+		out, err := routeRequest(ip, "https", "https-backend.k4all.test", "-kv")
+		g.Expect(err).NotTo(HaveOccurred(), out)
+		g.Expect(out).To(ContainSubstring("Hostname: whoami-tls"))
+		g.Expect(out).To(MatchRegexp(certSubject(defaultCertSubject[controller]).String()))
+	}, 2*time.Minute, pollInterval).Should(Succeed())
+
+	By("passthrough (cdi-uploadproxy shape): the backend's own certificate reaches the client")
+	Eventually(func(g Gomega) {
+		out, err := routeRequest(ip, "https", "passthrough.k4all.test", "-kv")
+		g.Expect(err).NotTo(HaveOccurred(), out)
+		g.Expect(out).To(ContainSubstring("Hostname: whoami-tls"))
+		g.Expect(out).To(MatchRegexp(certSubject("passthrough.k4all.test").String()))
+	}, 2*time.Minute, pollInterval).Should(Succeed())
+}
+
+// expectNginxHandedOverToTraefik checks what the switch must leave behind for
+// the routes existing clusters already have.
+func expectNginxHandedOverToTraefik() {
+	By("keeping the nginx IngressClass the routes refer to")
+	Eventually(func() string {
+		out, _ := kubectl("get", "ingressclass", "nginx", "-o", "jsonpath={.spec.controller}")
+		return out
+	}, 5*time.Minute, pollInterval).Should(Equal("k8s.io/ingress-nginx"))
+
+	By("making Traefik's own class the default instead")
+	const isDefault = `{.metadata.annotations.ingressclass\.kubernetes\.io/is-default-class}`
+	defaults := kubectlMustSucceed("get", "ingressclass", "-o",
+		`jsonpath={range .items[*]}{.metadata.name}=`+isDefault+`{" "}{end}`)
+	Expect(defaults).To(ContainSubstring("traefik=true"))
+	Expect(defaults).NotTo(ContainSubstring("nginx=true"))
+
+	By("labelling the Traefik service for check-ip.sh")
+	Expect(kubectlMustSucceed("get", "svc", "-n", "traefik", "-l", "k4all-ingress=traefik",
+		"-o", "jsonpath={.items[*].metadata.name}")).NotTo(BeEmpty())
+
+	By("removing ingress-nginx and its admission webhook")
+	Eventually(func() string {
+		out, _ := kubectl("get", "pods", "-n", "ingress-nginx", "-o", "jsonpath={.items[*].metadata.name}")
+		return out
+	}, 5*time.Minute, pollInterval).Should(BeEmpty())
+	out, err := kubectl("get", "validatingwebhookconfiguration", "ingress-nginx-admission")
+	Expect(err).To(HaveOccurred(), "admission webhook still there: %s", out)
+
+	By("accepting Ingress updates, as update-routes.sh makes them")
+	kubectlMustSucceed("annotate", "ingress", "passthrough", "-n", routesNamespace,
+		"k4all-e2e/touched="+time.Now().Format("150405"), "--overwrite")
+}
+
+// upgradeTo applies the ReleaseManifest in file over from and waits for every
+// component to reach its state in to.
+func upgradeTo(file string, from, to *k4allv1alpha1.ReleaseManifest) {
+	By("applying " + file)
+	start := time.Now()
+	kubectlMustSucceed("apply", "-f", file)
+
+	reached := map[string]time.Duration{}
+	Eventually(func() []string {
+		var pending []string
+		for name, comp := range to.Spec.Components {
+			if _, done := reached[name]; done {
+				continue
+			}
+			want := "Installed/" + comp.Version
+			if comp.Management == k4allv1alpha1.ComponentManagementRemoved {
+				want = "Removed/"
+			}
+			if componentStatus(name) == want {
+				reached[name] = time.Since(start).Round(time.Second)
+				_, _ = fmt.Fprintf(GinkgoWriter, "upgrade: %s %s after %s\n", name, want, reached[name])
+				continue
+			}
+			pending = append(pending, fmt.Sprintf("%s=%s (%s)", name, componentStatus(name), componentMessage(name)))
+		}
+		return pending
+	}, 20*time.Minute, pollInterval).Should(BeEmpty(), "components not at their target state")
+
+	certManager := to.Spec.Components["cert-manager"]
+	if certManager.Version != from.Spec.Components["cert-manager"].Version {
+		By("checking that cert-manager ran every intermediate step")
+		// Every helm upgrade rolls a new controller ReplicaSet; old ones keep their image.
+		images := kubectlMustSucceed("get", "replicasets", "-n", "cert-manager",
+			"-l", "app.kubernetes.io/name=cert-manager,app.kubernetes.io/component=controller",
+			"-o", "jsonpath={.items[*].spec.template.spec.containers[0].image}")
+		for _, step := range certManager.UpgradePath {
+			Expect(images).To(ContainSubstring(":"+step.Version), "controller ReplicaSet images: %s", images)
+		}
+	}
+
+	By("waiting for the ReleaseManifest to be Ready again")
+	Eventually(func() string {
+		out, _ := kubectl("get", "releasemanifest", releaseManifestName,
+			"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+		return out
+	}, testTimeout, pollInterval).Should(Equal("True"))
+	Eventually(func() bool {
+		return deploymentReady("cert-manager-webhook", "cert-manager")
+	}, testTimeout, pollInterval).Should(BeTrue())
 }
 
 var _ = Describe("K4All Operator", Ordered, func() {
+	initial := mustReadReleaseManifest(releaseManifestFile)
+	expectedComponents := activeComponents(initial)
 
 	BeforeAll(func() {
 		By("verifying the cluster is reachable")
@@ -204,7 +412,7 @@ var _ = Describe("K4All Operator", Ordered, func() {
 
 	Context("Custom Resources", func() {
 		It("should accept a ClusterConfig CR", func() {
-			out, err := kubectl("apply", "-f", "test/e2e/testdata/clusterconfig.yaml")
+			out, err := kubectl("apply", "-f", clusterConfigFile)
 			Expect(err).NotTo(HaveOccurred(), "apply ClusterConfig: %s", out)
 		})
 
@@ -288,7 +496,7 @@ var _ = Describe("K4All Operator", Ordered, func() {
 				"metrics-server missing patched arg, got: %s", out)
 		})
 
-		// testdata/clusterconfig.yaml sets componentOverrides for cert-manager:
+		// Both testdata ClusterConfigs set componentOverrides for cert-manager:
 		// a podLabels value and a --set helmArg, each tagging one Deployment.
 		It("should apply ClusterConfig componentOverrides to the cert-manager release", func() {
 			labelOf := func(deployment string) string {
@@ -304,6 +512,18 @@ var _ = Describe("K4All Operator", Ordered, func() {
 	})
 
 	// ── ClusterConfig Status ────────────────────────────────────────────
+
+	// ── Ingress routes ──────────────────────────────────────────────────
+
+	Context("Ingress routes", func() {
+		It("should serve the k4all route shapes", func() {
+			controller := ingressController(initial)
+			if controller == "" {
+				Skip(releaseManifestFile + " installs no ingress controller")
+			}
+			expectRoutesServedBy(controller)
+		})
+	})
 
 	Context("ClusterConfig Status", func() {
 		It("should report active CNI as calico", func() {
@@ -415,58 +635,35 @@ var _ = Describe("K4All Operator", Ordered, func() {
 		})
 	})
 
-	// ── Upgrade to the next release set ─────────────────────────────────
+	// ── Upgrade through the next release sets ───────────────────────────
 
-	// With E2E_UPGRADE_TO set, the installed set is replaced by that
-	// ReleaseManifest, as the k4all v2.4.0 sync does on existing clusters.
-	Context("Upgrade to the next release set", func() {
-		It("should bring every component to its new version through upgradePath", func() {
-			if upgradeTo == "" {
+	// Each file in E2E_UPGRADE_TO replaces the installed set, as the
+	// ReleaseManifest sync of the matching k4all release does.
+	if len(upgradeChain) == 0 {
+		Context("Upgrade to the next release set", func() {
+			It("should bring every component to its new version through upgradePath", func() {
 				Skip("E2E_UPGRADE_TO not set: fresh install only")
-			}
-			target := readReleaseManifest(upgradeTo)
-
-			By("applying " + upgradeTo)
-			start := time.Now()
-			kubectlMustSucceed("apply", "-f", upgradeTo)
-
-			reached := map[string]time.Duration{}
-			Eventually(func() []string {
-				var pending []string
-				for name, comp := range target.Spec.Components {
-					if _, done := reached[name]; done {
-						continue
-					}
-					if componentStatus(name) == "Installed/"+comp.Version {
-						reached[name] = time.Since(start).Round(time.Second)
-						_, _ = fmt.Fprintf(GinkgoWriter, "upgrade: %s at %s after %s\n", name, comp.Version, reached[name])
-						continue
-					}
-					pending = append(pending, fmt.Sprintf("%s=%s (%s)", name, componentStatus(name), componentMessage(name)))
-				}
-				return pending
-			}, 60*time.Minute, pollInterval).Should(BeEmpty(), "components not at their target version")
-
-			By("checking that cert-manager ran every intermediate step")
-			// Every helm upgrade rolls a new controller ReplicaSet; old ones keep their image.
-			images := kubectlMustSucceed("get", "replicasets", "-n", "cert-manager",
-				"-l", "app.kubernetes.io/name=cert-manager,app.kubernetes.io/component=controller",
-				"-o", "jsonpath={.items[*].spec.template.spec.containers[0].image}")
-			for _, step := range target.Spec.Components["cert-manager"].UpgradePath {
-				Expect(images).To(ContainSubstring(":"+step.Version), "controller ReplicaSet images: %s", images)
-			}
-
-			By("waiting for the ReleaseManifest to be Ready again")
-			Eventually(func() string {
-				out, _ := kubectl("get", "releasemanifest", releaseManifestName,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				return out
-			}, testTimeout, pollInterval).Should(Equal("True"))
-			Eventually(func() bool {
-				return deploymentReady("cert-manager-webhook", "cert-manager")
-			}, testTimeout, pollInterval).Should(BeTrue())
+			})
 		})
-	})
+	}
+	previous := initial
+	for _, file := range upgradeChain {
+		from, to := previous, mustReadReleaseManifest(file)
+		previous = to
+		Context("Upgrade to "+file, func() {
+			It("should bring every component to its new version through upgradePath", func() {
+				upgradeTo(file, from, to)
+			})
+			if ingressController(from) == "nginx" && ingressController(to) == "traefik" {
+				It("should hand the nginx routes over to Traefik", expectNginxHandedOverToTraefik)
+			}
+			if controller := ingressController(to); controller != "" {
+				It("should serve the k4all route shapes through "+controller, func() {
+					expectRoutesServedBy(controller)
+				})
+			}
+		})
+	}
 
 	// ── Diagnostics ─────────────────────────────────────────────────────
 
@@ -489,9 +686,19 @@ var _ = Describe("K4All Operator", Ordered, func() {
 		_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Operator Logs (last 200 lines) ===\n%s\n", logs)
 
 		By("capturing pod status across namespaces")
-		for _, ns := range []string{operatorNamespace, "tigera-operator", "cert-manager", "kube-system"} {
+		for _, ns := range []string{operatorNamespace, "tigera-operator", "cert-manager", "kube-system",
+			"ingress-nginx", "traefik", routesNamespace} {
 			pods, _ := kubectl("get", "pods", "-n", ns, "-o", "wide")
 			_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Pods in %s ===\n%s\n", ns, pods)
+		}
+
+		By("capturing ingress controller logs for diagnostics")
+		for ns, selector := range map[string]string{
+			"ingress-nginx": "app.kubernetes.io/name=ingress-nginx",
+			"traefik":       "app.kubernetes.io/name=traefik",
+		} {
+			logs, _ := kubectl("logs", "-n", ns, "-l", selector, "--tail=100")
+			_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Logs in %s (last 100 lines) ===\n%s\n", ns, logs)
 		}
 	})
 })

@@ -49,6 +49,10 @@ type IngressConfig struct {
 	Nginx NginxIngressConfig `json:"nginx,omitempty"`
 	// +optional
 	Cilium CiliumIngressConfig `json:"cilium,omitempty"`
+	// Traefik replaces NGINX from k4all v2.6.0. When absent, Traefik takes the
+	// nginx settings, so clusters installed earlier keep their IP and default.
+	// +optional
+	Traefik *TraefikIngressConfig `json:"traefik,omitempty"`
 }
 
 // NginxIngressConfig configures the NGINX ingress controller.
@@ -57,6 +61,16 @@ type NginxIngressConfig struct {
 	// +optional
 	DedicatedIP string `json:"dedicatedIP,omitempty"`
 	// Whether NGINX should be the default IngressClass
+	// +optional
+	IsDefault bool `json:"isDefault,omitempty"`
+}
+
+// TraefikIngressConfig configures the Traefik ingress controller.
+type TraefikIngressConfig struct {
+	// Dedicated LoadBalancer IP; leave empty to use the node IP directly
+	// +optional
+	DedicatedIP string `json:"dedicatedIP,omitempty"`
+	// Whether Traefik should be the default IngressClass
 	// +optional
 	IsDefault bool `json:"isDefault,omitempty"`
 }

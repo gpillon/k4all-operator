@@ -168,6 +168,19 @@ spec:
                         description: Whether NGINX should be the default IngressClass
                         type: boolean
                     type: object
+                  traefik:
+                    description: |-
+                      Traefik replaces NGINX from k4all v2.6.0. When absent, Traefik takes the
+                      nginx settings, so clusters installed earlier keep their IP and default.
+                    properties:
+                      dedicatedIP:
+                        description: Dedicated LoadBalancer IP; leave empty to use
+                          the node IP directly
+                        type: string
+                      isDefault:
+                        description: Whether Traefik should be the default IngressClass
+                        type: boolean
+                    type: object
                 type: object
               networking:
                 description: Networking configuration

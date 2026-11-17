@@ -2,12 +2,9 @@ package hooks
 
 import (
 	"context"
-	"fmt"
-	"net"
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -49,22 +46,22 @@ func (h *IngressNginxHook) PreInstall(ctx context.Context, name string, spec k4a
 	isDefault := nginxCfg.IsDefault
 
 	if dedicatedIP != "" {
-		service["type"] = "LoadBalancer"
+		service["type"] = serviceTypeLoadBalancer
 		controller["hostNetwork"] = false
 		service["loadBalancerIP"] = dedicatedIP
 	} else {
-		clusterIP, err := h.detectClusterIP(ctx)
+		clusterIP, err := nodeInternalIP(ctx, h.client)
 		if err != nil {
 			h.log.V(1).Info("could not detect cluster IP, skipping externalIPs", "error", err)
 		} else {
 			service["externalIPs"] = []string{clusterIP}
 			service["loadBalancerIP"] = clusterIP
 		}
-		service["type"] = "LoadBalancer"
+		service["type"] = serviceTypeLoadBalancer
 	}
 
-	if haType == "kubevip" && dedicatedIP == "" {
-		service["loadBalancerClass"] = "kube-vip.io/kube-vip-class"
+	if haType == haTypeKubeVIP && dedicatedIP == "" {
+		service["loadBalancerClass"] = kubeVIPLoadBalancer
 	}
 
 	ingressClassResource, _ := controller["ingressClassResource"].(map[string]interface{})
@@ -75,7 +72,7 @@ func (h *IngressNginxHook) PreInstall(ctx context.Context, name string, spec k4a
 	controller["ingressClassResource"] = ingressClassResource
 
 	// When there's no dedicated IP and no kubevip, use hostPort for direct node access
-	if dedicatedIP == "" && haType != "kubevip" && isDefault {
+	if dedicatedIP == "" && haType != haTypeKubeVIP && isDefault {
 		h.log.Info("using hostPort mode for NGINX (no dedicated IP, no kubevip)")
 		hostPort := make(map[string]interface{})
 		hostPort["enabled"] = true
@@ -91,22 +88,4 @@ func (h *IngressNginxHook) PreInstall(ctx context.Context, name string, spec k4a
 	values["controller"] = controller
 
 	return values, nil
-}
-
-func (h *IngressNginxHook) detectClusterIP(ctx context.Context) (string, error) {
-	nodes := &corev1.NodeList{}
-	if err := h.client.List(ctx, nodes); err != nil {
-		return "", fmt.Errorf("list nodes: %w", err)
-	}
-
-	for _, node := range nodes.Items {
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == corev1.NodeInternalIP {
-				if ip := net.ParseIP(addr.Address); ip != nil {
-					return addr.Address, nil
-				}
-			}
-		}
-	}
-	return "", fmt.Errorf("no node with InternalIP found")
 }

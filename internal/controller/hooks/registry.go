@@ -46,6 +46,7 @@ func NewRegistry(c client.Client, log logr.Logger) *Registry {
 	r.hooks["cilium"] = NewCiliumHook(c, log.WithName("hook-cilium"))
 	r.hooks["headlamp"] = NewHeadlampHook(c, log.WithName("hook-headlamp"))
 	r.hooks["ingress-nginx"] = NewIngressNginxHook(c, log.WithName("hook-ingress-nginx"))
+	r.hooks["traefik"] = NewTraefikHook(c, log.WithName("hook-traefik"))
 	r.hooks["metallb"] = NewMetalLBHook(c, log.WithName("hook-metallb"))
 	r.hooks["topolvm"] = NewTopolvmHook(c, log.WithName("hook-topolvm"))
 	r.hooks["calico"] = NewCalicoHook(c, log.WithName("hook-calico"))
