@@ -11,19 +11,32 @@ concurrency:
 
 env:
   KIND_VERSION: v0.33.0
-  # Same Kubernetes minor as the k4all bootc image (pkgs.k8s.io core:/stable:/v1.35).
-  KIND_NODE_IMAGE: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
   KIND_CLUSTER: k4all-operator-test-e2e
   E2E_IMG: localhost/k4all-operator:e2e-test
 
 jobs:
   test-e2e:
-    name: E2E (kind)
+    name: E2E (kind ${{ matrix.kubernetes }})
     # Same-repo PRs are already covered by the push run on the head commit
     # (its checks show up on the PR); only PRs from forks need their own run.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Components must work on every Kubernetes minor a k4all cluster passes
+    # through: 1.35 (bootc image today), then 1.36 and 1.37. Node images are
+    # the ones published with KIND_VERSION.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kubernetes: "1.35"
+            node-image: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+          - kubernetes: "1.36"
+            node-image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+          - kubernetes: "1.37"
+            node-image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    env:
+      KIND_NODE_IMAGE: ${{ matrix.node-image }}
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -120,7 +133,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: kind-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: kind-logs-${{ matrix.kubernetes }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: kind-logs
           retention-days: 7
           if-no-files-found: ignore
