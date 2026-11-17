@@ -244,3 +244,18 @@ func skipsMinor(minors []Release, cur *semver.Version, r Release) bool {
 	}
 	return false
 }
+
+// Newer returns the releases after current that are not blocked, oldest first.
+func (g *Graph) Newer(current string) []Release {
+	cur, err := parseVersion(current)
+	if err != nil {
+		return nil
+	}
+	var out []Release
+	for _, r := range g.Releases {
+		if !r.Blocked && r.key.GreaterThan(cur) {
+			out = append(out, r)
+		}
+	}
+	return out
+}

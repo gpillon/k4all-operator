@@ -1,0 +1,449 @@
+package clusterupgrade
+
+import (
+	"encoding/json"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/upgradegraph"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+var now = time.Date(2026, 11, 21, 2, 30, 0, 0, time.UTC)
+
+// graph is a piece of the k4all ladder with a patch in the v2.6 stream.
+func graph(t *testing.T) *upgradegraph.Graph {
+	t.Helper()
+	rel := func(version, kind, minFrom, kubernetes string, fedora int) map[string]interface{} {
+		return map[string]interface{}{"version": version, "kind": kind, "minFrom": minFrom,
+			"kubernetes": kubernetes, "crio": kubernetes[:4], "fedora": fedora}
+	}
+	doc, err := json.Marshal(map[string]interface{}{"releases": []interface{}{
+		rel("v2.4.0", "minor", "v2.3.0", "1.35.10", 43),
+		rel("v2.5.0", "minor", "v2.4.0", "1.35.10", 45),
+		rel("v2.6.0", "minor", "v2.5.0", "1.35.10", 45),
+		rel("v2.6.1", "patch", "v2.6.0", "1.35.11", 45),
+		rel("v2.7.0", "minor", "v2.6.0", "1.36.6", 45),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := upgradegraph.Parse(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+// node is a Ready node whose k4all-upgrade reported its type and release.
+func node(name, role, release string) Node {
+	return Node{Name: name, Ready: true, Annotations: map[string]string{
+		k4allv1alpha1.NodeTypeAnnotation:    role,
+		k4allv1alpha1.NodeReleaseAnnotation: release,
+	}}
+}
+
+// firstHop is the hop from v2.5.0, where most cases start.
+const firstHop = "v2.6.0"
+
+func expectActions(t *testing.T, got []Action, want ...Action) {
+	t.Helper()
+	if len(got) == 0 && len(want) == 0 {
+		return
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("actions = %+v, want %+v", got, want)
+	}
+}
+
+func nodePhases(status k4allv1alpha1.ClusterUpgradeStatus) map[string]k4allv1alpha1.NodeUpgradePhase {
+	phases := map[string]k4allv1alpha1.NodeUpgradePhase{}
+	for _, n := range status.Nodes {
+		phases[n.Name] = n.Phase
+	}
+	return phases
+}
+
+func TestDecide_WithoutTargetReportsTheClusterRelease(t *testing.T) {
+	status, actions := Decide(Input{
+		Nodes: []Node{node("w-0", "worker", "v2.4.0"), node("cp-0", "bootstrap", "v2.5.0")},
+		Graph: graph(t),
+		Now:   now,
+	})
+
+	expectActions(t, actions)
+	if status.Phase != k4allv1alpha1.ClusterUpgradeIdle {
+		t.Errorf("phase = %s, want Idle", status.Phase)
+	}
+	if status.CurrentRelease != "v2.4.0" {
+		t.Errorf("currentRelease = %s, want v2.4.0, the oldest node's", status.CurrentRelease)
+	}
+	available := make([]string, 0, len(status.AvailableReleases))
+	for _, r := range status.AvailableReleases {
+		available = append(available, r.Version)
+	}
+	if want := []string{"v2.5.0", "v2.6.0", "v2.6.1", "v2.7.0"}; !reflect.DeepEqual(available, want) {
+		t.Errorf("availableReleases = %v, want %v", available, want)
+	}
+	order := make([]string, 0, len(status.Nodes))
+	for _, n := range status.Nodes {
+		order = append(order, n.Name+"/"+n.Role+"/"+n.Release)
+	}
+	if want := []string{"cp-0/bootstrap/v2.5.0", "w-0/worker/v2.4.0"}; !reflect.DeepEqual(order, want) {
+		t.Errorf("nodes = %v, want %v (upgrade order)", order, want)
+	}
+}
+
+func threeNodes(release string) []Node {
+	return []Node{node("w-0", "worker", release), node("cp-1", "control", release), node("cp-0", "bootstrap", release)}
+}
+
+func TestDecide_StartsWithTheBootstrapNode(t *testing.T) {
+	status, actions := Decide(Input{
+		Spec:  k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: "v2.7.0"},
+		Nodes: threeNodes("v2.5.0"),
+		Graph: graph(t),
+		Now:   now,
+	})
+
+	expectActions(t, actions, Action{Kind: Cordon, Node: "cp-0"})
+	if status.Phase != k4allv1alpha1.ClusterUpgradeProgressing || status.CurrentHop != firstHop {
+		t.Errorf("phase %s, currentHop %s; want Progressing at v2.6.0", status.Phase, status.CurrentHop)
+	}
+	wantPath := []k4allv1alpha1.Hop{
+		{Release: "v2.6.0", Kind: "minor", Phase: k4allv1alpha1.HopInProgress},
+		{Release: "v2.6.1", Kind: "patch", Phase: k4allv1alpha1.HopPending},
+		{Release: "v2.7.0", Kind: "minor", Phase: k4allv1alpha1.HopPending},
+	}
+	if !reflect.DeepEqual(status.Path, wantPath) {
+		t.Errorf("path = %+v, want %+v", status.Path, wantPath)
+	}
+	if want := map[string]k4allv1alpha1.NodeUpgradePhase{
+		"cp-0": k4allv1alpha1.NodeUpgradeDraining, "cp-1": k4allv1alpha1.NodeUpgradePending, "w-0": k4allv1alpha1.NodeUpgradePending,
+	}; !reflect.DeepEqual(nodePhases(status), want) {
+		t.Errorf("node phases = %v, want %v", nodePhases(status), want)
+	}
+	if started := status.Nodes[0].DrainStartedAt; started == nil || !started.Time.Equal(now) {
+		t.Errorf("cp-0 drainStartedAt = %v, want %v", started, now)
+	}
+}
+
+// draining is the state after the operator cordoned cp-0 at drainStart.
+func draining(t *testing.T, drainStart time.Time, podsLeft int) Input {
+	nodes := threeNodes("v2.5.0")
+	nodes[2].Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation] = "true"
+	nodes[2].Unschedulable = true
+	started := metav1.NewTime(drainStart)
+	return Input{
+		Spec:  k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: "v2.7.0", Drain: k4allv1alpha1.DrainSpec{TimeoutMinutes: 30}},
+		Nodes: nodes,
+		Previous: k4allv1alpha1.ClusterUpgradeStatus{Nodes: []k4allv1alpha1.NodeUpgradeStatus{
+			{Name: "cp-0", Phase: k4allv1alpha1.NodeUpgradeDraining, DrainStartedAt: &started},
+		}},
+		PodsLeft: map[string]int{"cp-0": podsLeft},
+		Graph:    graph(t),
+		Now:      now,
+	}
+}
+
+func TestDecide_EvictsUntilTheNodeIsDrained(t *testing.T) {
+	status, actions := Decide(draining(t, now.Add(-time.Minute), 2))
+
+	expectActions(t, actions, Action{Kind: Evict, Node: "cp-0"})
+	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeDraining || !got.DrainStartedAt.Time.Equal(now.Add(-time.Minute)) {
+		t.Errorf("cp-0 = %s since %v, want Draining since the cordon", got.Phase, got.DrainStartedAt)
+	}
+}
+
+func TestDecide_AsksForTheHopOnceDrained(t *testing.T) {
+	status, actions := Decide(draining(t, now.Add(-time.Minute), 0))
+
+	expectActions(t, actions, Action{Kind: SetTarget, Node: "cp-0", Release: firstHop})
+	if got := status.Nodes[0].Phase; got != k4allv1alpha1.NodeUpgradeUpgrading {
+		t.Errorf("cp-0 phase = %s, want Upgrading", got)
+	}
+}
+
+// upgrading is cp-0 running the v2.6.0 hop the operator asked for.
+func upgrading(t *testing.T, release string, annotations ...string) Input {
+	in := draining(t, now.Add(-10*time.Minute), 0)
+	cp0 := &in.Nodes[2]
+	cp0.Annotations[k4allv1alpha1.NodeReleaseAnnotation] = release
+	cp0.Annotations[k4allv1alpha1.NodeUpgradeTargetAnnotation] = firstHop
+	for i := 0; i+1 < len(annotations); i += 2 {
+		cp0.Annotations[annotations[i]] = annotations[i+1]
+	}
+	in.Previous.Nodes[0].Phase = k4allv1alpha1.NodeUpgradeUpgrading
+	return in
+}
+
+func TestDecide_ReportsTheHostPhaseOfTheHop(t *testing.T) {
+	status, actions := Decide(upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "REBOOT"))
+
+	expectActions(t, actions)
+	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeUpgrading || got.HostPhase != "REBOOT" {
+		t.Errorf("cp-0 = %s/%s, want Upgrading/REBOOT", got.Phase, got.HostPhase)
+	}
+	if status.Phase != k4allv1alpha1.ClusterUpgradeProgressing {
+		t.Errorf("phase = %s, want Progressing", status.Phase)
+	}
+}
+
+func TestDecide_FinishesTheNodeWhenTheHostIsDone(t *testing.T) {
+	status, actions := Decide(upgrading(t, "v2.6.0", k4allv1alpha1.NodeUpgradeDoneAnnotation, "v2.6.0"))
+
+	expectActions(t, actions, Action{Kind: Finish, Node: "cp-0"})
+	if got := status.Nodes[0].Phase; got != k4allv1alpha1.NodeUpgradeDone {
+		t.Errorf("cp-0 phase = %s, want Done", got)
+	}
+}
+
+func TestDecide_GoesOnWithTheNextNodeOfTheHop(t *testing.T) {
+	nodes := threeNodes("v2.5.0")
+	nodes[2].Annotations[k4allv1alpha1.NodeReleaseAnnotation] = "v2.6.0"
+	_, actions := Decide(Input{Spec: k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: "v2.7.0"}, Nodes: nodes, Graph: graph(t), Now: now})
+
+	expectActions(t, actions, Action{Kind: Cordon, Node: "cp-1"})
+}
+
+// Every node finishes a hop before any node starts the next one.
+func TestDecide_StartsTheNextHopFromTheBootstrapNode(t *testing.T) {
+	status, actions := Decide(Input{
+		Spec:  k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: "v2.7.0"},
+		Nodes: threeNodes("v2.6.0"),
+		Previous: k4allv1alpha1.ClusterUpgradeStatus{Path: []k4allv1alpha1.Hop{
+			{Release: "v2.6.0", Kind: "minor", Phase: k4allv1alpha1.HopInProgress},
+			{Release: "v2.6.1", Kind: "patch", Phase: k4allv1alpha1.HopPending},
+			{Release: "v2.7.0", Kind: "minor", Phase: k4allv1alpha1.HopPending},
+		}},
+		Graph: graph(t),
+		Now:   now,
+	})
+
+	expectActions(t, actions, Action{Kind: Cordon, Node: "cp-0"})
+	wantPath := []k4allv1alpha1.Hop{
+		{Release: "v2.6.0", Kind: "minor", Phase: k4allv1alpha1.HopDone},
+		{Release: "v2.6.1", Kind: "patch", Phase: k4allv1alpha1.HopInProgress},
+		{Release: "v2.7.0", Kind: "minor", Phase: k4allv1alpha1.HopPending},
+	}
+	if !reflect.DeepEqual(status.Path, wantPath) {
+		t.Errorf("path = %+v, want %+v", status.Path, wantPath)
+	}
+}
+
+// A single node has nowhere to move its pods to: it is only cordoned.
+func TestDecide_SingleNodeIsNotDrained(t *testing.T) {
+	_, actions := Decide(Input{
+		Spec:  k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: firstHop},
+		Nodes: []Node{node("k4all", "bootstrap", "v2.5.0")},
+		Graph: graph(t),
+		Now:   now,
+	})
+
+	expectActions(t, actions, Action{Kind: Cordon, Node: "k4all"}, Action{Kind: SetTarget, Node: "k4all", Release: firstHop})
+}
+
+func TestDecide_HoldOnTheNodeFailsTheUpgradeUntilItResumes(t *testing.T) {
+	status, actions := Decide(upgrading(t, "v2.5.0",
+		k4allv1alpha1.NodeUpgradePhaseAnnotation, "HOLD",
+		k4allv1alpha1.NodeUpgradeMessageAnnotation, "POST_BOOT: kubelet not Ready"))
+
+	expectActions(t, actions)
+	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeFailed || got.Message != "POST_BOOT: kubelet not Ready" {
+		t.Errorf("cp-0 = %s %q, want Failed with the host's message", got.Phase, got.Message)
+	}
+	if status.Phase != k4allv1alpha1.ClusterUpgradeFailed || status.Message != "cp-0: HOLD: POST_BOOT: kubelet not Ready" {
+		t.Errorf("phase %s %q, want Failed naming the node", status.Phase, status.Message)
+	}
+
+	resumed := upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "POST_BOOT")
+	resumed.Previous = status
+	if status, _ := Decide(resumed); status.Nodes[0].Phase != k4allv1alpha1.NodeUpgradeUpgrading {
+		t.Errorf("after resume cp-0 = %s, want Upgrading", status.Nodes[0].Phase)
+	}
+}
+
+// clear-hold --abandon on the node removes upgrade-target: only the retry
+// annotation (which clears the failed phase) asks for the hop again.
+func TestDecide_AbandonedHopStaysFailed(t *testing.T) {
+	in := upgrading(t, "v2.5.0",
+		k4allv1alpha1.NodeUpgradePhaseAnnotation, "ABANDONED",
+		k4allv1alpha1.NodeUpgradeMessageAnnotation, "abandoned by the admin")
+	delete(in.Nodes[2].Annotations, k4allv1alpha1.NodeUpgradeTargetAnnotation)
+
+	status, actions := Decide(in)
+	expectActions(t, actions)
+	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeFailed || got.Message != "abandoned by the admin" {
+		t.Errorf("cp-0 = %s %q, want Failed", got.Phase, got.Message)
+	}
+
+	in.Previous = status
+	delete(in.Nodes[2].Annotations, k4allv1alpha1.NodeUpgradePhaseAnnotation)
+	if status, actions := Decide(in); status.Nodes[0].Phase != k4allv1alpha1.NodeUpgradeFailed || len(actions) > 0 {
+		t.Errorf("later cp-0 = %s with %v, want still Failed and no action", status.Nodes[0].Phase, actions)
+	}
+}
+
+func TestDecide_DrainTimeoutFailsTheNode(t *testing.T) {
+	status, actions := Decide(draining(t, now.Add(-31*time.Minute), 2))
+
+	expectActions(t, actions)
+	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeFailed || got.Message != "drain timed out after 30 minutes, 2 pods left" {
+		t.Errorf("cp-0 = %s %q, want Failed on the drain timeout", got.Phase, got.Message)
+	}
+	if status.Phase != k4allv1alpha1.ClusterUpgradeFailed {
+		t.Errorf("phase = %s, want Failed", status.Phase)
+	}
+}
+
+func TestDecide_DrainTimeoutCanRunTheHopAnyway(t *testing.T) {
+	in := draining(t, now.Add(-31*time.Minute), 2)
+	in.Spec.Drain.ContinueOnTimeout = true
+
+	_, actions := Decide(in)
+	expectActions(t, actions, Action{Kind: SetTarget, Node: "cp-0", Release: firstHop})
+}
+
+func TestDecide_RetryDrainsTheFailedNodeAgain(t *testing.T) {
+	in := draining(t, now.Add(-31*time.Minute), 2)
+	failed, _ := Decide(in)
+	in.Previous = failed
+	in.Retry = true
+
+	status, actions := Decide(in)
+	expectActions(t, actions, Action{Kind: Evict, Node: "cp-0"})
+	if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeDraining || !got.DrainStartedAt.Time.Equal(now) {
+		t.Errorf("cp-0 = %s since %v, want Draining again from now", got.Phase, got.DrainStartedAt)
+	}
+}
+
+func target(release string) k4allv1alpha1.ClusterUpgradeSpec {
+	return k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: release}
+}
+
+func expectPhase(t *testing.T, status k4allv1alpha1.ClusterUpgradeStatus, phase k4allv1alpha1.ClusterUpgradePhase, message string) {
+	t.Helper()
+	if status.Phase != phase || status.Message != message {
+		t.Errorf("phase %s %q, want %s %q", status.Phase, status.Message, phase, message)
+	}
+}
+
+func TestDecide_PausedStartsNoNode(t *testing.T) {
+	spec := target("v2.7.0")
+	spec.Paused = true
+	status, actions := Decide(Input{Spec: spec, Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now})
+
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradePaused, "")
+}
+
+func TestDecide_PausedLetsTheNodeInProgressFinish(t *testing.T) {
+	in := upgrading(t, "v2.6.0", k4allv1alpha1.NodeUpgradeDoneAnnotation, "v2.6.0")
+	in.Spec.Paused = true
+
+	_, actions := Decide(in)
+	expectActions(t, actions, Action{Kind: Finish, Node: "cp-0"})
+}
+
+func TestDecide_SucceedsWhenEveryNodeRunsTheTarget(t *testing.T) {
+	status, actions := Decide(Input{
+		Spec:  target("v2.6.0"),
+		Nodes: threeNodes("v2.6.0"),
+		Previous: k4allv1alpha1.ClusterUpgradeStatus{Path: []k4allv1alpha1.Hop{
+			{Release: "v2.6.0", Kind: "minor", Phase: k4allv1alpha1.HopInProgress},
+		}},
+		Graph: graph(t),
+		Now:   now,
+	})
+
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeSucceeded, "")
+	if want := []k4allv1alpha1.Hop{{Release: "v2.6.0", Kind: "minor", Phase: k4allv1alpha1.HopDone}}; !reflect.DeepEqual(status.Path, want) {
+		t.Errorf("path = %+v, want %+v", status.Path, want)
+	}
+}
+
+// k4all-upgrade v2.4.0 writes the release and node-type annotations.
+func TestDecide_NodeWithoutAnnotationsStopsTheUpgrade(t *testing.T) {
+	nodes := threeNodes("v2.5.0")
+	delete(nodes[0].Annotations, k4allv1alpha1.NodeTypeAnnotation)
+	status, actions := Decide(Input{Spec: target("v2.7.0"), Nodes: nodes, Graph: graph(t), Now: now})
+
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeFailed,
+		"w-0 has no k4all.magesgate.com/node-type annotation: is k4all-upgrade v2.4.0 or later running there?")
+}
+
+func TestDecide_WaitsForEveryNodeToBeReady(t *testing.T) {
+	nodes := threeNodes("v2.5.0")
+	nodes[0].Ready = false
+	status, actions := Decide(Input{Spec: target("v2.7.0"), Nodes: nodes, Graph: graph(t), Now: now})
+
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, "v2.6.0: waiting for w-0 to be Ready")
+}
+
+// A hop k4all-upgrade started on its own (a patch in its window) runs first.
+func TestDecide_WaitsForAHopTheNodeStartedItself(t *testing.T) {
+	nodes := threeNodes("v2.5.0")
+	nodes[1].Annotations["k4all.magesgate.com/upgrade-in-progress"] = "v2.5.0->v2.5.1"
+	status, actions := Decide(Input{Spec: target("v2.7.0"), Nodes: nodes, Graph: graph(t), Now: now})
+
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, "v2.6.0: waiting for the hop cp-1 runs on its own (v2.5.0->v2.5.1)")
+}
+
+func TestDecide_EmptiedTargetUncordonsTheDrainingNode(t *testing.T) {
+	in := draining(t, now.Add(-time.Minute), 2)
+	in.Spec.TargetRelease = ""
+
+	status, actions := Decide(in)
+	expectActions(t, actions, Action{Kind: Finish, Node: "cp-0"})
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeIdle, "")
+}
+
+func TestDecide_EmptiedTargetLetsTheHopInProgressFinish(t *testing.T) {
+	in := upgrading(t, "v2.5.0", k4allv1alpha1.NodeUpgradePhaseAnnotation, "REBOOT")
+	in.Spec.TargetRelease = ""
+
+	status, actions := Decide(in)
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, "stopping after cp-0 finishes its hop")
+}
+
+func TestDecide_RefusesADowngrade(t *testing.T) {
+	status, actions := Decide(Input{Spec: target("v2.4.0"), Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now})
+
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeFailed, "targetRelease v2.4.0 is older than the cluster's release v2.5.0")
+}
+
+func TestDecide_ReportsATargetTheGraphCannotReach(t *testing.T) {
+	status, _ := Decide(Input{Spec: target("v2.9.0"), Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now})
+
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeFailed,
+		"no upgrade path: release v2.9.0 is not in the upgrade graph or is blocked")
+}
+
+func TestDecide_WaitsForTheGraph(t *testing.T) {
+	status, actions := Decide(Input{
+		Spec: target("v2.7.0"), Nodes: threeNodes("v2.5.0"), Now: now,
+		GraphErr: errors.New("GET upgrade-graph.json: 503"),
+	})
+
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, "cannot read the upgrade graph: GET upgrade-graph.json: 503")
+}
+
+// Without the graph the drained node keeps its cordon until the hop is known.
+func TestDecide_DrainingNodeWaitsForTheGraph(t *testing.T) {
+	in := draining(t, now.Add(-time.Minute), 0)
+	in.Graph, in.GraphErr = nil, errors.New("GET upgrade-graph.json: 503")
+
+	status, actions := Decide(in)
+	expectActions(t, actions)
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, "cannot read the upgrade graph: GET upgrade-graph.json: 503")
+}
