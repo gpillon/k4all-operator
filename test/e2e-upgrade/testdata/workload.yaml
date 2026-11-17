@@ -1,0 +1,31 @@
+# Pods the drain must move off each node before its hop.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workload
+  namespace: k4all-e2e-upgrade
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: workload
+  template:
+    metadata:
+      labels:
+        app: workload
+    spec:
+      terminationGracePeriodSeconds: 1
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: workload
+      containers:
+        - name: sleep
+          image: busybox:1.37
+          command: ["sleep", "infinity"]

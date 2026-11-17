@@ -16,7 +16,7 @@ env:
 
 jobs:
   test-e2e:
-    name: E2E (kind ${{ matrix.kubernetes }})
+    name: E2E (kind ${{ matrix.kubernetes }}${{ matrix.suite && format(', {0}', matrix.suite) || '' }})
     # Same-repo PRs are already covered by the push run on the head commit
     # (its checks show up on the PR); only PRs from forks need their own run.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
@@ -45,11 +45,20 @@ jobs:
             node-image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
             cluster-config: test/e2e/testdata/clusterconfig-v2.6.yaml
             release-manifest: test/e2e/testdata/releasemanifest-v2.6.yaml
+          # ClusterUpgrade on three nodes, a fake k4all-upgrade playing the
+          # nodes' side of the protocol (test/e2e-upgrade).
+          - kubernetes: "1.35"
+            suite: cluster-upgrade
+            node-image: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+            kind-config: test/e2e-upgrade/kind.yaml
+            e2e-suite: ./test/e2e-upgrade/
     env:
       KIND_NODE_IMAGE: ${{ matrix.node-image }}
       E2E_CLUSTER_CONFIG: ${{ matrix.cluster-config }}
       E2E_RELEASE_MANIFEST: ${{ matrix.release-manifest }}
       E2E_UPGRADE_TO: ${{ matrix.upgrade-to }}
+      KIND_CONFIG: ${{ matrix.kind-config }}
+      E2E_SUITE: ${{ matrix.e2e-suite || './test/e2e/' }}
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -126,7 +135,7 @@ jobs:
       # 'make setup-test-e2e' (called by test-e2e) skips creation when the
       # cluster already exists, so the pinned node image is used.
       - name: Create kind cluster
-        run: kind create cluster --name "${KIND_CLUSTER}" --image "${KIND_NODE_IMAGE}" --wait 2m
+        run: kind create cluster --name "${KIND_CLUSTER}" --image "${KIND_NODE_IMAGE}" ${KIND_CONFIG:+--config "${KIND_CONFIG}"} --wait 2m
 
       - name: Load operator image into kind
         run: make kind-load-image IMG="${E2E_IMG}" CONTAINER_TOOL=docker KIND_CLUSTER="${KIND_CLUSTER}"
@@ -135,7 +144,7 @@ jobs:
         run: make build-installer IMG="${E2E_IMG}"
 
       - name: Running Test e2e
-        run: make test-e2e KIND_CLUSTER="${KIND_CLUSTER}"
+        run: make test-e2e KIND_CLUSTER="${KIND_CLUSTER}" E2E_SUITE="${E2E_SUITE}"
 
       # ── Diagnostics on failure ────────────────────────────────────────
       - name: Export kind logs
@@ -146,7 +155,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: kind-logs-${{ matrix.kubernetes }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: kind-logs-${{ matrix.kubernetes }}${{ matrix.suite && format('-{0}', matrix.suite) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: kind-logs
           retention-days: 7
           if-no-files-found: ignore

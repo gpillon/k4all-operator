@@ -119,6 +119,9 @@ KIND_CLUSTER ?= k4all-operator-test-e2e
 # kubelet would resolve an unqualified image to docker.io/library/<name> and fail to find it.
 E2E_IMG ?= localhost/k4all-operator:e2e-test
 E2E_TIMEOUT ?= 75m
+# The e2e suite to run: ./test/e2e/ (components) or ./test/e2e-upgrade/
+# (ClusterUpgrade, on the three-node cluster of test/e2e-upgrade/kind.yaml).
+E2E_SUITE ?= ./test/e2e/
 
 .PHONY: test-all
 test-all: ## Full e2e: build image, create Kind cluster, deploy, test, cleanup
@@ -163,7 +166,7 @@ endif
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run e2e tests against an existing Kind cluster (no image build).
-	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT)
+	KIND_CLUSTER=$(KIND_CLUSTER) go test $(E2E_SUITE) -v -ginkgo.v -timeout $(E2E_TIMEOUT)
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
