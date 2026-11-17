@@ -123,7 +123,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if r.engine == nil {
 		r.engine = engine.New(r.Client, r.RestConfig, r.Log.WithName("engine"), r.ToolsImage)
-		r.hookReg = hooks.NewRegistry(r.Client, r.Log)
+		r.hookReg = hooks.NewRegistry(r.Client, r.Log, hooks.WithRestConfig(r.RestConfig))
 	}
 
 	// The release may need the ClusterConfig in a new shape before its

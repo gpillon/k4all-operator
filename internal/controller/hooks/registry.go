@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -38,14 +39,31 @@ type Registry struct {
 	hooks map[string]Hook
 }
 
-func NewRegistry(c client.Client, log logr.Logger) *Registry {
+// Option configures a Registry.
+type Option func(*options)
+
+type options struct{ restConfig *rest.Config }
+
+// WithRestConfig lets hooks read the API server directly, e.g. to tell
+// whether a namespace a removed component left is empty.
+func WithRestConfig(cfg *rest.Config) Option {
+	return func(o *options) { o.restConfig = cfg }
+}
+
+func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	r := &Registry{
 		hooks: make(map[string]Hook),
 	}
 	r.hooks["kubevirt"] = NewVirtHook(c, log.WithName("hook-virt"))
 	r.hooks["cilium"] = NewCiliumHook(c, log.WithName("hook-cilium"))
 	r.hooks["headlamp"] = NewHeadlampHook(c, log.WithName("hook-headlamp"))
-	r.hooks["ingress-nginx"] = NewIngressNginxHook(c, log.WithName("hook-ingress-nginx"))
+	nginx := NewIngressNginxHook(c, log.WithName("hook-ingress-nginx"))
+	nginx.restConfig = o.restConfig
+	r.hooks["ingress-nginx"] = nginx
 	r.hooks["traefik"] = NewTraefikHook(c, log.WithName("hook-traefik"))
 	r.hooks["metallb"] = NewMetalLBHook(c, log.WithName("hook-metallb"))
 	r.hooks["topolvm"] = NewTopolvmHook(c, log.WithName("hook-topolvm"))

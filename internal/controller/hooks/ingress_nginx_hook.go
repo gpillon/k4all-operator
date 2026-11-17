@@ -3,8 +3,14 @@ package hooks
 import (
 	"context"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -15,6 +21,10 @@ type IngressNginxHook struct {
 	BaseHook
 	client client.Client
 	log    logr.Logger
+	// restConfig reaches the API server directly, for the namespace check.
+	restConfig *rest.Config
+	// namespace of the release, ingress-nginx; set apart only by tests.
+	namespace string
 }
 
 func NewIngressNginxHook(c client.Client, log logr.Logger) *IngressNginxHook {
@@ -88,4 +98,50 @@ func (h *IngressNginxHook) PreInstall(ctx context.Context, name string, spec k4a
 	values["controller"] = controller
 
 	return values, nil
+}
+
+// ingressNginxNamespace is where the ingress-nginx release lives.
+const ingressNginxNamespace = "ingress-nginx"
+
+// What ingress-nginx leaves outside its Helm release: the certificate the
+// admission certgen Job writes, and the controller's leader-election Lease.
+var ingressNginxLeftovers = []client.Object{
+	&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "ingress-nginx-admission"}},
+	&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: "ingress-nginx-leader"}},
+}
+
+// Cleanup runs after helm uninstall (management Removed, k4all v2.4.0). It
+// deletes what ingress-nginx left outside its release, then its namespace if
+// nothing else is in it. All best effort, only logged: an error here would
+// leave ingress-nginx Failed and stop the host's sync.
+func (h *IngressNginxHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha1.ClusterConfigSpec) error {
+	ns := h.namespace
+	if ns == "" {
+		ns = ingressNginxNamespace
+	}
+	for _, o := range ingressNginxLeftovers {
+		obj := o.DeepCopyObject().(client.Object)
+		obj.SetNamespace(ns)
+		if err := h.client.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+			h.log.Info("cannot delete an ingress-nginx leftover", "namespace", ns, "name", obj.GetName(), "error", err.Error())
+		}
+	}
+	if h.restConfig == nil {
+		return nil
+	}
+	left, err := namespaceLeftovers(ctx, h.restConfig, ns)
+	switch {
+	case err != nil:
+		h.log.Info("namespace kept: cannot tell whether it is empty", "namespace", ns, "error", err.Error())
+	case len(left) > 0:
+		h.log.Info("namespace kept: it holds objects ingress-nginx did not leave", "namespace", ns, "objects", left)
+	default:
+		err := h.client.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		if err != nil && !errors.IsNotFound(err) {
+			h.log.Info("cannot delete the namespace", "namespace", ns, "error", err.Error())
+		} else if err == nil {
+			h.log.Info("deleted the namespace ingress-nginx left", "namespace", ns)
+		}
+	}
+	return nil
 }
