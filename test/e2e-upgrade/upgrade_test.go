@@ -104,6 +104,7 @@ type hopRecord struct {
 	node, release string
 	cordoned      bool
 	podsLeft      []string // pods the drain should have moved
+	back          []string // pods that tolerate the cordon, there when the hop started
 	otherTargets  []string // other nodes asked for a hop at the same time
 	syncPod       string   // bootstrap only: how the SYNC pod ended, Ready or Pending
 }
@@ -308,7 +309,11 @@ func (a *fakeAgent) start(n corev1.Node, target string, nodes *corev1.NodeList) 
 	pods := &corev1.PodList{}
 	if err := getJSON(pods, "get", "pods", "-A", "--field-selector", "spec.nodeName="+n.Name); err == nil {
 		for _, p := range pods.Items {
-			if movable(p) {
+			switch {
+			case !movable(p):
+			case toleratesCordon(p):
+				rec.back = append(rec.back, p.Namespace+"/"+p.Name)
+			default:
 				rec.podsLeft = append(rec.podsLeft, p.Namespace+"/"+p.Name)
 			}
 		}
@@ -317,6 +322,19 @@ func (a *fakeAgent) start(n corev1.Node, target string, nodes *corev1.NodeList) 
 	a.hops = append(a.hops, rec)
 	a.running[n.Name] = &hopRun{started: time.Now(), record: len(a.hops) - 1}
 	a.mu.Unlock()
+}
+
+// toleratesCordon: its controller may put such a pod back on the cordoned
+// node, so the drain cannot be expected to have moved it (kubectl drain
+// does not wait for it either).
+func toleratesCordon(p corev1.Pod) bool {
+	for _, t := range p.Spec.Tolerations {
+		if t.Operator == corev1.TolerationOpExists && (t.Key == "" || t.Key == corev1.TaintNodeUnschedulable) &&
+			(t.Effect == "" || t.Effect == corev1.TaintEffectNoSchedule) {
+			return true
+		}
+	}
+	return false
 }
 
 // movable is a pod the drain must have moved: not a DaemonSet or static pod,
@@ -353,6 +371,7 @@ var _ = Describe("ClusterUpgrade", Ordered, func() {
 		kubectlMustSucceed("apply", "-f", "test/e2e-upgrade/testdata/workload.yaml")
 		kubectlMustSucceed("rollout", "status", "-n", testNamespace, "deployment/graph", "--timeout=3m")
 		kubectlMustSucceed("rollout", "status", "-n", testNamespace, "deployment/workload", "--timeout=3m")
+		kubectlMustSucceed("rollout", "status", "-n", testNamespace, "deployment/comes-back", "--timeout=3m")
 
 		By("starting the fake k4all-upgrade on every node")
 		nodes := &corev1.NodeList{}
@@ -387,8 +406,8 @@ var _ = Describe("ClusterUpgrade", Ordered, func() {
 			close(agent.stop)
 			<-agent.done
 			for _, h := range agent.hops {
-				_, _ = fmt.Fprintf(GinkgoWriter, "hop %s on %s: cordoned=%v podsLeft=%v others=%v syncPod=%s\n",
-					h.release, h.node, h.cordoned, h.podsLeft, h.otherTargets, h.syncPod)
+				_, _ = fmt.Fprintf(GinkgoWriter, "hop %s on %s: cordoned=%v podsLeft=%v back=%v others=%v syncPod=%s\n",
+					h.release, h.node, h.cordoned, h.podsLeft, h.back, h.otherTargets, h.syncPod)
 			}
 			for _, e := range agent.errs {
 				_, _ = fmt.Fprintf(GinkgoWriter, "fake agent: %s\n", e)
@@ -430,7 +449,8 @@ var _ = Describe("ClusterUpgrade", Ordered, func() {
 
 	It("should upgrade one drained node at a time, bootstrap first, every node a hop before the next", func() {
 		kubectlMustSucceed("patch", "clusterupgrade", k4allv1alpha1.ClusterUpgradeName, "--type=merge",
-			"-p", `{"spec":{"targetRelease":"`+targetRelease+`"}}`)
+			// A drain stuck on comes-back fails in minutes, not after the default 30.
+			"-p", `{"spec":{"targetRelease":"`+targetRelease+`","drain":{"timeoutMinutes":3}}}`)
 
 		Eventually(func(g Gomega) {
 			cu, err := clusterUpgrade()
