@@ -30,6 +30,7 @@ import (
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
 	"github.com/gpillon/k4all-operator/internal/engine"
+	"github.com/gpillon/k4all-operator/internal/migrations"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -123,6 +124,17 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if r.engine == nil {
 		r.engine = engine.New(r.Client, r.RestConfig, r.Log.WithName("engine"), r.ToolsImage)
 		r.hookReg = hooks.NewRegistry(r.Client, r.Log)
+	}
+
+	// The release may need the ClusterConfig in a new shape before its
+	// components are applied from it.
+	if migrated, err := migrations.Run(ctx, r.Client, rm, config); err != nil {
+		log.Error(err, "ClusterConfig migration failed")
+		engine.SetReadyCondition(rm, metav1.ConditionFalse, "MigrationFailed", err.Error())
+		_ = r.patchStatus(ctx, rm)
+		return ctrl.Result{}, err
+	} else if migrated {
+		log.Info("ClusterConfig migrated", "migrations", config.Annotations[migrations.AppliedAnnotation])
 	}
 
 	// Handle force-resync annotation.
