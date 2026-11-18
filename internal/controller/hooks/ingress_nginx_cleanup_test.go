@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -102,7 +103,7 @@ func TestIngressNginxCleanup_DeletesTheNamespaceItLeft(t *testing.T) {
 	c, cfg := envtestClient(t)
 	ns := "ingress-nginx-left"
 	leftNamespace(t, c, ns)
-	h := &IngressNginxHook{client: c, log: logr.Discard(), restConfig: cfg, namespace: ns}
+	h := &IngressNginxHook{client: c, log: logr.Discard(), restConfig: cfg, namespace: ns, settle: 2 * time.Second, poll: 200 * time.Millisecond}
 
 	if err := h.Cleanup(context.Background(), "ingress-nginx", k4allv1alpha1.ClusterConfigSpec{}); err != nil {
 		t.Fatal(err)
@@ -120,7 +121,7 @@ func TestIngressNginxCleanup_KeepsANamespaceWithOtherObjects(t *testing.T) {
 	if err := c.Create(context.Background(), mine); err != nil {
 		t.Fatal(err)
 	}
-	h := &IngressNginxHook{client: c, log: logr.Discard(), restConfig: cfg, namespace: ns}
+	h := &IngressNginxHook{client: c, log: logr.Discard(), restConfig: cfg, namespace: ns, settle: 2 * time.Second, poll: 200 * time.Millisecond}
 
 	if err := h.Cleanup(context.Background(), "ingress-nginx", k4allv1alpha1.ClusterConfigSpec{}); err != nil {
 		t.Fatal(err)
@@ -141,9 +142,40 @@ func TestIngressNginxCleanup_KeepsANamespaceWithOtherObjects(t *testing.T) {
 // the namespace is best effort, only logged.
 func TestIngressNginxCleanup_NeverFailsTheRemoval(t *testing.T) {
 	c, _ := envtestClient(t)
-	h := &IngressNginxHook{client: c, log: logr.Discard(), restConfig: &rest.Config{Host: "http://127.0.0.1:1"}, namespace: "ingress-nginx-none"}
+	h := &IngressNginxHook{client: c, log: logr.Discard(), restConfig: &rest.Config{Host: "http://127.0.0.1:1"}, namespace: "ingress-nginx-none",
+		settle: time.Second, poll: 200 * time.Millisecond}
 
 	if err := h.Cleanup(context.Background(), "ingress-nginx", k4allv1alpha1.ClusterConfigSpec{}); err != nil {
 		t.Errorf("Cleanup: %v, want nil", err)
+	}
+}
+
+// helm uninstall does not wait for what it deletes: right after it, the
+// namespace still holds objects on their way out. In the e2e run the
+// ingress-nginx controller pod was still listed without an owner; it was
+// gone a moment later. The cleanup waits for them before it decides.
+func TestIngressNginxCleanup_WaitsForWhatTheUninstallIsDeleting(t *testing.T) {
+	c, cfg := envtestClient(t)
+	ns := "ingress-nginx-going"
+	leftNamespace(t, c, ns)
+	going := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ingress-nginx-controller-5sgxq"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "x"}}},
+	}
+	if err := c.Create(context.Background(), going); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(time.Second)
+		_ = c.Delete(context.Background(), going, client.GracePeriodSeconds(0))
+	}()
+	h := &IngressNginxHook{client: c, log: logr.Discard(), restConfig: cfg, namespace: ns,
+		settle: 10 * time.Second, poll: 200 * time.Millisecond}
+
+	if err := h.Cleanup(context.Background(), "ingress-nginx", k4allv1alpha1.ClusterConfigSpec{}); err != nil {
+		t.Fatal(err)
+	}
+	if !deleting(t, c, ns) {
+		t.Errorf("namespace %s kept: the pod on its way out was counted", ns)
 	}
 }

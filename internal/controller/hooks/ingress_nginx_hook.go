@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"context"
+	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +26,9 @@ type IngressNginxHook struct {
 	restConfig *rest.Config
 	// namespace of the release, ingress-nginx; set apart only by tests.
 	namespace string
+	// How long and how often the namespace check waits for what the
+	// uninstall is still deleting; 0 means the defaults (tests shorten them).
+	settle, poll time.Duration
 }
 
 func NewIngressNginxHook(c client.Client, log logr.Logger) *IngressNginxHook {
@@ -112,7 +116,8 @@ var ingressNginxLeftovers = []client.Object{
 
 // Cleanup runs after helm uninstall (management Removed, k4all v2.4.0). It
 // deletes what ingress-nginx left outside its release, then its namespace if
-// nothing else is in it. All best effort, only logged: an error here would
+// nothing else is in it once what the uninstall deletes is gone (up to 30
+// seconds). All best effort, only logged: an error here would
 // leave ingress-nginx Failed and stop the host's sync.
 func (h *IngressNginxHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha1.ClusterConfigSpec) error {
 	ns := h.namespace
@@ -129,7 +134,7 @@ func (h *IngressNginxHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha
 	if h.restConfig == nil {
 		return nil
 	}
-	left, err := namespaceLeftovers(ctx, h.restConfig, ns)
+	left, err := h.waitForLeftovers(ctx, ns)
 	switch {
 	case err != nil:
 		h.log.Info("namespace kept: cannot tell whether it is empty", "namespace", ns, "error", err.Error())
@@ -144,4 +149,39 @@ func (h *IngressNginxHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha
 		}
 	}
 	return nil
+}
+
+// Defaults for how long and how often the cleanup waits for what helm
+// uninstall is still deleting. Short: removals run before the other
+// components, and Traefik, which replaces ingress-nginx, comes after.
+const (
+	cleanupSettle = 30 * time.Second
+	cleanupPoll   = 2 * time.Second
+)
+
+// waitForLeftovers checks the namespace until nothing is left in it, or
+// until the settle time: helm uninstall does not wait for what it deletes,
+// and right after it the namespace still holds objects on their way out
+// (in an e2e run, the controller pod, listed without its owner). It returns
+// the last check.
+func (h *IngressNginxHook) waitForLeftovers(ctx context.Context, ns string) ([]string, error) {
+	settle, poll := h.settle, h.poll
+	if settle == 0 {
+		settle = cleanupSettle
+	}
+	if poll == 0 {
+		poll = cleanupPoll
+	}
+	deadline := time.Now().Add(settle)
+	for {
+		left, err := namespaceLeftovers(ctx, h.restConfig, ns)
+		if (err == nil && len(left) == 0) || time.Now().After(deadline) {
+			return left, err
+		}
+		select {
+		case <-ctx.Done():
+			return left, ctx.Err()
+		case <-time.After(poll):
+		}
+	}
 }
