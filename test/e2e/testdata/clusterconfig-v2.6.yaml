@@ -1,6 +1,6 @@
-# ClusterConfig of a cluster installed with k4all v2.6.0 or later: the default
+# ClusterConfig of a cluster installed with k4all v2.4.0 or later: the default
 # config has ingress.traefik and no nginx key. clusterconfig.yaml is the one of
-# clusters installed earlier, which Traefik falls back to.
+# clusters installed earlier, which the operator moves to ingress.traefik.
 apiVersion: k4all.magesgate.com/v1alpha1
 kind: ClusterConfig
 metadata:

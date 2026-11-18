@@ -1,8 +1,9 @@
-# Component set of k4all v2.4.0 (fcos-k8s bootc/overlay/usr/local/share/k4all-release.yaml),
-# limited to the components the e2e suite installs. On Kubernetes 1.35 the
-# suite installs releasemanifest.yaml (the v2.2.x set), then applies this file
-# as the v2.4.0 ReleaseManifest sync does, then releasemanifest-v2.6.yaml; with
-# clusterconfig-v2.4-nginx-dedicated-ip.yaml it installs this file directly.
+# Component set of k4all v2.4.0 (fcos-k8s bootc/overlay/usr/local/share/k4all-release.yaml
+# at 7bfaf85), limited to the components the e2e suite installs: the first
+# sync with operator v0.5.0, Traefik in place of ingress-nginx (Removed).
+# traefik, headlamp (with the k4all plugin) and ingress-nginx as released;
+# Calico's pod network fits kind. On Kubernetes 1.35 the suite applies it
+# over releasemanifest.yaml (the v2.2.x set).
 apiVersion: k4all.magesgate.com/v1alpha1
 kind: ReleaseManifest
 metadata:
@@ -13,7 +14,6 @@ spec:
     repository: ghcr.io/gpillon/k4all-bootc
     imageTag: latest
   components:
-    # CNI — manifest type with inline manifests, tests manifest install + inline
     calico:
       type: manifest
       version: "v3.33.1"
@@ -44,7 +44,6 @@ spec:
             name: default
           spec: {}
 
-    # Certificates — helm type, tests helm installation
     cert-manager:
       type: helm
       version: "v1.21.3"
@@ -63,7 +62,6 @@ spec:
       dependsOn:
         - calico
 
-    # Monitoring — manifest type with patches, tests patching
     metrics-server:
       type: manifest
       # Keep in sync with bootc/overlay/usr/local/share/k4all-release.yaml in fcos-k8s.
@@ -81,19 +79,25 @@ spec:
           type: strategic
           patch: '{"spec":{"template":{"spec":{"containers":[{"name":"metrics-server","args":["--cert-dir=/tmp","--secure-port=10250","--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname","--kubelet-use-node-status-port","--metric-resolution=15s","--kubelet-insecure-tls"]}]}}}}'
 
-    # MetalLB announces ingress.nginx.dedicatedIP; without one it is not installed.
     metallb:
       type: manifest
+      # v0.15.3 fails on Kubernetes 1.36 (metallb#3034, fixed in v0.16.0).
       version: "v0.16.2"
       source: "https://raw.githubusercontent.com/metallb/metallb/{{ version }}/config/manifests/metallb-native.yaml"
       namespace: metallb-system
       dependsOn:
         - calico
+      custom: {}
 
-    # Ingress — the k4all route shapes are served through it before v2.6.0.
     ingress-nginx:
       type: helm
-      version: "4.15.1"
+      # Replaced by Traefik in v2.4.0: the operator uninstalls it before it
+      # installs traefik (Removed components go first), which frees the
+      # LoadBalancer IP and the host ports. Never upgraded: it stays at the
+      # version clusters ran before v2.4.0 (the repo is archived, and its
+      # last release, 4.15.1, is tested only up to Kubernetes 1.35).
+      management: Removed
+      version: "4.14.3"
       repo: "https://kubernetes.github.io/ingress-nginx"
       chart: ingress-nginx
       namespace: ingress-nginx
@@ -111,10 +115,71 @@ spec:
       dependsOn:
         - cert-manager
         - metallb
+      custom: {}
 
-    # Dashboard — the operator's headlamp hook publishes it on
-    # dashboard.<ip>.nip.io through the ingress controller. Without the k4all
-    # plugin initContainer of the real manifest.
+    traefik:
+      type: helm
+      # Traefik v3.7.18. k4all's own routes (Headlamp, Argo CD) use the
+      # traefik class. Its Ingress-NGINX provider still serves users'
+      # Ingresses of class "nginx" with their nginx.ingress.kubernetes.io
+      # annotations (ssl-passthrough included), until they move to traefik.
+      # The operator's Traefik hook adds the service, the host ports and the
+      # default class from ClusterConfig spec.ingress.traefik (or
+      # spec.ingress.nginx on clusters installed before v2.4.0, until the
+      # operator moves it).
+      version: "42.4.0"
+      repo: "https://traefik.github.io/charts"
+      chart: traefik
+      namespace: traefik
+      values:
+        deployment:
+          kind: DaemonSet
+        nodeSelector:
+          kubernetes.io/os: linux
+          node-role.kubernetes.io/control-plane: ""
+        providers:
+          kubernetesIngressNGINX:
+            enabled: true
+          kubernetesIngress:
+            enabled: true
+          kubernetesCRD:
+            enabled: true
+        ingressClass:
+          enabled: true
+          name: traefik
+        extraObjects:
+          # For users' Ingresses only. The provider only follows Ingresses
+          # whose class has the ingress-nginx controller; the chart creates
+          # only the traefik class. Never the default class: the hook makes
+          # traefik the default instead.
+          - apiVersion: networking.k8s.io/v1
+            kind: IngressClass
+            metadata:
+              name: nginx
+              annotations:
+                ingressclass.kubernetes.io/is-default-class: "false"
+            spec:
+              controller: k8s.io/ingress-nginx
+          # What ingress-nginx's force-ssl-redirect did: routes name it with
+          # traefik.ingress.kubernetes.io/router.middlewares:
+          # traefik-redirect-https@kubernetescrd. On the websecure entry
+          # point the request is already https and goes through.
+          - apiVersion: traefik.io/v1alpha1
+            kind: Middleware
+            metadata:
+              name: redirect-https
+              namespace: traefik
+            spec:
+              redirectScheme:
+                scheme: https
+                permanent: true
+      # MetalLB only: the operator's helm wait needs the LoadBalancer IP.
+      # Traefik does not use cert-manager; that dependency came from
+      # ingress-nginx.
+      dependsOn:
+        - metallb
+      custom: {}
+
     headlamp:
       type: helm
       version: "0.46.0"
@@ -122,10 +187,74 @@ spec:
       chart: headlamp
       namespace: headlamp
       values:
+        config:
+          oidc:
+            clientID: ""
+            clientSecret: ""
+            issuerURL: ""
+            scopes: ""
+          pluginsDir: /headlamp/plugins
         service:
-          type: ClusterIP
+          type: NodePort
           port: 4466
+          nodePort: 32323
+        # The dashboard route is the Ingress of the operator's headlamp hook
+        # (class traefik and the redirect Middleware, k4all-operator v0.4.2
+        # and later), plus the FQDN rule of update-routes.sh: the chart's own
+        # Ingress stays off. Turned on through componentOverrides, it uses
+        # Traefik too.
         ingress:
           enabled: false
+          ingressClassName: traefik
+          annotations:
+            traefik.ingress.kubernetes.io/router.middlewares: traefik-redirect-https@kubernetescrd
+        # The k4all Headlamp plugin (headlamp-plugin/ in this repo), pinned
+        # like every component: an initContainer copies it from its image
+        # into an emptyDir mounted read-only at <pluginsDir>/k4all-headlamp-plugin,
+        # so pluginsDir stays usable for other plugins. A new plugin tag
+        # changes the pod template: the operator re-applies headlamp and the
+        # new pod starts with the new plugin. componentOverrides.headlamp
+        # that set initContainers, volumes or volumeMounts replace these
+        # lists (Helm does not merge lists): copy these entries into them.
+        initContainers:
+          - name: k4all-plugin
+            image: ghcr.io/gpillon/k4all-headlamp-plugin:0.1.2
+            imagePullPolicy: IfNotPresent
+            command:
+              - sh
+              - -c
+              - cp -R /plugins/k4all-headlamp-plugin/. /k4all-plugin/
+            resources:
+              requests:
+                cpu: 10m
+                memory: 16Mi
+              limits:
+                memory: 32Mi
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 100
+              runAsGroup: 101
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                  - ALL
+              seccompProfile:
+                type: RuntimeDefault
+            volumeMounts:
+              - name: k4all-plugin
+                mountPath: /k4all-plugin
+        volumes:
+          - name: k4all-plugin
+            emptyDir:
+              sizeLimit: 16Mi
+        volumeMounts:
+          - name: k4all-plugin
+            mountPath: /headlamp/plugins/k4all-headlamp-plugin
+            readOnly: true
+      # traefik: its Middleware traefik/redirect-https exists by the time
+      # the headlamp hook writes the dashboard route.
       dependsOn:
         - cert-manager
+        - traefik
+      custom: {}

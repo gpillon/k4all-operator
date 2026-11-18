@@ -46,7 +46,7 @@ const (
 	releaseManifestName = "k4all"
 	clusterConfigName   = "k4all-cluster-config"
 
-	// The ingress controller of k4all v2.6.0 on, as ingressController names it.
+	// The ingress controller of k4all v2.4.0 on, as ingressController names it.
 	traefikController = "traefik"
 
 	testTimeout  = 15 * time.Minute
@@ -238,7 +238,7 @@ func dedicatedIP(controller string) string {
 }
 
 // expectedTraefik is ingress.traefik as the operator has it from k4all
-// v2.6.0: the one of the testdata ClusterConfig, or else its ingress.nginx,
+// v2.4.0: the one of the testdata ClusterConfig, or else its ingress.nginx,
 // which the operator moves there.
 func expectedTraefik() k4allv1alpha1.TraefikIngressConfig {
 	ingress := mustReadClusterConfig(clusterConfigFile).Spec.Ingress
@@ -282,7 +282,15 @@ func routeRequest(ip, scheme, host string, curlArgs ...string) (string, error) {
 // through controller ("nginx" or "traefik").
 func expectRoutesServedBy(controller string) {
 	By("deploying the k4all route shapes")
-	kubectlMustSucceed("apply", "-f", routesFile)
+	// The operator reports a Helm component Installed without waiting for
+	// its pods: ingress-nginx's admission webhook may refuse for a while.
+	Eventually(func() error {
+		out, err := kubectl("apply", "-f", routesFile)
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, out)
+		}
+		return nil
+	}, 3*time.Minute, pollInterval).Should(Succeed())
 	for _, name := range []string{"whoami-tls", "whoami-http"} {
 		Eventually(func() bool {
 			return deploymentAvailable(name, routesNamespace)
@@ -358,13 +366,22 @@ func expectNginxHandedOverToTraefik() {
 	out, err := kubectl("get", "validatingwebhookconfiguration", "ingress-nginx-admission")
 	Expect(err).To(HaveOccurred(), "admission webhook still there: %s", out)
 
+	By("deleting the ingress-nginx namespace, with what the release left outside it")
+	Eventually(func() error {
+		_, err := kubectl("get", "namespace", "ingress-nginx")
+		return err
+	}, 5*time.Minute, pollInterval).Should(HaveOccurred(), func() string {
+		left, _ := kubectl("get", "all,secrets,configmaps,serviceaccounts,leases,jobs", "-n", "ingress-nginx")
+		return "namespace ingress-nginx kept, holding:\n" + left
+	})
+
 	By("accepting Ingress updates, as update-routes.sh makes them")
 	kubectlMustSucceed("annotate", "ingress", "passthrough", "-n", routesNamespace,
 		"k4all-e2e/touched="+time.Now().Format("150405"), "--overwrite")
 }
 
 // expectNginxSettingsMovedToTraefik checks the ClusterConfig migration of
-// k4all v2.6.0: ingress.traefik set, ingress.nginx gone.
+// k4all v2.4.0: ingress.traefik set, ingress.nginx gone.
 func expectNginxSettingsMovedToTraefik() {
 	want := expectedTraefik()
 	Eventually(func(g Gomega) {

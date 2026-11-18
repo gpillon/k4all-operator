@@ -1,5 +1,5 @@
-# clusterconfig-v2.6.yaml with a dedicated ingress IP, as the v2.6.0 installer
-# writes it: ingress.traefik.dedicatedIP and no nginx key. MetalLB announces
+# clusterconfig-v2.6.yaml with a dedicated ingress IP, as the installer
+# writes it from k4all v2.4.0: ingress.traefik.dedicatedIP and no nginx key. MetalLB announces
 # it; any free address works, since the e2e client reaches it through kube-proxy.
 apiVersion: k4all.magesgate.com/v1alpha1
 kind: ClusterConfig

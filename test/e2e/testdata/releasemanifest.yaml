@@ -1,3 +1,8 @@
+# Component set of k4all v2.2.x (fcos-k8s bootc/overlay/usr/local/share/k4all-release.yaml
+# at v2.2.4, 27c9dcb), limited to the components the e2e suite installs: the
+# set clusters run before the operator syncs v2.4.0. Calico, cert-manager and
+# metrics-server as the e2e suite needs them on kind (pod network, pinned
+# metrics-server); metallb, ingress-nginx and headlamp as released.
 apiVersion: k4all.magesgate.com/v1alpha1
 kind: ReleaseManifest
 metadata:
@@ -8,7 +13,6 @@ spec:
     repository: ghcr.io/gpillon/k4all-bootc
     imageTag: latest
   components:
-    # CNI — manifest type with inline manifests, tests manifest install + inline
     calico:
       type: manifest
       version: "v3.27.3"
@@ -35,7 +39,6 @@ spec:
             name: default
           spec: {}
 
-    # Certificates — helm type, tests helm installation
     cert-manager:
       type: helm
       version: "v1.14.5"
@@ -47,7 +50,6 @@ spec:
       dependsOn:
         - calico
 
-    # Monitoring — manifest type with patches, tests patching
     metrics-server:
       type: manifest
       # Keep in sync with bootc/overlay/usr/local/share/k4all-release.yaml in fcos-k8s.
@@ -64,3 +66,58 @@ spec:
             namespace: kube-system
           type: strategic
           patch: '{"spec":{"template":{"spec":{"containers":[{"name":"metrics-server","args":["--cert-dir=/tmp","--secure-port=10250","--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname","--kubelet-use-node-status-port","--metric-resolution=15s","--kubelet-insecure-tls"]}]}}}}'
+
+    metallb:
+      type: manifest
+      version: "v0.15.3"
+      source: "https://raw.githubusercontent.com/metallb/metallb/{{ version }}/config/manifests/metallb-native.yaml"
+      namespace: metallb-system
+      dependsOn:
+        - calico
+      custom: {}
+
+    ingress-nginx:
+      type: helm
+      version: "4.14.3"
+      repo: "https://kubernetes.github.io/ingress-nginx"
+      chart: ingress-nginx
+      namespace: ingress-nginx
+      values:
+        controller:
+          extraArgs:
+            enable-ssl-passthrough: ""
+          allowSnippetAnnotations: true
+          ingressClassResource:
+            enabled: true
+          kind: DaemonSet
+          nodeSelector:
+            kubernetes.io/os: linux
+            node-role.kubernetes.io/control-plane: ""
+      dependsOn:
+        - cert-manager
+        - metallb
+      custom: {}
+
+    headlamp:
+      type: helm
+      version: "0.40.0"
+      repo: "https://kubernetes-sigs.github.io/headlamp/"
+      chart: headlamp
+      namespace: headlamp
+      values:
+        config:
+          oidc:
+            clientID: ""
+            clientSecret: ""
+            issuerURL: ""
+            scopes: ""
+          pluginsDir: /headlamp/plugins
+        service:
+          type: NodePort
+          port: 4466
+          nodePort: 32323
+        ingress:
+          enabled: false
+      dependsOn:
+        - cert-manager
+      custom: {}

@@ -1,6 +1,6 @@
-# A ClusterConfig written before k4all v2.6.0, with a dedicated ingress IP
+# A ClusterConfig written before k4all v2.4.0, with a dedicated ingress IP
 # that is not the default class: only ingress.nginx. The suite installs the
-# v2.4.0 set with it, then the v2.6.0 set, whose operator moves these
+# v2.2.x set with it, then the v2.4.0 set, whose operator moves these
 # settings to ingress.traefik and removes ingress.nginx.
 apiVersion: k4all.magesgate.com/v1alpha1
 kind: ClusterConfig
