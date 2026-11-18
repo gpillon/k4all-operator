@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -171,6 +174,10 @@ func TestMigrations_WaitForTraefikInTheReleaseManifest(t *testing.T) {
 		"traefik":       k4allv1alpha1.ComponentManagementManaged,
 		"headlamp":      k4allv1alpha1.ComponentManagementManaged,
 	})
+	// Step 2/2 just applied: ingress-nginx is uninstalled after the migrations.
+	v24.Status.Components = map[string]k4allv1alpha1.ComponentStatus{
+		"ingress-nginx": {State: k4allv1alpha1.ComponentStateInstalled},
+	}
 	if changed, err := migrations.Run(ctx, c, v24, stored()); err != nil || !changed {
 		t.Fatalf("v2.4.0 manifest: changed %t, err %v; want a change", changed, err)
 	}
@@ -182,5 +189,65 @@ func TestMigrations_WaitForTraefikInTheReleaseManifest(t *testing.T) {
 	}
 	if v := got.Annotations[migrations.AppliedAnnotation]; v != "1" {
 		t.Errorf("v2.4.0 manifest: %s = %q, want \"1\"", migrations.AppliedAnnotation, v)
+	}
+}
+
+// A cluster past the v2.4.0 sync with operator v0.5.0 kept the ingress-nginx
+// namespace with what the release left. Once on v0.5.1, migration 2 deletes
+// it, through the same check as the removal's cleanup.
+func TestMigrations_CleanTheIngressNginxNamespaceLeftByV050(t *testing.T) {
+	c := envtestClient(t)
+	ctx := context.Background()
+	ns := "ingress-nginx"
+	for _, o := range []client.Object{
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ingress-nginx-admission"}},
+		&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ingress-nginx-leader"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "kube-root-ca.crt"}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "default"}},
+	} {
+		if err := c.Create(ctx, o); err != nil {
+			t.Fatalf("create %s: %v", o.GetName(), err)
+		}
+	}
+	cc := &k4allv1alpha1.ClusterConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "past-v24-with-v050", Annotations: map[string]string{migrations.AppliedAnnotation: "1"}},
+		Spec: k4allv1alpha1.ClusterConfigSpec{
+			Networking: k4allv1alpha1.NetworkingConfig{CNI: k4allv1alpha1.CNIConfig{Type: "calico"}},
+			Ingress:    k4allv1alpha1.IngressConfig{Traefik: &k4allv1alpha1.TraefikIngressConfig{IsDefault: true}},
+		},
+	}
+	if err := c.Create(ctx, cc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), cc) })
+	rm := &k4allv1alpha1.ReleaseManifest{
+		Spec: k4allv1alpha1.ReleaseManifestSpec{Components: map[string]k4allv1alpha1.ComponentSpec{
+			"traefik":       {Type: "helm", Version: "42.4.0"},
+			"ingress-nginx": {Type: "helm", Version: "4.14.3", Management: k4allv1alpha1.ComponentManagementRemoved},
+		}},
+		Status: k4allv1alpha1.ReleaseManifestStatus{Components: map[string]k4allv1alpha1.ComponentStatus{
+			"ingress-nginx": {State: k4allv1alpha1.ComponentStateRemoved},
+		}},
+	}
+
+	env := migrations.Env{Client: c, RestConfig: envtestConfig(t), Log: logr.Discard()}
+	if changed, err := migrations.RunWith(ctx, env, rm, cc); err != nil || !changed {
+		t.Fatalf("changed %t, err %v; want a change", changed, err)
+	}
+
+	got := &corev1.Namespace{}
+	err := c.Get(ctx, types.NamespacedName{Name: ns}, got)
+	if err == nil && got.DeletionTimestamp == nil {
+		t.Errorf("namespace %s kept, holding only what ingress-nginx left", ns)
+	} else if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	stored := &k4allv1alpha1.ClusterConfig{}
+	if err := c.Get(ctx, types.NamespacedName{Name: cc.Name}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if v := stored.Annotations[migrations.AppliedAnnotation]; v != "2" {
+		t.Errorf("%s = %q, want \"2\"", migrations.AppliedAnnotation, v)
 	}
 }

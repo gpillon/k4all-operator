@@ -391,7 +391,9 @@ func expectNginxSettingsMovedToTraefik() {
 		g.Expect(json.Unmarshal([]byte(out), cc)).To(Succeed())
 		g.Expect(cc.Spec.Ingress.Nginx).To(BeNil(), "ingress.nginx is still there")
 		g.Expect(cc.Spec.Ingress.Traefik).To(Equal(&want))
-		g.Expect(cc.Annotations).To(HaveKeyWithValue("k4all.magesgate.com/migrations", "1"))
+		// 1 moves the settings at the sync, 2 (the ingress-nginx namespace)
+		// follows once ingress-nginx is uninstalled.
+		g.Expect(cc.Annotations).To(HaveKeyWithValue("k4all.magesgate.com/migrations", "2"))
 	}, 5*time.Minute, pollInterval).Should(Succeed())
 }
 

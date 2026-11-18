@@ -22,7 +22,7 @@ func TestApply_StopsAtTheFirstMigrationNotDue(t *testing.T) {
 	cc := clusterConfig(k4allv1alpha1.IngressConfig{}, nil)
 	c := newClient(t, cc)
 
-	changed, err := apply(context.Background(), c, []Migration{step("first", true), step("second", false), step("third", true)}, v26(), cc)
+	changed, err := apply(context.Background(), Env{Client: c}, []Migration{step("first", true), step("second", false), step("third", true)}, v26(), cc)
 	if err != nil {
 		t.Fatal(err)
 	}
