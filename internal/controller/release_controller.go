@@ -128,7 +128,8 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// The release may need the ClusterConfig in a new shape before its
 	// components are applied from it.
-	if migrated, err := migrations.Run(ctx, r.Client, rm, config); err != nil {
+	env := migrations.Env{Client: r.Client, RestConfig: r.RestConfig, Log: log.WithName("migrations")}
+	if migrated, err := migrations.RunWith(ctx, env, rm, config); err != nil {
 		log.Error(err, "ClusterConfig migration failed")
 		engine.SetReadyCondition(rm, metav1.ConditionFalse, "MigrationFailed", err.Error())
 		_ = r.patchStatus(ctx, rm)

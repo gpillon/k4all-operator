@@ -185,3 +185,12 @@ func (h *IngressNginxHook) waitForLeftovers(ctx context.Context, ns string) ([]s
 		}
 	}
 }
+
+// CleanIngressNginxNamespace does what Cleanup does after the uninstall, for
+// a cluster where ingress-nginx is already gone (the ClusterConfig
+// migration ingress-nginx-namespace). Best effort, only logged; without cfg
+// it only deletes the known leftovers.
+func CleanIngressNginxNamespace(ctx context.Context, c client.Client, cfg *rest.Config, log logr.Logger) {
+	h := &IngressNginxHook{client: c, log: log, restConfig: cfg}
+	_ = h.Cleanup(ctx, "ingress-nginx", k4allv1alpha1.ClusterConfigSpec{})
+}

@@ -27,12 +27,18 @@ func manifest(components map[string]k4allv1alpha1.ComponentManagement) *k4allv1a
 	return rm
 }
 
-// v26 is the v2.6.0 shape: Traefik in, ingress-nginx being removed.
+// v26 is the reconcile right after the v2.4.0 sync: Traefik in,
+// ingress-nginx Removed but not uninstalled yet (its namespace migration,
+// the next one, is not due yet).
 func v26() *k4allv1alpha1.ReleaseManifest {
-	return manifest(map[string]k4allv1alpha1.ComponentManagement{
+	rm := manifest(map[string]k4allv1alpha1.ComponentManagement{
 		"traefik":       k4allv1alpha1.ComponentManagementManaged,
 		"ingress-nginx": k4allv1alpha1.ComponentManagementRemoved,
 	})
+	rm.Status.Components = map[string]k4allv1alpha1.ComponentStatus{
+		"ingress-nginx": {State: k4allv1alpha1.ComponentStateInstalled},
+	}
+	return rm
 }
 
 func clusterConfig(ingress k4allv1alpha1.IngressConfig, annotations map[string]string) *k4allv1alpha1.ClusterConfig {
@@ -78,13 +84,18 @@ func run(t *testing.T, rm *k4allv1alpha1.ReleaseManifest, cc *k4allv1alpha1.Clus
 }
 
 func TestRun_MovesNginxSettingsToTraefikOnceTraefikReplacesNginx(t *testing.T) {
-	for name, rm := range map[string]*k4allv1alpha1.ReleaseManifest{
-		"ingress-nginx Removed": v26(),
-		"ingress-nginx gone": manifest(map[string]k4allv1alpha1.ComponentManagement{
+	for name, tc := range map[string]struct {
+		rm    *k4allv1alpha1.ReleaseManifest
+		count string
+	}{
+		"ingress-nginx Removed": {v26(), "1"},
+		// Gone from the manifest and uninstalled: the namespace migration runs too.
+		"ingress-nginx gone": {manifest(map[string]k4allv1alpha1.ComponentManagement{
 			"traefik": k4allv1alpha1.ComponentManagementManaged,
-		}),
+		}), "2"},
 	} {
 		t.Run(name, func(t *testing.T) {
+			rm := tc.rm
 			got, changed := run(t, rm, clusterConfig(k4allv1alpha1.IngressConfig{
 				Nginx: &k4allv1alpha1.NginxIngressConfig{DedicatedIP: "192.168.6.193", IsDefault: false},
 			}, nil))
@@ -99,8 +110,8 @@ func TestRun_MovesNginxSettingsToTraefikOnceTraefikReplacesNginx(t *testing.T) {
 			if got.Spec.Ingress.Nginx != nil {
 				t.Errorf("ingress.nginx = %+v, want it removed", got.Spec.Ingress.Nginx)
 			}
-			if v := got.Annotations[AppliedAnnotation]; v != "1" {
-				t.Errorf("%s = %q, want \"1\"", AppliedAnnotation, v)
+			if v := got.Annotations[AppliedAnnotation]; v != tc.count {
+				t.Errorf("%s = %q, want %q", AppliedAnnotation, v, tc.count)
 			}
 		})
 	}

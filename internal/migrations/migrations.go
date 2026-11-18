@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/go-logr/logr"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
@@ -18,28 +20,48 @@ import (
 // have run. It is written in the same update as the spec they change.
 const AppliedAnnotation = "k4all.magesgate.com/migrations"
 
-// Migration changes the ClusterConfig spec for a release.
+// Migration moves the cluster forward for a release: the ClusterConfig spec
+// (Apply), objects of the cluster (Act), or both.
 type Migration struct {
 	Name string
 	// Due says the ReleaseManifest has reached the release that needs it.
 	Due func(rm *k4allv1alpha1.ReleaseManifest) bool
-	// Apply changes the spec in place.
+	// Apply changes the spec in place. Optional.
 	Apply func(spec *k4allv1alpha1.ClusterConfigSpec)
+	// Act changes the cluster, best effort: it logs what it cannot do, and
+	// the migration counts as done anyway. Optional.
+	Act func(ctx context.Context, env Env, rm *k4allv1alpha1.ReleaseManifest)
+}
+
+// Env is what Act works with.
+type Env struct {
+	Client client.Client
+	// RestConfig reaches the API server directly (discovery, metadata
+	// lists). Without it an Act that needs it does nothing.
+	RestConfig *rest.Config
+	Log        logr.Logger
 }
 
 // All the migrations, in order. Only ever append.
 var All = []Migration{
-	nginxToTraefik, // 1, k4all v2.6.0
+	nginxToTraefik,        // 1, k4all v2.4.0
+	ingressNginxNamespace, // 2, operator v0.5.1, for clusters past the v2.4.0 sync with v0.5.0
 }
 
 // Run applies to config, in order, the migrations of All it has not had yet,
 // up to the first one rm is not due for, and saves config with them. It
 // reports whether config changed.
 func Run(ctx context.Context, c client.Client, rm *k4allv1alpha1.ReleaseManifest, config *k4allv1alpha1.ClusterConfig) (bool, error) {
-	return apply(ctx, c, All, rm, config)
+	return RunWith(ctx, Env{Client: c, Log: logr.Discard()}, rm, config)
 }
 
-func apply(ctx context.Context, c client.Client, list []Migration, rm *k4allv1alpha1.ReleaseManifest, config *k4allv1alpha1.ClusterConfig) (bool, error) {
+// RunWith is Run with what the migrations that act on the cluster need.
+func RunWith(ctx context.Context, env Env, rm *k4allv1alpha1.ReleaseManifest, config *k4allv1alpha1.ClusterConfig) (bool, error) {
+	return apply(ctx, env, All, rm, config)
+}
+
+func apply(ctx context.Context, env Env, list []Migration, rm *k4allv1alpha1.ReleaseManifest, config *k4allv1alpha1.ClusterConfig) (bool, error) {
+	c := env.Client
 	applied := 0
 	if v, ok := config.Annotations[AppliedAnnotation]; ok {
 		n, err := strconv.Atoi(v)
@@ -50,7 +72,12 @@ func apply(ctx context.Context, c client.Client, list []Migration, rm *k4allv1al
 	}
 	done := applied
 	for done < len(list) && list[done].Due(rm) {
-		list[done].Apply(&config.Spec)
+		if m := list[done]; m.Apply != nil {
+			m.Apply(&config.Spec)
+		}
+		if m := list[done]; m.Act != nil {
+			m.Act(ctx, env, rm)
+		}
 		done++
 	}
 	if done == applied {
