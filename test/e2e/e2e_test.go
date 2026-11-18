@@ -282,7 +282,15 @@ func routeRequest(ip, scheme, host string, curlArgs ...string) (string, error) {
 // through controller ("nginx" or "traefik").
 func expectRoutesServedBy(controller string) {
 	By("deploying the k4all route shapes")
-	kubectlMustSucceed("apply", "-f", routesFile)
+	// The operator reports a Helm component Installed without waiting for
+	// its pods: ingress-nginx's admission webhook may refuse for a while.
+	Eventually(func() error {
+		out, err := kubectl("apply", "-f", routesFile)
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, out)
+		}
+		return nil
+	}, 3*time.Minute, pollInterval).Should(Succeed())
 	for _, name := range []string{"whoami-tls", "whoami-http"} {
 		Eventually(func() bool {
 			return deploymentAvailable(name, routesNamespace)
