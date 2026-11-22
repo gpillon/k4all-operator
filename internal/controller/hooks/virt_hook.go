@@ -97,3 +97,11 @@ func hasKVMDevice() bool {
 	_, err := os.Stat("/dev/kvm")
 	return err == nil
 }
+
+// RunningVersion reads the KubeVirt CR: virt-operator reports there the
+// version it runs and the one it is rolling out.
+func (h *VirtHook) RunningVersion(ctx context.Context) (string, bool, error) {
+	return operatorCRVersion(ctx, h.client, "kubevirt.io/v1", "KubeVirt",
+		types.NamespacedName{Namespace: "kubevirt", Name: "kubevirt"},
+		"observedKubeVirtVersion", "targetKubeVirtVersion")
+}

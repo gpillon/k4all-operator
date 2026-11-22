@@ -157,6 +157,33 @@ func (e *Engine) UninstallComponent(ctx context.Context, name string, spec k4all
 	}
 }
 
+// VersionReporter tells which version of a component runs in the cluster.
+type VersionReporter interface {
+	// RunningVersion returns the version the component runs, "" when it is
+	// not installed, and whether it has finished rolling that version out.
+	RunningVersion(ctx context.Context) (version string, ready bool, err error)
+}
+
+// helmReleaseReporter reports the chart version of a Helm component's release.
+type helmReleaseReporter struct {
+	helm            *HelmInstaller
+	name, namespace string
+}
+
+func (r helmReleaseReporter) RunningVersion(ctx context.Context) (string, bool, error) {
+	return r.helm.RunningVersion(ctx, r.name, r.namespace)
+}
+
+// HelmReleaseReporter returns what reports the version a Helm component
+// runs, from its Helm release; nil for the other component types.
+func (e *Engine) HelmReleaseReporter(name string, spec k4allv1alpha1.ComponentSpec) VersionReporter {
+	switch spec.Type {
+	case k4allv1alpha1.ComponentTypeHelm, k4allv1alpha1.ComponentTypeHelmOCI:
+		return helmReleaseReporter{helm: e.helm, name: name, namespace: spec.Namespace}
+	}
+	return nil
+}
+
 // IsInstalled checks whether a component is already installed at the given version.
 func (e *Engine) IsInstalled(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, currentStatus *k4allv1alpha1.ComponentStatus) bool {
 	if currentStatus == nil {

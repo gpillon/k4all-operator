@@ -20,6 +20,9 @@ type Hook interface {
 }
 
 // BaseHook provides no-op defaults so hooks only override what they need.
+// A hook may also implement engine.VersionReporter (KubeVirt, CDI): the
+// reconciler then follows the component's upgrade path from the version it
+// reports, and waits on it between steps.
 type BaseHook struct{}
 
 func (BaseHook) PreInstall(_ context.Context, _ string, _ k4allv1alpha1.ComponentSpec, _ k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {
@@ -59,6 +62,7 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 		hooks: make(map[string]Hook),
 	}
 	r.hooks["kubevirt"] = NewVirtHook(c, log.WithName("hook-virt"))
+	r.hooks["cdi"] = NewCDIHook(c)
 	r.hooks["cilium"] = NewCiliumHook(c, log.WithName("hook-cilium"))
 	r.hooks["headlamp"] = NewHeadlampHook(c, log.WithName("hook-headlamp"))
 	nginx := NewIngressNginxHook(c, log.WithName("hook-ingress-nginx"))
@@ -70,6 +74,11 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 	r.hooks["calico"] = NewCalicoHook(c, log.WithName("hook-calico"))
 	r.hooks["nmstate"] = NewNMStateHook(c, log.WithName("hook-nmstate"))
 	return r
+}
+
+// Register sets the hook of a component, replacing the built-in one.
+func (r *Registry) Register(componentName string, h Hook) {
+	r.hooks[componentName] = h
 }
 
 // Get returns the hook for a component, or nil if none exists.

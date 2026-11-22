@@ -52,3 +52,14 @@ func UpgradeStep(spec k4allv1alpha1.ComponentSpec, installedVersion string) (k4a
 	}
 	return stepSpec, true
 }
+
+// CompareVersions compares two semver versions ("v1.7.0" and "1.7.0" are the
+// same): -1, 0 or 1, and false when either is not semver.
+func CompareVersions(a, b string) (int, bool) {
+	va, errA := semver.NewVersion(a)
+	vb, errB := semver.NewVersion(b)
+	if errA != nil || errB != nil {
+		return 0, false
+	}
+	return va.Compare(vb), true
+}
