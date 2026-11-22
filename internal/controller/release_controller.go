@@ -21,12 +21,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/Masterminds/semver/v3"
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
@@ -333,27 +333,28 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			}
 		}
 
-		start, waiting, pathErr := r.pathStart(ctx, name, spec, currentStatus)
-		if pathErr != nil {
-			log.Error(pathErr, "upgradePath cannot start", "name", name)
-			allOK = false
-			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
-				State:              k4allv1alpha1.ComponentStateFailed,
-				Message:            pathErr.Error(),
-				InstalledVersion:   currentStatus.InstalledVersion,
-				LastTransitionTime: metav1.Now(),
-			}
-			continue
-		}
-		if waiting != "" {
+		start, startErr := r.upgradePathStart(ctx, name, spec, currentStatus)
+		var wait waitForStep
+		switch {
+		case goerrors.As(startErr, &wait):
 			stepsLeft = true
 			if currentStatus.State != k4allv1alpha1.ComponentStateUpgrading &&
 				currentStatus.State != k4allv1alpha1.ComponentStatePending {
 				currentStatus.State = k4allv1alpha1.ComponentStatePending
 				currentStatus.LastTransitionTime = metav1.Now()
 			}
-			currentStatus.Message = waiting
+			currentStatus.Message = wait.reason
 			rm.Status.Components[name] = currentStatus
+			continue
+		case startErr != nil:
+			log.Error(startErr, "the upgrade path cannot start", "name", name)
+			allOK = false
+			// No installedVersion: the next reconcile reads what runs again.
+			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
+				State:              k4allv1alpha1.ComponentStateFailed,
+				Message:            startErr.Error(),
+				LastTransitionTime: metav1.Now(),
+			}
 			continue
 		}
 		toApply, intermediate := engine.UpgradeStep(spec, start)
@@ -408,76 +409,75 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 	return allOK, stepsLeft
 }
 
-// pathStart is the version an upgradePath continues from: the recorded
-// installedVersion, or, when there is none (a component switched from
-// Unmanaged to Managed), the version it reports running. Mid-path it
-// returns waiting instead while the component does not run the step it was
-// given yet: only Helm steps wait for their resources on their own. An
-// error means nothing may be applied: a running version newer than the
-// release would be a downgrade.
-func (r *ReleaseReconciler) pathStart(
+// waitForStep says a component's upgrade path cannot go on yet: nothing is
+// applied, and the reconcile comes back soon.
+type waitForStep struct{ reason string }
+
+func (w waitForStep) Error() string { return w.reason }
+
+// upgradePathStart is the version a component's upgrade path goes on from:
+// the recorded installedVersion, or what runs when the status records none
+// (a component switched from Unmanaged to Managed) or a step is in progress.
+// Only Helm steps wait for their resources: a manifest step is applied, and
+// the component rolls it out on its own, so a waitForStep error says it does
+// not run a ready version to go on from yet. Running past the recorded step
+// is fine: the status write after a step can be lost. Any other error means
+// nothing may be applied: what runs cannot be read, or it is newer than the
+// release (no downgrades).
+func (r *ReleaseReconciler) upgradePathStart(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, st k4allv1alpha1.ComponentStatus,
-) (start, waiting string, err error) {
-	if len(spec.UpgradePath) == 0 {
-		return st.InstalledVersion, "", nil
+) (string, error) {
+	switchedToManaged := st.InstalledVersion == ""
+	if len(spec.UpgradePath) == 0 || (!switchedToManaged && st.State != k4allv1alpha1.ComponentStateUpgrading) {
+		return st.InstalledVersion, nil
 	}
 	reporter := r.versionReporter(name, spec)
 	if reporter == nil {
-		return st.InstalledVersion, "", nil
+		return st.InstalledVersion, nil
 	}
+	running, ready, err := reporter.RunningVersion(ctx)
 	switch {
-	case st.InstalledVersion == "":
-		version, ready, readErr := reporter.RunningVersion(ctx)
-		if readErr != nil {
-			return "", "", fmt.Errorf("cannot tell which version of %s runs: %w", name, readErr)
-		}
-		if newerVersion(version, spec.Version) {
-			return "", "", fmt.Errorf("%s runs %s, newer than the release's %s: not downgrading it", name, version, spec.Version)
-		}
-		if version != "" && !ready {
-			return "", fmt.Sprintf("%s runs %s but is not ready: waiting before upgrading it towards %s",
-				name, version, spec.Version), nil
-		}
-		return version, "", nil
-	case st.State == k4allv1alpha1.ComponentStateUpgrading:
-		version, ready, readErr := reporter.RunningVersion(ctx)
-		if readErr != nil {
-			return "", fmt.Sprintf("upgrade step %s applied, waiting for it to run: %v", st.InstalledVersion, readErr), nil
-		}
-		if !ready || !sameVersion(version, st.InstalledVersion) {
-			return "", fmt.Sprintf("upgrade step %s applied, waiting for it to run (runs %q, ready %t) before going on towards %s",
-				st.InstalledVersion, version, ready, spec.Version), nil
-		}
+	case err != nil && switchedToManaged:
+		return "", fmt.Errorf("cannot tell which version of %s runs: %w", name, err)
+	case err != nil:
+		return "", waitForStep{fmt.Sprintf("upgrade step %s applied, waiting for it to run: %v", st.InstalledVersion, err)}
+	case switchedToManaged && running == "":
+		return "", nil // nothing runs: a fresh install
+	case newerVersion(running, spec.Version):
+		return "", fmt.Errorf("%s runs %s, newer than the release's %s: not downgrading it", name, running, spec.Version)
+	case switchedToManaged && !ready:
+		return "", waitForStep{fmt.Sprintf("%s runs %s but is not ready: waiting before upgrading it towards %s",
+			name, running, spec.Version)}
+	case !switchedToManaged && (!ready || !atLeastVersion(running, st.InstalledVersion)):
+		return "", waitForStep{fmt.Sprintf("upgrade step %s applied, waiting for it to run (runs %q, ready %t) before going on towards %s",
+			st.InstalledVersion, running, ready, spec.Version)}
 	}
-	return st.InstalledVersion, "", nil
+	return running, nil
 }
 
-// newerVersion tells whether a is a later semver than b; false when either
-// is not semver.
-func newerVersion(a, b string) bool {
-	va, errA := semver.NewVersion(a)
-	vb, errB := semver.NewVersion(b)
-	return errA == nil && errB == nil && va.GreaterThan(vb)
-}
-
-// versionReporter tells which version of a component runs: its hook for
-// KubeVirt and CDI, its release for Helm components, nil otherwise.
+// versionReporter returns what reports the version a component runs: its
+// hook for KubeVirt and CDI, its Helm release for Helm components, nil
+// otherwise.
 func (r *ReleaseReconciler) versionReporter(name string, spec k4allv1alpha1.ComponentSpec) engine.VersionReporter {
-	if reporter, ok := r.hookReg.Get(name).(hooks.VersionReporter); ok {
+	if reporter, ok := r.hookReg.Get(name).(engine.VersionReporter); ok {
 		return reporter
 	}
-	return r.engine.ReleaseVersion(name, spec)
+	return r.engine.HelmReleaseReporter(name, spec)
 }
 
-// sameVersion compares two versions as semver ("v1.7.0" and "1.7.0" are the
-// same), or as strings when one is not semver.
-func sameVersion(a, b string) bool {
-	va, errA := semver.NewVersion(a)
-	vb, errB := semver.NewVersion(b)
-	if errA != nil || errB != nil {
-		return a == b
+// newerVersion tells whether a is a later semver than b.
+func newerVersion(a, b string) bool {
+	c, ok := engine.CompareVersions(a, b)
+	return ok && c > 0
+}
+
+// atLeastVersion tells whether a is b or later: by semver, or the same string
+// when either is not semver.
+func atLeastVersion(a, b string) bool {
+	if c, ok := engine.CompareVersions(a, b); ok {
+		return c >= 0
 	}
-	return va.Equal(vb)
+	return a == b
 }
 
 // reconcileRemovedComponents uninstalls components explicitly set to
@@ -541,6 +541,8 @@ func (r *ReleaseReconciler) uninstallWithCleanup(
 }
 
 // setReadySummary sets the Ready condition from the outcome of a full reconcile.
+// Components still on their upgrade path (Upgrading, or Pending on a step)
+// keep it False.
 func setReadySummary(rm *k4allv1alpha1.ReleaseManifest, allOK bool, activeCount int) {
 	if !allOK {
 		engine.SetReadyCondition(rm, metav1.ConditionFalse, "ComponentsFailed",
@@ -548,10 +550,20 @@ func setReadySummary(rm *k4allv1alpha1.ReleaseManifest, allOK bool, activeCount 
 		return
 	}
 	installed := 0
-	for _, st := range rm.Status.Components {
-		if st.State == k4allv1alpha1.ComponentStateInstalled {
+	var waiting []string
+	for name, st := range rm.Status.Components {
+		switch st.State {
+		case k4allv1alpha1.ComponentStateInstalled:
 			installed++
+		case k4allv1alpha1.ComponentStateUpgrading, k4allv1alpha1.ComponentStatePending:
+			waiting = append(waiting, name)
 		}
+	}
+	if len(waiting) > 0 {
+		sort.Strings(waiting)
+		engine.SetReadyCondition(rm, metav1.ConditionFalse, "ComponentsUpgrading",
+			"components on their upgrade path (see their status): "+strings.Join(waiting, ", "))
+		return
 	}
 	engine.SetReadyCondition(rm, metav1.ConditionTrue, "AllComponentsReconciled",
 		fmt.Sprintf("%d/%d components installed", installed, activeCount))

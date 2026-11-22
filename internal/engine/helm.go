@@ -16,7 +16,6 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/getter"
 	"helm.sh/helm/v3/pkg/registry"
-	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/repo"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -44,21 +43,23 @@ func NewHelmInstaller(restConfig *rest.Config, log logr.Logger) *HelmInstaller {
 	return h
 }
 
-// RunningVersion returns the chart version of the release and whether its
-// last revision is deployed; "" when there is no release.
+// RunningVersion returns the chart version of the Helm release's last
+// deployed revision: what runs, also after a failed upgrade. A release with
+// no deployed revision (none, or a failed first install) is not installed.
+// A deployed revision is ready: helm --wait waited for it.
 func (h *HelmInstaller) RunningVersion(_ context.Context, name, namespace string) (string, bool, error) {
 	cfg, err := h.configFor(namespace)
 	if err != nil {
 		return "", false, fmt.Errorf("helm action config: %w", err)
 	}
-	rel, err := action.NewStatus(cfg).Run(name)
-	if goerrors.Is(err, driver.ErrReleaseNotFound) {
+	rel, err := cfg.Releases.Deployed(name)
+	if goerrors.Is(err, driver.ErrReleaseNotFound) || goerrors.Is(err, driver.ErrNoDeployedReleases) {
 		return "", false, nil
 	}
 	if err != nil {
 		return "", false, fmt.Errorf("helm release %s/%s: %w", namespace, name, err)
 	}
-	return rel.Chart.Metadata.Version, rel.Info.Status == release.StatusDeployed, nil
+	return rel.Chart.Metadata.Version, true, nil
 }
 
 // Reconcile installs or upgrades the release. With wait it returns only once

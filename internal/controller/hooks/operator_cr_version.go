@@ -11,18 +11,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// RunningVersion reads the KubeVirt CR: virt-operator reports there the
-// version it runs and the one it is rolling out.
-func (h *VirtHook) RunningVersion(ctx context.Context) (string, bool, error) {
-	return operatorCRVersion(ctx, h.client, "kubevirt.io/v1", "KubeVirt",
-		types.NamespacedName{Namespace: "kubevirt", Name: "kubevirt"},
-		"observedKubeVirtVersion", "targetKubeVirtVersion")
-}
-
 // operatorCRVersion reads the version a KubeVirt-style operator reports in
 // its CR's status: observedField is the version it runs, targetField the one
 // it is rolling out. It is ready once the two match and the CR is Available,
-// neither Progressing nor Degraded. No CR, or no CRD, means not installed.
+// neither Progressing nor Degraded. No CR, or no CRD, means not installed; a
+// CR with no observed version is an error, as nothing tells what runs.
 func operatorCRVersion(
 	ctx context.Context, c client.Client, apiVersion, kind string, key types.NamespacedName, observedField, targetField string,
 ) (string, bool, error) {
@@ -36,8 +29,11 @@ func operatorCRVersion(
 		return "", false, fmt.Errorf("get %s %s: %w", kind, key, err)
 	}
 	observed, _, _ := unstructured.NestedString(cr.Object, "status", observedField)
+	if observed == "" {
+		return "", false, fmt.Errorf("%s %s reports no version yet: is its operator running?", kind, key)
+	}
 	target, _, _ := unstructured.NestedString(cr.Object, "status", targetField)
-	ready := observed != "" && observed == target &&
+	ready := observed == target &&
 		conditionIs(cr, "Available", "True") && !conditionIs(cr, "Progressing", "True") && !conditionIs(cr, "Degraded", "True")
 	return observed, ready, nil
 }
@@ -52,22 +48,4 @@ func conditionIs(cr *unstructured.Unstructured, typ, status string) bool {
 		}
 	}
 	return false
-}
-
-// CDIHook lets the reconciler follow CDI's upgradePath: CDI, like KubeVirt,
-// upgrades one minor version at a time.
-type CDIHook struct {
-	BaseHook
-	client client.Client
-}
-
-func NewCDIHook(c client.Client) *CDIHook {
-	return &CDIHook{client: c}
-}
-
-// RunningVersion reads the CDI CR, where cdi-operator reports the version it
-// runs and the one it is rolling out.
-func (h *CDIHook) RunningVersion(ctx context.Context) (string, bool, error) {
-	return operatorCRVersion(ctx, h.client, "cdi.kubevirt.io/v1beta1", "CDI",
-		types.NamespacedName{Name: "cdi"}, "observedVersion", "targetVersion")
 }

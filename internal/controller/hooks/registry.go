@@ -5,7 +5,6 @@ import (
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
-	"github.com/gpillon/k4all-operator/internal/engine"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -20,13 +19,10 @@ type Hook interface {
 	Cleanup(ctx context.Context, name string, config k4allv1alpha1.ClusterConfigSpec) error
 }
 
-// VersionReporter is implemented by the hooks of components that can tell
-// which version runs in the cluster (KubeVirt, CDI). The reconciler starts an
-// upgradePath from it when the status has no installedVersion (a component
-// switched from Unmanaged to Managed), and waits on it between the steps.
-type VersionReporter = engine.VersionReporter
-
 // BaseHook provides no-op defaults so hooks only override what they need.
+// A hook may also implement engine.VersionReporter (KubeVirt, CDI): the
+// reconciler then follows the component's upgrade path from the version it
+// reports, and waits on it between steps.
 type BaseHook struct{}
 
 func (BaseHook) PreInstall(_ context.Context, _ string, _ k4allv1alpha1.ComponentSpec, _ k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {

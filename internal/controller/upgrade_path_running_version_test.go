@@ -13,6 +13,7 @@ import (
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/release"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -40,9 +41,9 @@ const (
 	probeStep    = "v1.15.0"
 )
 
-// probePath is a manifest component at v1.16.0 whose upgradePath goes
+// probeWithUpgradePath is a manifest component at v1.16.0 whose upgradePath goes
 // through v1.15.0.
-func probePath() k4allv1alpha1.ComponentSpec {
+func probeWithUpgradePath() k4allv1alpha1.ComponentSpec {
 	return k4allv1alpha1.ComponentSpec{
 		Type:            k4allv1alpha1.ComponentTypeManifest,
 		Version:         probeRelease,
@@ -51,12 +52,12 @@ func probePath() k4allv1alpha1.ComponentSpec {
 	}
 }
 
-// adoptedOnEnvtest is a cluster where "probe" was Unmanaged (restored from
+// switchedToManagedOnEnvtest is a cluster where "probe" was Unmanaged (restored from
 // k4all 1.x) and has just been switched to Managed: the status has no
 // installedVersion. The probe hook reports what runs.
-func adoptedOnEnvtest(t *testing.T, running *runningProbe) (client.Client, *ReleaseReconciler) {
+func switchedToManagedOnEnvtest(t *testing.T, running *runningProbe) (client.Client, *ReleaseReconciler) {
 	t.Helper()
-	c, r := onEnvtest(t, probePath(), k4allv1alpha1.ComponentStatus{
+	c, r := onEnvtest(t, probeWithUpgradePath(), k4allv1alpha1.ComponentStatus{
 		State: k4allv1alpha1.ComponentStateUnmanaged, LastTransitionTime: metav1.Now(),
 	})
 	r.hookReg = hooks.NewRegistry(c, logr.Discard())
@@ -73,8 +74,8 @@ func reconcileProbe(t *testing.T, r *ReleaseReconciler) ctrl.Result {
 	return res
 }
 
-func TestReconcile_AdoptedComponentFollowsUpgradePathFromRunningVersion(t *testing.T) {
-	c, r := adoptedOnEnvtest(t, &runningProbe{version: "v1.14.0", ready: true})
+func TestReconcile_ComponentSwitchedToManagedFollowsItsUpgradePathFromTheRunningVersion(t *testing.T) {
+	c, r := switchedToManagedOnEnvtest(t, &runningProbe{version: "v1.14.0", ready: true})
 
 	reconcileProbe(t, r)
 
@@ -88,7 +89,7 @@ func TestReconcile_AdoptedComponentFollowsUpgradePathFromRunningVersion(t *testi
 // runs it, or KubeVirt would get v1.8 while still rolling out v1.7.
 func TestReconcile_NextStepWaitsUntilTheStepRuns(t *testing.T) {
 	running := &runningProbe{version: "v1.14.0", ready: true}
-	c, r := adoptedOnEnvtest(t, running)
+	c, r := switchedToManagedOnEnvtest(t, running)
 	reconcileProbe(t, r) // applies the step v1.15.0
 
 	res := reconcileProbe(t, r) // v1.14.0 still runs
@@ -114,10 +115,10 @@ func TestReconcile_NextStepWaitsUntilTheStepRuns(t *testing.T) {
 	}
 }
 
-// KubeVirt and CDI cannot go back a version: an adopted component newer than
-// the release is left as it is, and says so.
-func TestReconcile_AdoptedComponentNewerThanReleaseIsNotDowngraded(t *testing.T) {
-	c, r := adoptedOnEnvtest(t, &runningProbe{version: "v1.17.0", ready: true})
+// KubeVirt and CDI cannot go back a version: a component switched to
+// Managed that is newer than the release is left as it is, and says so.
+func TestReconcile_ComponentSwitchedToManagedNewerThanTheReleaseIsNotDowngraded(t *testing.T) {
+	c, r := switchedToManagedOnEnvtest(t, &runningProbe{version: "v1.17.0", ready: true})
 
 	reconcileProbe(t, r)
 
@@ -134,8 +135,8 @@ func TestReconcile_AdoptedComponentNewerThanReleaseIsNotDowngraded(t *testing.T)
 }
 
 // Not knowing what runs is no reason to jump to the release's version.
-func TestReconcile_AdoptionStopsWhenTheRunningVersionCannotBeRead(t *testing.T) {
-	c, r := adoptedOnEnvtest(t, &runningProbe{err: errors.New("the server is currently unable to handle the request")})
+func TestReconcile_SwitchToManagedStopsWhenTheRunningVersionCannotBeRead(t *testing.T) {
+	c, r := switchedToManagedOnEnvtest(t, &runningProbe{err: errors.New("the server is currently unable to handle the request")})
 
 	reconcileProbe(t, r)
 
@@ -148,11 +149,11 @@ func TestReconcile_AdoptionStopsWhenTheRunningVersionCannotBeRead(t *testing.T) 
 	}
 }
 
-// Mid-path a read error keeps the component waiting on its step: as Failed,
+// On an upgrade step a read error keeps the component waiting on its step: as Failed,
 // the next reconcile would apply the following step without waiting.
-func TestReconcile_ReadErrorMidPathKeepsWaitingOnTheStep(t *testing.T) {
+func TestReconcile_ReadErrorOnAnUpgradeStepKeepsWaitingOnTheStep(t *testing.T) {
 	running := &runningProbe{version: "v1.14.0", ready: true}
-	c, r := adoptedOnEnvtest(t, running)
+	c, r := switchedToManagedOnEnvtest(t, running)
 	reconcileProbe(t, r) // applies the step v1.15.0
 
 	running.err = errors.New("connection refused")
@@ -169,11 +170,11 @@ func TestReconcile_ReadErrorMidPathKeepsWaitingOnTheStep(t *testing.T) {
 	}
 }
 
-// The path starts from a healthy component: one still rolling out (or
+// The upgrade path starts from a healthy component: one still rolling out (or
 // degraded) gets nothing until it is ready.
-func TestReconcile_AdoptionWaitsUntilTheRunningVersionIsReady(t *testing.T) {
+func TestReconcile_SwitchToManagedWaitsUntilTheRunningVersionIsReady(t *testing.T) {
 	running := &runningProbe{version: "v1.14.0"}
-	c, r := adoptedOnEnvtest(t, running)
+	c, r := switchedToManagedOnEnvtest(t, running)
 
 	res := reconcileProbe(t, r)
 	st := probeStatus(t, c)
@@ -193,8 +194,8 @@ func TestReconcile_AdoptionWaitsUntilTheRunningVersionIsReady(t *testing.T) {
 }
 
 // Nothing running is a fresh install: straight to the release's version.
-func TestReconcile_AdoptedComponentNotRunningInstallsTheRelease(t *testing.T) {
-	c, r := adoptedOnEnvtest(t, &runningProbe{})
+func TestReconcile_ComponentSwitchedToManagedNotRunningInstallsTheReleaseVersion(t *testing.T) {
+	c, r := switchedToManagedOnEnvtest(t, &runningProbe{})
 
 	reconcileProbe(t, r)
 
@@ -204,9 +205,9 @@ func TestReconcile_AdoptedComponentNotRunningInstallsTheRelease(t *testing.T) {
 	}
 }
 
-// Helm components report the chart of their release. The chart repository is
+// Helm components report the chart of their Helm release. The chart repository is
 // unreachable here, so the step the reconciler picked shows in the failure.
-func TestReconcile_AdoptedHelmComponentFollowsUpgradePathFromItsRelease(t *testing.T) {
+func TestReconcile_HelmComponentSwitchedToManagedFollowsItsUpgradePathFromItsHelmRelease(t *testing.T) {
 	spec := k4allv1alpha1.ComponentSpec{
 		Type: k4allv1alpha1.ComponentTypeHelm, Namespace: "default", Version: probeRelease,
 		Repo: "http://127.0.0.1:1", Chart: "probe",
@@ -215,7 +216,7 @@ func TestReconcile_AdoptedHelmComponentFollowsUpgradePathFromItsRelease(t *testi
 	c, r := onEnvtest(t, spec, k4allv1alpha1.ComponentStatus{
 		State: k4allv1alpha1.ComponentStateUnmanaged, LastTransitionTime: metav1.Now(),
 	})
-	helmRelease(t, r.RestConfig, "default", "probe", "v1.14.0")
+	deployHelmRelease(t, r.RestConfig, "default", "probe", "v1.14.0")
 
 	reconcileProbe(t, r)
 
@@ -225,8 +226,8 @@ func TestReconcile_AdoptedHelmComponentFollowsUpgradePathFromItsRelease(t *testi
 	}
 }
 
-// helmRelease stores a deployed revision of a release, as `helm install` would.
-func helmRelease(t *testing.T, cfg *rest.Config, namespace, name, chartVersion string) {
+// deployHelmRelease stores a deployed revision of a release, as `helm install` would.
+func deployHelmRelease(t *testing.T, cfg *rest.Config, namespace, name, chartVersion string) {
 	t.Helper()
 	flags := genericclioptions.NewConfigFlags(false)
 	flags.WrapConfigFn = func(*rest.Config) *rest.Config { return cfg }
@@ -244,4 +245,39 @@ func helmRelease(t *testing.T, cfg *rest.Config, namespace, name, chartVersion s
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = helmCfg.Releases.Delete(name, 1) })
+}
+
+// The status write after a step can be lost (operator restart, API server
+// down): the component then runs a later version than the status records,
+// and the upgrade path goes on from what runs.
+func TestReconcile_UpgradePathGoesOnFromARunningVersionPastTheRecordedStep(t *testing.T) {
+	c, r := onEnvtest(t, probeWithUpgradePath(), k4allv1alpha1.ComponentStatus{
+		State: k4allv1alpha1.ComponentStateUpgrading, InstalledVersion: "v1.14.0", LastTransitionTime: metav1.Now(),
+	})
+	r.hookReg = hooks.NewRegistry(c, logr.Discard())
+	r.hookReg.Register("probe", &runningProbe{version: probeStep, ready: true})
+
+	reconcileProbe(t, r)
+
+	st := probeStatus(t, c)
+	if st.InstalledVersion != probeRelease || st.State != k4allv1alpha1.ComponentStateInstalled {
+		t.Fatalf("%s at %q (%s), want Installed at %s: %s runs", st.State, st.InstalledVersion, st.Message, probeRelease, probeStep)
+	}
+}
+
+// A step that never becomes ready (a degraded KubeVirt) keeps the component
+// waiting: the ReleaseManifest is not Ready meanwhile, and says on what.
+func TestReconcile_WaitingOnAStepIsNotReady(t *testing.T) {
+	c, r := switchedToManagedOnEnvtest(t, &runningProbe{version: "v1.14.0"})
+
+	reconcileProbe(t, r)
+
+	rm := &k4allv1alpha1.ReleaseManifest{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "k4all"}, rm); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(rm.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse || !strings.Contains(ready.Message, "probe") {
+		t.Fatalf("Ready = %+v, want False naming probe, which waits", ready)
+	}
 }

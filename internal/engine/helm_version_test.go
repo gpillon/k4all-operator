@@ -39,7 +39,7 @@ func certManagerRelease(revision int, chartVersion string, status release.Status
 	}
 }
 
-func TestHelmRunningVersion_DeployedRelease(t *testing.T) {
+func TestHelmRunningVersion_ADeployedReleaseRunsItsChart(t *testing.T) {
 	h := helmWith(t, certManagerRelease(1, "v1.14.5", release.StatusDeployed))
 
 	version, ready, err := h.RunningVersion(context.Background(), "cert-manager", "cert-manager")
@@ -49,7 +49,7 @@ func TestHelmRunningVersion_DeployedRelease(t *testing.T) {
 	}
 }
 
-func TestHelmRunningVersion_NoRelease(t *testing.T) {
+func TestHelmRunningVersion_NoReleaseIsNotInstalled(t *testing.T) {
 	h := helmWith(t)
 
 	version, ready, err := h.RunningVersion(context.Background(), "cert-manager", "cert-manager")
@@ -59,16 +59,28 @@ func TestHelmRunningVersion_NoRelease(t *testing.T) {
 	}
 }
 
-// A failed upgrade leaves the chart it tried as the last revision: the path
-// does not go on from a release that is not deployed.
-func TestHelmRunningVersion_FailedLastRevision(t *testing.T) {
+// A failed upgrade leaves the revision before it deployed: that chart is
+// what runs, and helm upgrade can go on from it.
+func TestHelmRunningVersion_AFailedUpgradeLeavesThePreviousChartRunning(t *testing.T) {
 	h := helmWith(t,
-		certManagerRelease(1, "v1.14.5", release.StatusSuperseded),
+		certManagerRelease(1, "v1.14.5", release.StatusDeployed),
 		certManagerRelease(2, "v1.15.5", release.StatusFailed))
 
 	version, ready, err := h.RunningVersion(context.Background(), "cert-manager", "cert-manager")
 
-	if err != nil || version != "v1.15.5" || ready {
-		t.Fatalf("got (%q, %t, %v), want (\"v1.15.5\", false, nil)", version, ready, err)
+	if err != nil || version != "v1.14.5" || !ready {
+		t.Fatalf("got (%q, %t, %v), want (\"v1.14.5\", true, nil)", version, ready, err)
+	}
+}
+
+// A failed first install deployed nothing: it is still a fresh install, which
+// helm upgrade retries over the failed revision.
+func TestHelmRunningVersion_AFailedInstallIsNotInstalled(t *testing.T) {
+	h := helmWith(t, certManagerRelease(1, "v1.21.3", release.StatusFailed))
+
+	version, ready, err := h.RunningVersion(context.Background(), "cert-manager", "cert-manager")
+
+	if err != nil || version != "" || ready {
+		t.Fatalf("got (%q, %t, %v), want (\"\", false, nil): nothing was deployed", version, ready, err)
 	}
 }

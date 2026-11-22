@@ -164,22 +164,22 @@ type VersionReporter interface {
 	RunningVersion(ctx context.Context) (version string, ready bool, err error)
 }
 
-// helmRelease reports the chart version of a Helm component's release.
-type helmRelease struct {
+// helmReleaseReporter reports the chart version of a Helm component's release.
+type helmReleaseReporter struct {
 	helm            *HelmInstaller
 	name, namespace string
 }
 
-func (r helmRelease) RunningVersion(ctx context.Context) (string, bool, error) {
+func (r helmReleaseReporter) RunningVersion(ctx context.Context) (string, bool, error) {
 	return r.helm.RunningVersion(ctx, r.name, r.namespace)
 }
 
-// ReleaseVersion reports the version a Helm component runs, from its release;
-// nil for the other component types.
-func (e *Engine) ReleaseVersion(name string, spec k4allv1alpha1.ComponentSpec) VersionReporter {
+// HelmReleaseReporter returns what reports the version a Helm component
+// runs, from its Helm release; nil for the other component types.
+func (e *Engine) HelmReleaseReporter(name string, spec k4allv1alpha1.ComponentSpec) VersionReporter {
 	switch spec.Type {
 	case k4allv1alpha1.ComponentTypeHelm, k4allv1alpha1.ComponentTypeHelmOCI:
-		return helmRelease{helm: e.helm, name: name, namespace: spec.Namespace}
+		return helmReleaseReporter{helm: e.helm, name: name, namespace: spec.Namespace}
 	}
 	return nil
 }
