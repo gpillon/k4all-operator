@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/getter"
 	"helm.sh/helm/v3/pkg/registry"
+	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/repo"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -26,16 +28,37 @@ type HelmInstaller struct {
 	restConfig *rest.Config
 	log        logr.Logger
 	cacheDir   string
+	// configFor builds the Helm action configuration of a namespace.
+	configFor func(namespace string) (*action.Configuration, error)
 }
 
 func NewHelmInstaller(restConfig *rest.Config, log logr.Logger) *HelmInstaller {
 	cacheDir := filepath.Join(os.TempDir(), "k4all-helm-cache")
 	_ = os.MkdirAll(cacheDir, 0o755)
-	return &HelmInstaller{
+	h := &HelmInstaller{
 		restConfig: restConfig,
 		log:        log,
 		cacheDir:   cacheDir,
 	}
+	h.configFor = h.actionConfig
+	return h
+}
+
+// RunningVersion returns the chart version of the release and whether its
+// last revision is deployed; "" when there is no release.
+func (h *HelmInstaller) RunningVersion(_ context.Context, name, namespace string) (string, bool, error) {
+	cfg, err := h.configFor(namespace)
+	if err != nil {
+		return "", false, fmt.Errorf("helm action config: %w", err)
+	}
+	rel, err := action.NewStatus(cfg).Run(name)
+	if goerrors.Is(err, driver.ErrReleaseNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("helm release %s/%s: %w", namespace, name, err)
+	}
+	return rel.Chart.Metadata.Version, rel.Info.Status == release.StatusDeployed, nil
 }
 
 // Reconcile installs or upgrades the release. With wait it returns only once

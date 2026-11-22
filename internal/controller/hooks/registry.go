@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/engine"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -18,6 +19,12 @@ type Hook interface {
 	PostInstall(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error
 	Cleanup(ctx context.Context, name string, config k4allv1alpha1.ClusterConfigSpec) error
 }
+
+// VersionReporter is implemented by the hooks of components that can tell
+// which version runs in the cluster (KubeVirt, CDI). The reconciler starts an
+// upgradePath from it when the status has no installedVersion (a component
+// switched from Unmanaged to Managed), and waits on it between the steps.
+type VersionReporter = engine.VersionReporter
 
 // BaseHook provides no-op defaults so hooks only override what they need.
 type BaseHook struct{}
@@ -59,6 +66,7 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 		hooks: make(map[string]Hook),
 	}
 	r.hooks["kubevirt"] = NewVirtHook(c, log.WithName("hook-virt"))
+	r.hooks["cdi"] = NewCDIHook(c)
 	r.hooks["cilium"] = NewCiliumHook(c, log.WithName("hook-cilium"))
 	r.hooks["headlamp"] = NewHeadlampHook(c, log.WithName("hook-headlamp"))
 	nginx := NewIngressNginxHook(c, log.WithName("hook-ingress-nginx"))
@@ -70,6 +78,11 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 	r.hooks["calico"] = NewCalicoHook(c, log.WithName("hook-calico"))
 	r.hooks["nmstate"] = NewNMStateHook(c, log.WithName("hook-nmstate"))
 	return r
+}
+
+// Register sets the hook of a component, replacing the built-in one.
+func (r *Registry) Register(componentName string, h Hook) {
+	r.hooks[componentName] = h
 }
 
 // Get returns the hook for a component, or nil if none exists.

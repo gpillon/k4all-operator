@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
@@ -123,6 +124,8 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if r.engine == nil {
 		r.engine = engine.New(r.Client, r.RestConfig, r.Log.WithName("engine"), r.ToolsImage)
+	}
+	if r.hookReg == nil {
 		r.hookReg = hooks.NewRegistry(r.Client, r.Log, hooks.WithRestConfig(r.RestConfig))
 	}
 
@@ -330,7 +333,30 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			}
 		}
 
-		toApply, intermediate := engine.UpgradeStep(spec, currentStatus.InstalledVersion)
+		start, waiting, pathErr := r.pathStart(ctx, name, spec, currentStatus)
+		if pathErr != nil {
+			log.Error(pathErr, "upgradePath cannot start", "name", name)
+			allOK = false
+			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
+				State:              k4allv1alpha1.ComponentStateFailed,
+				Message:            pathErr.Error(),
+				InstalledVersion:   currentStatus.InstalledVersion,
+				LastTransitionTime: metav1.Now(),
+			}
+			continue
+		}
+		if waiting != "" {
+			stepsLeft = true
+			if currentStatus.State != k4allv1alpha1.ComponentStateUpgrading &&
+				currentStatus.State != k4allv1alpha1.ComponentStatePending {
+				currentStatus.State = k4allv1alpha1.ComponentStatePending
+				currentStatus.LastTransitionTime = metav1.Now()
+			}
+			currentStatus.Message = waiting
+			rm.Status.Components[name] = currentStatus
+			continue
+		}
+		toApply, intermediate := engine.UpgradeStep(spec, start)
 		log.Info("reconciling component", "name", name, "type", spec.Type, "version", toApply.Version,
 			"target", spec.Version)
 
@@ -380,6 +406,78 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 		}
 	}
 	return allOK, stepsLeft
+}
+
+// pathStart is the version an upgradePath continues from: the recorded
+// installedVersion, or, when there is none (a component switched from
+// Unmanaged to Managed), the version it reports running. Mid-path it
+// returns waiting instead while the component does not run the step it was
+// given yet: only Helm steps wait for their resources on their own. An
+// error means nothing may be applied: a running version newer than the
+// release would be a downgrade.
+func (r *ReleaseReconciler) pathStart(
+	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, st k4allv1alpha1.ComponentStatus,
+) (start, waiting string, err error) {
+	if len(spec.UpgradePath) == 0 {
+		return st.InstalledVersion, "", nil
+	}
+	reporter := r.versionReporter(name, spec)
+	if reporter == nil {
+		return st.InstalledVersion, "", nil
+	}
+	switch {
+	case st.InstalledVersion == "":
+		version, ready, readErr := reporter.RunningVersion(ctx)
+		if readErr != nil {
+			return "", "", fmt.Errorf("cannot tell which version of %s runs: %w", name, readErr)
+		}
+		if newerVersion(version, spec.Version) {
+			return "", "", fmt.Errorf("%s runs %s, newer than the release's %s: not downgrading it", name, version, spec.Version)
+		}
+		if version != "" && !ready {
+			return "", fmt.Sprintf("%s runs %s but is not ready: waiting before upgrading it towards %s",
+				name, version, spec.Version), nil
+		}
+		return version, "", nil
+	case st.State == k4allv1alpha1.ComponentStateUpgrading:
+		version, ready, readErr := reporter.RunningVersion(ctx)
+		if readErr != nil {
+			return "", fmt.Sprintf("upgrade step %s applied, waiting for it to run: %v", st.InstalledVersion, readErr), nil
+		}
+		if !ready || !sameVersion(version, st.InstalledVersion) {
+			return "", fmt.Sprintf("upgrade step %s applied, waiting for it to run (runs %q, ready %t) before going on towards %s",
+				st.InstalledVersion, version, ready, spec.Version), nil
+		}
+	}
+	return st.InstalledVersion, "", nil
+}
+
+// newerVersion tells whether a is a later semver than b; false when either
+// is not semver.
+func newerVersion(a, b string) bool {
+	va, errA := semver.NewVersion(a)
+	vb, errB := semver.NewVersion(b)
+	return errA == nil && errB == nil && va.GreaterThan(vb)
+}
+
+// versionReporter tells which version of a component runs: its hook for
+// KubeVirt and CDI, its release for Helm components, nil otherwise.
+func (r *ReleaseReconciler) versionReporter(name string, spec k4allv1alpha1.ComponentSpec) engine.VersionReporter {
+	if reporter, ok := r.hookReg.Get(name).(hooks.VersionReporter); ok {
+		return reporter
+	}
+	return r.engine.ReleaseVersion(name, spec)
+}
+
+// sameVersion compares two versions as semver ("v1.7.0" and "1.7.0" are the
+// same), or as strings when one is not semver.
+func sameVersion(a, b string) bool {
+	va, errA := semver.NewVersion(a)
+	vb, errB := semver.NewVersion(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return va.Equal(vb)
 }
 
 // reconcileRemovedComponents uninstalls components explicitly set to

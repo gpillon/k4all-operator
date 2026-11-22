@@ -28,6 +28,14 @@ data:
 // is recorded as Installed at installedVersion.
 func installedOnEnvtest(t *testing.T, spec k4allv1alpha1.ComponentSpec, installedVersion string) (client.Client, *ReleaseReconciler) {
 	t.Helper()
+	return onEnvtest(t, spec, k4allv1alpha1.ComponentStatus{
+		State: k4allv1alpha1.ComponentStateInstalled, InstalledVersion: installedVersion, LastTransitionTime: metav1.Now(),
+	})
+}
+
+// onEnvtest is installedOnEnvtest with any status for "probe".
+func onEnvtest(t *testing.T, spec k4allv1alpha1.ComponentSpec, status k4allv1alpha1.ComponentStatus) (client.Client, *ReleaseReconciler) {
+	t.Helper()
 	cfg := envtestConfig(t)
 	s := gateScheme(t)
 	c, err := client.New(cfg, client.Options{Scheme: s})
@@ -52,9 +60,7 @@ func installedOnEnvtest(t *testing.T, spec k4allv1alpha1.ComponentSpec, installe
 		}
 		t.Cleanup(func() { _ = c.Delete(context.Background(), obj) })
 	}
-	rm.Status.Components = map[string]k4allv1alpha1.ComponentStatus{
-		"probe": {State: k4allv1alpha1.ComponentStateInstalled, InstalledVersion: installedVersion, LastTransitionTime: metav1.Now()},
-	}
+	rm.Status.Components = map[string]k4allv1alpha1.ComponentStatus{"probe": status}
 	if err := c.Status().Update(ctx, rm); err != nil {
 		t.Fatal(err)
 	}
