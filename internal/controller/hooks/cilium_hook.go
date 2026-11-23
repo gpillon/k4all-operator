@@ -25,7 +25,8 @@ func NewCiliumHook(c client.Client, log logr.Logger) *CiliumHook {
 
 // ciliumValuesRevision changes whenever BuildCiliumValues renders other
 // values for the same ClusterConfig. 2: socketLB.hostNamespaceOnly with
-// KubeVirt, cni.exclusive off with Multus.
+// KubeVirt, cni.exclusive off with Multus, devices ovs-bridge with
+// forceDeviceDetection with the OVS bridge.
 const ciliumValuesRevision = "2"
 
 // ValuesRevision implements ValuesRevisioner.
@@ -93,14 +94,20 @@ func BuildCiliumValues(config k4allv1alpha1.ClusterConfigSpec) map[string]interf
 		values["l2announcements"] = map[string]interface{}{"enabled": true}
 	}
 
-	// Setting devices turns off Cilium's auto-detection, so the main
-	// interface (ovs-bridge, when k4all creates it) must be listed too.
-	if len(cilium.AdditionalDevices) > 0 {
-		var devices []string
-		if config.Features.OVSBridge.Enabled {
-			devices = append(devices, ovsBridgeDevice)
-		}
-		values["devices"] = append(devices, cilium.AdditionalDevices...)
+	// The OVS bridge: Cilium (1.20) skips devices of kind openvswitch in its
+	// auto-detection, so once k4all moved the node IP to ovs-bridge an agent
+	// that starts finds no device and stops ("unable to determine direct
+	// routing device"), at every reboot. ovs-bridge is named, and
+	// forceDeviceDetection keeps the auto-detection for every other device:
+	// on a new node the agent starts on the NIC before the bridge exists,
+	// and the NIC, once a port of the bridge, is skipped.
+	// Setting devices without the OVS bridge turns off the auto-detection:
+	// additionalDevices are then the whole list, as before.
+	if config.Features.OVSBridge.Enabled {
+		values["devices"] = append([]string{ovsBridgeDevice}, cilium.AdditionalDevices...)
+		values["forceDeviceDetection"] = true
+	} else if len(cilium.AdditionalDevices) > 0 {
+		values["devices"] = append([]string{}, cilium.AdditionalDevices...)
 	}
 
 	// KubeVirt: a VM on the pod network sends its packets through
@@ -120,10 +127,10 @@ func BuildCiliumValues(config k4allv1alpha1.ClusterConfigSpec) map[string]interf
 	}
 
 	// The agents read these values at their next start; the operator does
-	// not roll them (rollOutCiliumPods). With the OVS bridge, Cilium 1.20
-	// no longer detects ovs-bridge as a device, so an agent restarted on
-	// such a node crash-loops ("unable to determine direct routing
-	// device") until devices names it.
+	// not roll them (rollOutCiliumPods): a node still registered with a
+	// pod-network InternalIP, or still without the devices above, would
+	// crash-loop. k4all-upgrade restarts the agent of each node once the
+	// node runs the release that pins this operator.
 
 	if cilium.GatewayAPI {
 		values["gatewayAPI"] = map[string]interface{}{"enabled": true}

@@ -73,3 +73,42 @@ func TestCiliumHookHasAValuesRevision(t *testing.T) {
 		t.Fatalf("the cilium hook must report a values revision, so clusters re-apply Cilium after the operator upgrade")
 	}
 }
+
+func TestBuildCiliumValues_OVSBridgeIsNamedAndAutoDetectionStays(t *testing.T) {
+	c := ciliumConfig(false, false)
+	c.Features.OVSBridge.Enabled = true
+	v := BuildCiliumValues(c)
+	if want := []string{"ovs-bridge"}; !reflect.DeepEqual(v["devices"], want) {
+		t.Errorf("devices = %v, want %v", v["devices"], want)
+	}
+	if v["forceDeviceDetection"] != true {
+		t.Errorf("forceDeviceDetection = %v, want true (the NIC before the bridge exists)", v["forceDeviceDetection"])
+	}
+
+	c.Networking.CNI.Cilium.AdditionalDevices = []string{"eth1"}
+	v = BuildCiliumValues(c)
+	if want := []string{"ovs-bridge", "eth1"}; !reflect.DeepEqual(v["devices"], want) {
+		t.Errorf("devices = %v, want %v", v["devices"], want)
+	}
+}
+
+func TestBuildCiliumValues_AdditionalDevicesWithoutTheBridge(t *testing.T) {
+	c := ciliumConfig(false, false)
+	c.Networking.CNI.Cilium.AdditionalDevices = []string{"eth1", "eth2"}
+	v := BuildCiliumValues(c)
+	if want := []string{"eth1", "eth2"}; !reflect.DeepEqual(v["devices"], want) {
+		t.Errorf("devices = %v, want %v", v["devices"], want)
+	}
+	if _, ok := v["forceDeviceDetection"]; ok {
+		t.Errorf("forceDeviceDetection set without the OVS bridge")
+	}
+}
+
+func TestBuildCiliumValues_NoDevicesWithoutBridgeOrAdditionalDevices(t *testing.T) {
+	v := BuildCiliumValues(ciliumConfig(true, true))
+	for _, k := range []string{"devices", "forceDeviceDetection"} {
+		if _, ok := v[k]; ok {
+			t.Errorf("%s set: %v", k, v[k])
+		}
+	}
+}
