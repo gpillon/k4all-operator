@@ -12,10 +12,12 @@ import (
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/getter"
 	"helm.sh/helm/v3/pkg/registry"
+	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/repo"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -70,19 +72,30 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 		return fmt.Errorf("helm action config: %w", err)
 	}
 
-	installed, currentVersion, err := h.getRelease(cfg, name)
-	if err != nil {
-		return err
-	}
-
 	chartPath, err := h.pullChart(spec)
 	if err != nil {
 		return fmt.Errorf("pull chart: %w", err)
 	}
 
-	chart, err := loader.Load(chartPath)
+	ch, err := loader.Load(chartPath)
 	if err != nil {
 		return fmt.Errorf("load chart %s: %w", chartPath, err)
+	}
+
+	return h.installOrUpgrade(ctx, cfg, name, spec, ch, values, wait)
+}
+
+// installOrUpgrade installs the release, or upgrades it when it exists.
+func (h *HelmInstaller) installOrUpgrade(
+	ctx context.Context, cfg *action.Configuration, name string, spec k4allv1alpha1.ComponentSpec,
+	ch *chart.Chart, values map[string]interface{}, wait bool,
+) error {
+	if err := h.recoverPendingRelease(cfg, name); err != nil {
+		return err
+	}
+	installed, currentVersion, err := h.getRelease(cfg, name)
+	if err != nil {
+		return err
 	}
 
 	if !installed {
@@ -93,7 +106,7 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 		install.CreateNamespace = true
 		install.Wait = wait
 		install.Timeout = 10 * time.Minute
-		_, err = install.RunWithContext(ctx, chart, values)
+		_, err = install.RunWithContext(ctx, ch, values)
 		return err
 	}
 
@@ -108,7 +121,7 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 	upgrade.Wait = wait
 	upgrade.Timeout = 10 * time.Minute
 	upgrade.MaxHistory = 3
-	_, err = upgrade.RunWithContext(ctx, name, chart, values)
+	_, err = upgrade.RunWithContext(ctx, name, ch, values)
 	return err
 }
 
@@ -131,6 +144,39 @@ func (h *HelmInstaller) Uninstall(ctx context.Context, name, namespace string) e
 	uninstall.Timeout = 5 * time.Minute
 	_, err = uninstall.Run(name)
 	return err
+}
+
+// recoverPendingRelease marks failed a last revision still pending-install,
+// pending-upgrade or pending-rollback, so that the install or upgrade can go
+// on. Only the operator's leader installs and upgrades these releases, one
+// reconcile at a time, and it calls Helm synchronously: a revision pending
+// when a reconcile starts was left by an operator process that stopped in the
+// middle of the operation (deleted by k4all's CRI-O bridge handover on a
+// fresh install, OOM-killed, or rebooted with its node). Helm would refuse
+// every later install or upgrade with "another operation is in progress".
+// Marking it failed is what Helm itself does to an operation that fails: the
+// upgrade then goes on from the last deployed revision, or from this one when
+// none was ever deployed. Nothing is uninstalled.
+func (h *HelmInstaller) recoverPendingRelease(cfg *action.Configuration, name string) error {
+	last, err := cfg.Releases.Last(name)
+	if goerrors.Is(err, driver.ErrReleaseNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("helm release %s: %w", name, err)
+	}
+	if last.Info == nil || !last.Info.Status.IsPending() {
+		return nil
+	}
+	h.log.Info("helm release left pending by an operator that stopped during the operation: marking it failed",
+		"name", name, "revision", last.Version, "status", last.Info.Status)
+	last.Info.Description = fmt.Sprintf("%s left by an operator that stopped during it; marked failed by k4all-operator",
+		last.Info.Status)
+	last.Info.Status = release.StatusFailed
+	if err := cfg.Releases.Update(last); err != nil {
+		return fmt.Errorf("mark the pending revision %d of helm release %s failed: %w", last.Version, name, err)
+	}
+	return nil
 }
 
 func (h *HelmInstaller) getRelease(cfg *action.Configuration, name string) (installed bool, version string, err error) {
