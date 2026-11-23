@@ -25,7 +25,7 @@ func NewCiliumHook(c client.Client, log logr.Logger) *CiliumHook {
 
 // ciliumValuesRevision changes whenever BuildCiliumValues renders other
 // values for the same ClusterConfig. 2: socketLB.hostNamespaceOnly with
-// KubeVirt, cni.exclusive off with Multus, rollOutCiliumPods with either.
+// KubeVirt, cni.exclusive off with Multus.
 const ciliumValuesRevision = "2"
 
 // ValuesRevision implements ValuesRevisioner.
@@ -119,12 +119,11 @@ func BuildCiliumValues(config k4allv1alpha1.ClusterConfigSpec) map[string]interf
 		values["cni"] = map[string]interface{}{"exclusive": false}
 	}
 
-	// Cilium agents read their ConfigMap only at start: roll them when the
-	// values above are in play, so a running cluster picks up the change
-	// (once; the datapath keeps forwarding while each agent restarts).
-	if config.Features.Virt.Enabled || config.Features.OVSCNI.Enabled {
-		values["rollOutCiliumPods"] = true
-	}
+	// The agents read these values at their next start; the operator does
+	// not roll them (rollOutCiliumPods). With the OVS bridge, Cilium 1.20
+	// no longer detects ovs-bridge as a device, so an agent restarted on
+	// such a node crash-loops ("unable to determine direct routing
+	// device") until devices names it.
 
 	if cilium.GatewayAPI {
 		values["gatewayAPI"] = map[string]interface{}{"enabled": true}

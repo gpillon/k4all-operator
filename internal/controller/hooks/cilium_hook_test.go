@@ -19,7 +19,7 @@ func ciliumConfig(virt, ovsCni bool) k4allv1alpha1.ClusterConfigSpec {
 
 func TestBuildCiliumValues_PlainClusterKeepsChartDefaults(t *testing.T) {
 	v := BuildCiliumValues(ciliumConfig(false, false))
-	for _, k := range []string{"socketLB", "cni", "rollOutCiliumPods"} {
+	for _, k := range []string{"socketLB", "cni"} {
 		if _, ok := v[k]; ok {
 			t.Errorf("%s set without KubeVirt or Multus: %v", k, v[k])
 		}
@@ -37,9 +37,6 @@ func TestBuildCiliumValues_KubeVirtKeepsSocketLBInTheHost(t *testing.T) {
 	if _, ok := v["cni"]; ok {
 		t.Errorf("cni set without Multus: %v", v["cni"])
 	}
-	if v["rollOutCiliumPods"] != true {
-		t.Errorf("rollOutCiliumPods = %v, want true", v["rollOutCiliumPods"])
-	}
 }
 
 func TestBuildCiliumValues_MultusKeepsItsCNIConfig(t *testing.T) {
@@ -50,15 +47,22 @@ func TestBuildCiliumValues_MultusKeepsItsCNIConfig(t *testing.T) {
 	if _, ok := v["socketLB"]; ok {
 		t.Errorf("socketLB set without KubeVirt: %v", v["socketLB"])
 	}
-	if v["rollOutCiliumPods"] != true {
-		t.Errorf("rollOutCiliumPods = %v, want true", v["rollOutCiliumPods"])
-	}
 }
 
 func TestBuildCiliumValues_KubeVirtAndMultus(t *testing.T) {
 	v := BuildCiliumValues(ciliumConfig(true, true))
-	if v["socketLB"] == nil || v["cni"] == nil || v["rollOutCiliumPods"] != true {
-		t.Errorf("values = %v, want socketLB, cni and rollOutCiliumPods", v)
+	if v["socketLB"] == nil || v["cni"] == nil {
+		t.Errorf("values = %v, want socketLB and cni", v)
+	}
+}
+
+// The operator never rolls the agents: on a node with the OVS bridge an
+// agent restarted without devices=ovs-bridge crash-loops (Cilium 1.20).
+func TestBuildCiliumValues_NeverRollsTheAgents(t *testing.T) {
+	for _, c := range []k4allv1alpha1.ClusterConfigSpec{ciliumConfig(true, true), ciliumConfig(false, false)} {
+		if _, ok := BuildCiliumValues(c)["rollOutCiliumPods"]; ok {
+			t.Errorf("rollOutCiliumPods set for %+v", c.Features)
+		}
 	}
 }
 
