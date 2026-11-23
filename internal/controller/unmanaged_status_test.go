@@ -50,3 +50,21 @@ func TestReconcile_ComponentTurningUnmanagedRecordsWhen(t *testing.T) {
 		t.Errorf("%s since %s, want Unmanaged since now", st.State, st.LastTransitionTime)
 	}
 }
+
+// A component its feature gate leaves out keeps the time it was skipped.
+func TestReconcile_SkippedComponentKeepsItsTransitionTime(t *testing.T) {
+	since := metav1.NewTime(time.Now().Add(-time.Hour).Truncate(time.Second))
+	cl := newCluster(t,
+		map[string]k4allv1alpha1.ComponentSpec{"probe": {Type: "unsupported", Version: "1", FeatureGate: "virt"}},
+		map[string]k4allv1alpha1.ComponentStatus{"probe": {
+			State: k4allv1alpha1.ComponentStateSkipped, Message: skippedMessage, LastTransitionTime: since,
+		}},
+	)
+
+	cl.reconcile()
+
+	st := cl.manifest().Status.Components["probe"]
+	if st.State != k4allv1alpha1.ComponentStateSkipped || !st.LastTransitionTime.Equal(&since) {
+		t.Errorf("%s since %s, want Skipped since %s", st.State, st.LastTransitionTime, since)
+	}
+}

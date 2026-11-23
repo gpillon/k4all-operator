@@ -299,14 +299,21 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 			}
 		}
 
+		if prevStatus.State == k4allv1alpha1.ComponentStateSkipped && prevStatus.Message == skippedMessage {
+			continue
+		}
 		rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
 			State:              k4allv1alpha1.ComponentStateSkipped,
-			Message:            "disabled by ClusterConfig feature gate",
+			Message:            skippedMessage,
 			LastTransitionTime: metav1.Now(),
 		}
 	}
 	return allOK
 }
+
+// skippedMessage is the message of a component its feature gate or the CNI
+// leaves out.
+const skippedMessage = "disabled by ClusterConfig feature gate"
 
 // reconcileActiveComponents installs or upgrades the active components in
 // dependency order, running the PreInstall/PostInstall hooks around each one.
