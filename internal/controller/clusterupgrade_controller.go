@@ -31,6 +31,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -130,6 +131,12 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 	in.UnhealthyPDBs = pdbs
+	// Only an upgrade drains, and only with more than one node.
+	if cu.Spec.TargetRelease != "" && len(nodeList.Items) > 1 {
+		if in.Blockers, err = r.drainBlockers(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	status, actions := clusterupgrade.Decide(in)
 	// Actions first: the status must never claim a step the Nodes do not show.
@@ -204,20 +211,27 @@ func (r *ClusterUpgradeReconciler) podsToEvict(ctx context.Context, nodeName str
 	}
 	out := make([]corev1.Pod, 0, len(pods.Items))
 	for _, p := range pods.Items {
-		if p.Spec.NodeName != nodeName || // the fake client ignores field selectors
-			p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed ||
-			(p.Namespace == r.Self.Namespace && p.Name == r.Self.Name) {
+		if p.Spec.NodeName != nodeName { // the fake client ignores field selectors
 			continue
 		}
-		if _, mirror := p.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
-			continue
+		if drainMoves(p, r.Self) {
+			out = append(out, p)
 		}
-		if ownedByDaemonSet(p) {
-			continue
-		}
-		out = append(out, p)
 	}
 	return out, nil
+}
+
+// drainMoves tells whether the drain moves p off its node: not a finished,
+// static (mirror) or DaemonSet pod, nor the operator itself.
+func drainMoves(p corev1.Pod, self types.NamespacedName) bool {
+	if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed ||
+		(p.Namespace == self.Namespace && p.Name == self.Name) {
+		return false
+	}
+	if _, mirror := p.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
+		return false
+	}
+	return !ownedByDaemonSet(p)
 }
 
 func ownedByDaemonSet(p corev1.Pod) bool {
@@ -243,9 +257,10 @@ func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Act
 			mark = k4allv1alpha1.NodeCordonedAlready
 		}
 		return r.patchNode(ctx, a.Node, map[string]interface{}{
-			"metadata": map[string]interface{}{"annotations": map[string]interface{}{
-				k4allv1alpha1.NodeUpgradeCordonedAnnotation: mark,
-			}},
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{k4allv1alpha1.NodeUpgradeCordonedAnnotation: mark},
+				"labels":      map[string]interface{}{clusterupgrade.DrainingLabel: "true"},
+			},
 			"spec": map[string]interface{}{"unschedulable": true},
 		})
 	case clusterupgrade.Evict:
@@ -254,9 +269,10 @@ func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Act
 	case clusterupgrade.Uncordon:
 		// From here a cordon on the node is the admin's: Finish leaves it.
 		return r.patchNode(ctx, a.Node, map[string]interface{}{
-			"metadata": map[string]interface{}{"annotations": map[string]interface{}{
-				k4allv1alpha1.NodeUpgradeCordonedAnnotation: k4allv1alpha1.NodeCordonReleased,
-			}},
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{k4allv1alpha1.NodeUpgradeCordonedAnnotation: k4allv1alpha1.NodeCordonReleased},
+				"labels":      map[string]interface{}{clusterupgrade.DrainingLabel: nil},
+			},
 			"spec": map[string]interface{}{"unschedulable": false},
 		})
 	case clusterupgrade.SetTarget:
@@ -271,11 +287,15 @@ func (r *ClusterUpgradeReconciler) run(ctx context.Context, a clusterupgrade.Act
 			return err
 		}
 		patch := map[string]interface{}{
-			"metadata": map[string]interface{}{"annotations": map[string]interface{}{
-				k4allv1alpha1.NodeUpgradeCordonedAnnotation: nil,
-				k4allv1alpha1.NodeUpgradeTargetAnnotation:   nil,
-				k4allv1alpha1.NodeUpgradeDoneAnnotation:     nil,
-			}},
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					k4allv1alpha1.NodeUpgradeCordonedAnnotation: nil,
+					k4allv1alpha1.NodeUpgradeTargetAnnotation:   nil,
+					k4allv1alpha1.NodeUpgradeDoneAnnotation:     nil,
+				},
+				// Also from a cordon that stays (the admin's): the drain is over.
+				"labels": map[string]interface{}{clusterupgrade.DrainingLabel: nil},
+			},
 		}
 		if node.Annotations[k4allv1alpha1.NodeUpgradeCordonedAnnotation] == k4allv1alpha1.NodeCordonedByOperator {
 			patch["spec"] = map[string]interface{}{"unschedulable": false}
@@ -357,6 +377,135 @@ func (r *ClusterUpgradeReconciler) unhealthyPDBs(ctx context.Context) ([]cluster
 		return out[i].Namespace+"/"+out[i].Name < out[j].Namespace+"/"+out[j].Name
 	})
 	return out, nil
+}
+
+// The labels of a CloudNativePG instance pod.
+const (
+	cnpgClusterLabel = "cnpg.io/cluster"
+	cnpgRoleLabel    = "cnpg.io/instanceRole"
+)
+
+// drainBlockers lists, by node, the pods its drain could never evict
+// (findBlockers). It reads the pods of the budgets that never allow a
+// disruption, and the CloudNativePG replicas that could take over from a
+// primary among them.
+func (r *ClusterUpgradeReconciler) drainBlockers(ctx context.Context) (map[string][]clusterupgrade.Blocker, error) {
+	list := &policyv1.PodDisruptionBudgetList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil, fmt.Errorf("list PodDisruptionBudgets: %w", err)
+	}
+	stuck := make([]policyv1.PodDisruptionBudget, 0, len(list.Items))
+	var pods []corev1.Pod
+	seen := map[types.NamespacedName]bool{}
+	add := func(namespace string, selector labels.Selector) error {
+		got := &corev1.PodList{}
+		if err := r.APIReader.List(ctx, got, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+			return fmt.Errorf("list pods in %s: %w", namespace, err)
+		}
+		for _, p := range got.Items {
+			if key := client.ObjectKeyFromObject(&p); !seen[key] {
+				seen[key] = true
+				pods = append(pods, p)
+			}
+		}
+		return nil
+	}
+	for _, p := range list.Items {
+		// A null selector selects no pod (and as a list option, every pod).
+		if p.Spec.Selector == nil || !neverAllows(p) {
+			continue
+		}
+		selector, err := metav1.LabelSelectorAsSelector(p.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		stuck = append(stuck, p)
+		if err := add(p.Namespace, selector); err != nil {
+			return nil, err
+		}
+	}
+	clusters := map[types.NamespacedName]bool{}
+	for _, p := range pods {
+		if c := p.Labels[cnpgClusterLabel]; c != "" && p.Labels[cnpgRoleLabel] == "primary" {
+			clusters[types.NamespacedName{Namespace: p.Namespace, Name: c}] = true
+		}
+	}
+	for c := range clusters {
+		if err := add(c.Namespace, labels.SelectorFromSet(labels.Set{cnpgClusterLabel: c.Name, cnpgRoleLabel: "replica"})); err != nil {
+			return nil, err
+		}
+	}
+	return findBlockers(stuck, pods, r.Self), nil
+}
+
+// neverAllows tells whether a PodDisruptionBudget allows no disruption
+// although every pod it expects is healthy: waiting changes nothing. One
+// short of healthy pods is not: its pods are starting (waitForPDBs, and the
+// drain retries until its timeout). Nor is one the disruption controller has
+// not seen yet.
+func neverAllows(p policyv1.PodDisruptionBudget) bool {
+	return p.Status.ObservedGeneration >= p.Generation && p.Status.DisruptionsAllowed == 0 &&
+		p.Status.CurrentHealthy >= p.Status.ExpectedPods
+}
+
+// findBlockers lists, by node and sorted, the pods a drain of their node
+// could never evict: a budget in pdbs that never allows a disruption selects
+// them, and the eviction API applies it (a running pod, not terminating,
+// that the drain moves). A CloudNativePG primary with a ready replica on
+// another node is not one: CNPG switches it over when its node is cordoned.
+func findBlockers(pdbs []policyv1.PodDisruptionBudget, pods []corev1.Pod, self types.NamespacedName) map[string][]clusterupgrade.Blocker {
+	out := map[string][]clusterupgrade.Blocker{}
+	for _, b := range pdbs {
+		if !neverAllows(b) {
+			continue
+		}
+		selector, err := metav1.LabelSelectorAsSelector(b.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		for _, p := range pods {
+			if p.Namespace != b.Namespace || !selector.Matches(labels.Set(p.Labels)) ||
+				p.Status.Phase != corev1.PodRunning || p.DeletionTimestamp != nil ||
+				!drainMoves(p, self) || cnpgSwitchesOver(p, pods) {
+				continue
+			}
+			out[p.Spec.NodeName] = append(out[p.Spec.NodeName], clusterupgrade.Blocker{
+				PDB: b.Namespace + "/" + b.Name, Pod: p.Namespace + "/" + p.Name})
+		}
+	}
+	for _, blockers := range out {
+		sort.Slice(blockers, func(i, j int) bool {
+			return blockers[i].PDB+" "+blockers[i].Pod < blockers[j].PDB+" "+blockers[j].Pod
+		})
+	}
+	return out
+}
+
+// cnpgSwitchesOver tells whether p is a CloudNativePG primary that CNPG
+// moves off its node by itself: once the node is cordoned it switches over to
+// a replica, here one ready on another node (CNPG docs, Kubernetes upgrade).
+func cnpgSwitchesOver(p corev1.Pod, pods []corev1.Pod) bool {
+	cluster := p.Labels[cnpgClusterLabel]
+	if cluster == "" || p.Labels[cnpgRoleLabel] != "primary" {
+		return false
+	}
+	for _, o := range pods {
+		if o.Namespace == p.Namespace && o.Labels[cnpgClusterLabel] == cluster && o.Labels[cnpgRoleLabel] == "replica" &&
+			o.Spec.NodeName != "" && o.Spec.NodeName != p.Spec.NodeName && o.DeletionTimestamp == nil &&
+			o.Status.Phase == corev1.PodRunning && podReady(o) {
+			return true
+		}
+	}
+	return false
+}
+
+func podReady(p corev1.Pod) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager. Every Node

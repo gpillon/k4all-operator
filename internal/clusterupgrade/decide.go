@@ -27,16 +27,18 @@ type Node struct {
 type ActionKind string
 
 const (
-	// Cordon the node and mark it upgrade-cordoned.
+	// Cordon the node, mark it upgrade-cordoned and label it draining.
 	Cordon ActionKind = "Cordon"
 	// Evict the pods the drain moves off the node.
 	Evict ActionKind = "Evict"
 	// Write upgrade-target: Release, the hop k4all-upgrade runs.
 	SetTarget ActionKind = "SetTarget"
-	// Uncordon the node past its reboot and mark it upgrade-cordoned: released.
+	// Uncordon the node past its reboot, mark it upgrade-cordoned: released
+	// and remove the draining label.
 	Uncordon ActionKind = "Uncordon"
-	// Uncordon the node if the operator cordoned it, and clear the
-	// upgrade-target, upgrade-done and upgrade-cordoned annotations.
+	// Uncordon the node if the operator cordoned it, clear the
+	// upgrade-target, upgrade-done and upgrade-cordoned annotations and
+	// remove the draining label.
 	Finish ActionKind = "Finish"
 )
 
@@ -64,6 +66,13 @@ type PDB struct {
 	Healthy, Desired int32
 }
 
+// Blocker is a pod a drain cannot move: its PodDisruptionBudget allows no
+// disruption although every pod it expects is healthy, so waiting changes
+// nothing (the primary of a single-instance CloudNativePG cluster).
+type Blocker struct {
+	PDB, Pod string // namespace/name
+}
+
 // Input is the state Decide works from.
 type Input struct {
 	Spec     k4allv1alpha1.ClusterUpgradeSpec
@@ -73,6 +82,9 @@ type Input struct {
 	Pods map[string][]Pod
 	// PodDisruptionBudgets short of healthy pods, sorted.
 	UnhealthyPDBs []PDB
+	// Blockers holds, for each node, the pods on it that its drain could
+	// never evict, sorted.
+	Blockers map[string][]Blocker
 	// Graph is nil when it could not be read (GraphErr).
 	Graph    *upgradegraph.Graph
 	GraphErr error
@@ -139,7 +151,38 @@ func decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action, string) {
 		status.Message = hop + ": " + wait
 		return status, nil, ""
 	}
+	if wait := blockedNext(in, &status); wait != "" {
+		status.Message = hop + ": " + wait
+		return status, nil, ""
+	}
 	return status, cordonNext(in, &status, hop), ""
+}
+
+// blockedNext says why the next node is not cordoned: pods on it that its
+// drain could never evict (k4all#87). The upgrade waits, without a cordon,
+// until the admin lets them go; changing a budget is the admin's call. A
+// single node is not drained, so nothing blocks it.
+func blockedNext(in Input, status *k4allv1alpha1.ClusterUpgradeStatus) string {
+	i := nextPending(*status)
+	if i < 0 || len(in.Nodes) <= 1 {
+		return ""
+	}
+	n := &status.Nodes[i]
+	blockers := in.Blockers[n.Name]
+	if len(blockers) == 0 {
+		return ""
+	}
+	named := make([]string, 0, 4)
+	for j, b := range blockers {
+		if j == 3 {
+			named = append(named, fmt.Sprintf("and %d more", len(blockers)-3))
+			break
+		}
+		named = append(named, fmt.Sprintf("PDB %s allows no disruption of pod %s", b.PDB, b.Pod))
+	}
+	n.Message = "cannot be drained: " + strings.Join(named, "; ") +
+		" (a single-instance CloudNativePG cluster? see docs/upgrades.md, Drains that never end); the node is not cordoned"
+	return n.Name + " " + n.Message
 }
 
 // waitForPDBs names the PodDisruptionBudget the next node waits for. After a
@@ -375,24 +418,40 @@ func waitFor(nodes []Node) (string, int) {
 // upgradeInProgressAnnotation is the pause gate k4all-upgrade sets during any hop.
 const upgradeInProgressAnnotation = "k4all.magesgate.com/upgrade-in-progress"
 
+// DrainingLabel is on a Node from its Cordon to its Uncordon or Finish. The
+// operator's pod tolerates the cordon, which a single node needs, and prefers
+// the nodes without this label (config/manager/manager.yaml): a drain that
+// evicts it does not put it back on the node about to reboot (k4all#86).
+// k4all-upgrade sets it too when it drains a node itself.
+const DrainingLabel = "k4all.magesgate.com/draining"
+
+// nextPending is the index of the first node behind the current hop, -1
+// when there is none.
+func nextPending(status k4allv1alpha1.ClusterUpgradeStatus) int {
+	for i := range status.Nodes {
+		if status.Nodes[i].Phase == k4allv1alpha1.NodeUpgradePending {
+			return i
+		}
+	}
+	return -1
+}
+
 // cordonNext starts the first node behind hop.
 func cordonNext(in Input, status *k4allv1alpha1.ClusterUpgradeStatus, hop string) []Action {
-	for i := range status.Nodes {
-		n := &status.Nodes[i]
-		if n.Phase != k4allv1alpha1.NodeUpgradePending {
-			continue
-		}
-		n.Phase = k4allv1alpha1.NodeUpgradeDraining
-		started := metav1.NewTime(in.Now)
-		n.DrainStartedAt, n.StartedAt, n.CompletedAt = &started, &started, nil
-		actions := []Action{{Kind: Cordon, Node: n.Name}}
-		if len(in.Nodes) == 1 {
-			n.Phase = k4allv1alpha1.NodeUpgradeUpgrading
-			actions = append(actions, Action{Kind: SetTarget, Node: n.Name, Release: hop})
-		}
-		return actions
+	i := nextPending(*status)
+	if i < 0 {
+		return nil
 	}
-	return nil
+	n := &status.Nodes[i]
+	n.Phase = k4allv1alpha1.NodeUpgradeDraining
+	started := metav1.NewTime(in.Now)
+	n.DrainStartedAt, n.StartedAt, n.CompletedAt = &started, &started, nil
+	actions := []Action{{Kind: Cordon, Node: n.Name}}
+	if len(in.Nodes) == 1 {
+		n.Phase = k4allv1alpha1.NodeUpgradeUpgrading
+		actions = append(actions, Action{Kind: SetTarget, Node: n.Name, Release: hop})
+	}
+	return actions
 }
 
 // step moves on the node the operator cordoned: drain it, ask for the hop,
