@@ -12,7 +12,8 @@ import (
 )
 
 // CiliumHook configures Cilium-specific Helm values that depend on ClusterConfig
-// (kube-proxy replacement, spec.networking.cni.cilium options).
+// (kube-proxy replacement, spec.networking.cni.cilium options) and on the
+// cluster (the pod pool Cilium runs).
 type CiliumHook struct {
 	BaseHook
 	client client.Client
@@ -23,17 +24,26 @@ func NewCiliumHook(c client.Client, log logr.Logger) *CiliumHook {
 	return &CiliumHook{client: c, log: log}
 }
 
-// ciliumValuesRevision changes whenever BuildCiliumValues renders other
-// values for the same ClusterConfig. 2: socketLB.hostNamespaceOnly with
-// KubeVirt, cni.exclusive off with Multus, devices ovs-bridge with
-// forceDeviceDetection with the OVS bridge.
-const ciliumValuesRevision = "2"
+// ciliumValuesRevision changes whenever PreInstall renders other values for
+// the same ClusterConfig. 2: socketLB.hostNamespaceOnly with KubeVirt,
+// cni.exclusive off with Multus, devices ovs-bridge with
+// forceDeviceDetection with the OVS bridge. 3: ipam, the pool the cluster
+// runs (the chart default 10.0.0.0/8 before), spec.cluster.podNetwork on a
+// new cluster.
+const ciliumValuesRevision = "3"
 
 // ValuesRevision implements ValuesRevisioner.
 func (h *CiliumHook) ValuesRevision() string { return ciliumValuesRevision }
 
-func (h *CiliumHook) PreInstall(_ context.Context, _ string, _ k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {
+// PreInstall renders BuildCiliumValues and the IPAM: the pool Cilium runs,
+// or spec.cluster.podNetwork on a new cluster (ReadCiliumIPAM).
+func (h *CiliumHook) PreInstall(ctx context.Context, _ string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {
+	ipam, err := ReadCiliumIPAM(ctx, h.client, spec.Namespace, config)
+	if err != nil {
+		return nil, err
+	}
 	extra := BuildCiliumValues(config)
+	extra["ipam"] = ipam.helmValues()
 	for k, v := range extra {
 		values[k] = v
 	}
