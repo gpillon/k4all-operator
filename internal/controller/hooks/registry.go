@@ -58,6 +58,16 @@ type ValuesRevisioner interface {
 	ValuesRevision() string
 }
 
+// OverrideMerger is implemented by a hook that layers its component's
+// ClusterConfig componentOverride on the PreInstall values itself, instead
+// of the plain deep merge, where a list of the override replaces the
+// release's list (headlamp: plugin lists merge by name). The reconciler calls
+// it on every apply, with an empty override when the ClusterConfig has none.
+type OverrideMerger interface {
+	MergeOverride(spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+		values map[string]interface{}, override k4allv1alpha1.ComponentOverride) (map[string]interface{}, error)
+}
+
 // Registry maps component names to their hooks.
 type Registry struct {
 	hooks map[string]Hook

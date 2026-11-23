@@ -749,18 +749,23 @@ func (r *ReleaseReconciler) appliedHash(
 // componentValues returns the values the engine layers on top of the
 // ReleaseManifest values of one component: the PreInstall hook's values
 // first, then the ClusterConfig componentOverrides, so the user always wins.
-// The PreInstall hook, if any, may also prepare the cluster.
+// The PreInstall hook, if any, may also prepare the cluster. A hook that is
+// an OverrideMerger layers the override itself.
 func (r *ReleaseReconciler) componentValues(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
 ) (map[string]interface{}, error) {
 	values := make(map[string]interface{})
-	if hook := r.hookReg.Get(name); hook != nil {
+	hook := r.hookReg.Get(name)
+	if hook != nil {
 		var err error
 		if values, err = hook.PreInstall(ctx, name, spec, config, values); err != nil {
 			return nil, err
 		}
 	}
 	override, ok := config.ComponentOverrides[name]
+	if merger, isMerger := hook.(hooks.OverrideMerger); isMerger {
+		return merger.MergeOverride(spec, config, values, override)
+	}
 	if !ok {
 		return values, nil
 	}
