@@ -42,7 +42,9 @@ func (BaseHook) Cleanup(_ context.Context, _ string, _ k4allv1alpha1.ClusterConf
 // cluster between installs (KubeVirt: emulation "auto" follows the nodes).
 // The reconciler calls Sync after PostInstall and on every reconcile while
 // the component is installed and up to date. A positive duration asks for the
-// next reconcile within that time, also with an error (which is logged).
+// next reconcile within that time, also with an error. Sync redoes all the
+// hook's post-install work: its error goes into the component's message like
+// a PostInstall one, and a success clears such a message.
 type Syncer interface {
 	Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) (time.Duration, error)
 }

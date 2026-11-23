@@ -67,12 +67,18 @@ func TestVirtHook_IsNotReadyWhileAVersionRollsOut(t *testing.T) {
 	}
 }
 
+// noKubeVirtCRD is a fake API server without the KubeVirt CRD.
+func noKubeVirtCRD() client.Client {
+	return fake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			return &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "kubevirt.io", Kind: "KubeVirt"}}
+		},
+	}).Build()
+}
+
 // Before KubeVirt is ever installed its CRD does not exist either.
 func TestVirtHook_NoKubeVirtCRDIsNotInstalled(t *testing.T) {
-	noCRD := interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
-		return &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "kubevirt.io", Kind: "KubeVirt"}}
-	}}
-	h := NewVirtHook(fake.NewClientBuilder().WithInterceptorFuncs(noCRD).Build(), logr.Discard())
+	h := NewVirtHook(noKubeVirtCRD(), logr.Discard())
 
 	version, ready, err := h.RunningVersion(context.Background())
 

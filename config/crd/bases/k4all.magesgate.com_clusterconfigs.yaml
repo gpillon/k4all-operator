@@ -136,8 +136,12 @@ spec:
                     properties:
                       emulation:
                         default: auto
-                        description: 'Emulation mode: "true", "false", or "auto" (detect
-                          /dev/kvm)'
+                        description: |-
+                          Emulation mode, set in the KubeVirt CR as useEmulation (the operator puts
+                          back a value changed there by hand): "true", "false", or "auto". With
+                          "auto" the nodes decide, from the devices.kubevirt.io/kvm that
+                          virt-handler offers where /dev/kvm exists: emulation is off once a node
+                          offers KVM, on once virt-handler runs and none does.
                         enum:
                         - "true"
                         - "false"

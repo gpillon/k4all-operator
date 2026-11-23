@@ -9,52 +9,49 @@ import (
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// What virt-handler's device plugin makes the kubelet report for
-// devices.kubevirt.io/kvm: 1k devices, allocatable while /dev/kvm exists.
-const (
-	withKVM    = "kvm"    // capacity 1k, allocatable 1k
-	withoutKVM = "no-kvm" // capacity 1k, allocatable 0: the device is missing
-	noHandler  = ""       // no resource: virt-handler has not run there
-)
-
-// virtNode is a node as the kubelet and virt-handler report it. schedulable is
-// the kubevirt.io/schedulable label virt-handler sets once its device plugins
-// are up.
-func virtNode(name, kvm string, schedulable bool) *corev1.Node {
+// virtNode is a node as the kubelet and virt-handler report it:
+//   - kvmAvailable: virt-handler is up, devices.kubevirt.io/kvm capacity and
+//     allocatable 1k (/dev/kvm exists);
+//   - kvmMissing: virt-handler is up, capacity 1k and allocatable 0 (no
+//     /dev/kvm, or virt-handler crashed and the kubelet marked its devices
+//     unhealthy);
+//   - kvmUnknown: virt-handler has not run there.
+func virtNode(name string, kvm kvmOnNodes) *corev1.Node {
 	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{}}}
-	if schedulable || kvm != noHandler {
-		n.Labels[schedulableLabel] = strconv.FormatBool(schedulable)
-	}
-	switch kvm {
-	case withKVM:
-		n.Status.Capacity = corev1.ResourceList{kvmResource: resource.MustParse("1k")}
-		n.Status.Allocatable = corev1.ResourceList{kvmResource: resource.MustParse("1k")}
-	case withoutKVM:
-		n.Status.Capacity = corev1.ResourceList{kvmResource: resource.MustParse("1k")}
-		n.Status.Allocatable = corev1.ResourceList{kvmResource: resource.MustParse("0")}
-	}
+	setVirtHandler(n, kvm)
 	return n
+}
+
+func setVirtHandler(n *corev1.Node, kvm kvmOnNodes) {
+	n.Status = corev1.NodeStatus{}
+	delete(n.Labels, schedulableLabel)
+	allocatable := map[kvmOnNodes]string{kvmAvailable: "1k", kvmMissing: "0"}[kvm]
+	if allocatable == "" {
+		return
+	}
+	if n.Labels == nil {
+		n.Labels = map[string]string{}
+	}
+	n.Labels[schedulableLabel] = strconv.FormatBool(true)
+	n.Status.Capacity = corev1.ResourceList{kvmResource: resource.MustParse("1k")}
+	n.Status.Allocatable = corev1.ResourceList{kvmResource: resource.MustParse(allocatable)}
 }
 
 // kubeVirtWithEmulation is the KubeVirt CR with useEmulation set, or unset
 // when useEmulation is nil (as kubevirt-cr.yaml creates it).
 func kubeVirtWithEmulation(useEmulation *bool) *unstructured.Unstructured {
 	cr := &unstructured.Unstructured{}
-	cr.SetAPIVersion("kubevirt.io/v1")
-	cr.SetKind("KubeVirt")
-	cr.SetNamespace("kubevirt")
-	cr.SetName("kubevirt")
+	cr.SetAPIVersion(kubeVirtAPIVersion)
+	cr.SetKind(kubeVirtKind)
+	cr.SetNamespace(kubeVirtKey.Namespace)
+	cr.SetName(kubeVirtKey.Name)
 	dev := map[string]interface{}{"featureGates": []interface{}{}}
 	if useEmulation != nil {
 		dev["useEmulation"] = *useEmulation
@@ -65,263 +62,302 @@ func kubeVirtWithEmulation(useEmulation *bool) *unstructured.Unstructured {
 
 func emulationIs(v bool) *bool { return &v }
 
-// readEmulation returns the CR's useEmulation, nil when unset.
-func readEmulation(t *testing.T, c client.Client) *bool {
-	t.Helper()
-	cr := &unstructured.Unstructured{}
-	cr.SetAPIVersion("kubevirt.io/v1")
-	cr.SetKind("KubeVirt")
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "kubevirt", Name: "kubevirt"}, cr); err != nil {
-		t.Fatal(err)
-	}
-	v, found, err := unstructured.NestedBool(cr.Object, "spec", "configuration", "developerConfiguration", "useEmulation")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !found {
-		return nil
-	}
-	return &v
+// virtCluster is a fake API server with KubeVirt and nodes, and the VirtHook
+// on a clock the test moves.
+type virtCluster struct {
+	t     *testing.T
+	c     client.Client
+	h     *VirtHook
+	clock time.Time
 }
 
-func emulationString(v *bool) string {
-	if v == nil {
-		return "unset"
-	}
-	return strconv.FormatBool(*v)
+func newVirtCluster(t *testing.T, c client.Client) *virtCluster {
+	vc := &virtCluster{t: t, c: c, clock: time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)}
+	vc.h = NewVirtHook(c, logr.Discard())
+	vc.h.now = func() time.Time { return vc.clock }
+	return vc
 }
 
-func virtConfig(emulation string) k4allv1alpha1.ClusterConfigSpec {
-	var cfg k4allv1alpha1.ClusterConfigSpec
-	cfg.Features.Virt = k4allv1alpha1.VirtConfig{Enabled: true, Emulation: emulation}
-	return cfg
-}
-
-func virtHookOn(cr client.Object, nodes ...*corev1.Node) (*VirtHook, client.Client) {
+func virtClusterWith(t *testing.T, cr client.Object, nodes ...*corev1.Node) *virtCluster {
 	objs := []client.Object{cr}
 	for _, n := range nodes {
 		objs = append(objs, n)
 	}
-	c := fake.NewClientBuilder().WithObjects(objs...).Build()
-	return NewVirtHook(c, logr.Discard()), c
+	return newVirtCluster(t, fake.NewClientBuilder().WithObjects(objs...).Build())
 }
 
-func postInstall(t *testing.T, h *VirtHook, emulation string) {
-	t.Helper()
-	if err := h.PostInstall(context.Background(), k4allv1alpha1.ComponentSpec{}, virtConfig(emulation)); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func syncVirt(t *testing.T, h *VirtHook, emulation string) time.Duration {
-	t.Helper()
-	after, err := h.Sync(context.Background(), k4allv1alpha1.ComponentSpec{}, virtConfig(emulation))
+// sync moves the clock by elapsed and runs Sync with features.virt.emulation
+// set to mode. It returns how soon Sync wants to run again.
+func (vc *virtCluster) sync(mode string, elapsed time.Duration) time.Duration {
+	vc.t.Helper()
+	vc.clock = vc.clock.Add(elapsed)
+	var cfg k4allv1alpha1.ClusterConfigSpec
+	cfg.Features.Virt = k4allv1alpha1.VirtConfig{Enabled: true, Emulation: mode}
+	after, err := vc.h.Sync(context.Background(), k4allv1alpha1.ComponentSpec{}, cfg)
 	if err != nil {
-		t.Fatal(err)
+		vc.t.Fatal(err)
 	}
 	return after
 }
 
-func wantEmulation(t *testing.T, c client.Client, want *bool) {
-	t.Helper()
-	if got := readEmulation(t, c); emulationString(got) != emulationString(want) {
-		t.Fatalf("useEmulation %s, want %s", emulationString(got), emulationString(want))
+// syncAutoEvery runs Sync with emulation auto every 30 seconds for d, as the
+// reconciler does while Sync asks for it.
+func (vc *virtCluster) syncAutoEvery(d time.Duration) {
+	vc.t.Helper()
+	for elapsed := time.Duration(0); elapsed < d; elapsed += emulationRecheckInterval {
+		vc.sync("auto", emulationRecheckInterval)
+	}
+}
+
+// setNode1 changes what virt-handler reports on node1.
+func (vc *virtCluster) setNode1(kvm kvmOnNodes) {
+	vc.t.Helper()
+	n := &corev1.Node{}
+	if err := vc.c.Get(context.Background(), client.ObjectKey{Name: "node1"}, n); err != nil {
+		vc.t.Fatal(err)
+	}
+	setVirtHandler(n, kvm)
+	status := n.Status
+	if err := vc.c.Update(context.Background(), n); err != nil {
+		vc.t.Fatal(err)
+	}
+	n.Status = status
+	if err := vc.c.Status().Update(context.Background(), n); err != nil {
+		vc.t.Fatal(err)
+	}
+}
+
+func (vc *virtCluster) kubeVirt() *unstructured.Unstructured {
+	vc.t.Helper()
+	cr, found, err := getOperatorCR(context.Background(), vc.c, kubeVirtAPIVersion, kubeVirtKind, kubeVirtKey)
+	if err != nil || !found {
+		vc.t.Fatalf("KubeVirt CR: found %t, %v", found, err)
+	}
+	return cr
+}
+
+// emulation is the CR's useEmulation: "true", "false", or "unset".
+func (vc *virtCluster) emulation() string {
+	vc.t.Helper()
+	v, found, err := unstructured.NestedBool(vc.kubeVirt().Object, useEmulationPath...)
+	if err != nil {
+		vc.t.Fatal(err)
+	}
+	if !found {
+		return "unset"
+	}
+	return strconv.FormatBool(v)
+}
+
+func (vc *virtCluster) wantEmulation(want, when string) {
+	vc.t.Helper()
+	if got := vc.emulation(); got != want {
+		vc.t.Fatalf("%s: useEmulation %s, want %s", when, got, want)
 	}
 }
 
 // gpillon/k4all#57: auto looked for /dev/kvm in the operator's own pod, which
 // mounts no host device, so every KubeVirt got useEmulation true. The nodes
-// decide now.
-func TestVirtHook_AutoUsesKVMWhenTheNodeHasIt(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(nil), virtNode("node1", withKVM, true))
+// decide now, and a cluster upgraded from v0.5.3 is corrected without
+// applying KubeVirt again.
+func TestVirtHook_AutoTurnsEmulationOffOnceANodeKeepsOfferingKVM(t *testing.T) {
+	vc := virtClusterWith(t, kubeVirtWithEmulation(emulationIs(true)), virtNode("node1", kvmAvailable))
 
-	postInstall(t, h, "auto")
+	if after := vc.sync("auto", 0); after != kvmSettle {
+		t.Errorf("first Sync asks to come back in %v, want %v to confirm KVM", after, kvmSettle)
+	}
+	vc.wantEmulation("true", "KVM seen once")
 
-	wantEmulation(t, c, emulationIs(false))
+	if after := vc.sync("auto", kvmSettle); after != 0 {
+		t.Errorf("Sync asks to come back in %v, want 0: nothing left to do", after)
+	}
+	vc.wantEmulation("false", "KVM seen for 30s")
 }
 
-func TestVirtHook_AutoEmulatesWhenNoNodeHasKVM(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(nil), virtNode("node1", withoutKVM, true))
-
-	postInstall(t, h, "auto")
-
-	wantEmulation(t, c, emulationIs(true))
-}
-
-// The default is auto.
 func TestVirtHook_EmptyEmulationIsAuto(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(nil), virtNode("node1", withKVM, true))
+	vc := virtClusterWith(t, kubeVirtWithEmulation(emulationIs(true)), virtNode("node1", kvmAvailable))
 
-	postInstall(t, h, "")
+	vc.sync("", 0)
+	vc.sync("", kvmSettle)
 
-	wantEmulation(t, c, emulationIs(false))
+	vc.wantEmulation("false", "KVM seen for 30s")
 }
 
-// A cluster that got useEmulation true from an operator before v0.5.4 is
-// corrected at the next reconcile: KubeVirt is not applied again.
-func TestVirtHook_SyncTurnsTheOldEmulationOffWhereTheNodesHaveKVM(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(emulationIs(true)), virtNode("node1", withKVM, true))
+// No KVM on any node (kind on a runner without /dev/kvm, a VM without nested
+// virtualization): emulation goes on once that has held for 10 minutes.
+func TestVirtHook_AutoTurnsEmulationOnAfterTenMinutesWithoutKVM(t *testing.T) {
+	vc := virtClusterWith(t, kubeVirtWithEmulation(nil), virtNode("node1", kvmMissing))
 
-	if after := syncVirt(t, h, "auto"); after != 0 {
-		t.Errorf("Sync asks to come back in %v, want 0: the nodes have answered", after)
+	if after := vc.sync("auto", 0); after != emulationRecheckInterval {
+		t.Errorf("Sync asks to come back in %v, want %v while the nodes settle", after, emulationRecheckInterval)
 	}
+	vc.syncAutoEvery(noKVMSettle - emulationRecheckInterval)
+	vc.wantEmulation("unset", "no KVM for 9m30s")
 
-	wantEmulation(t, c, emulationIs(false))
+	vc.sync("auto", emulationRecheckInterval)
+	vc.wantEmulation("true", "no KVM for 10m")
 }
 
-func TestVirtHook_SyncKeepsTheEmulationWhereNoNodeHasKVM(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(emulationIs(true)), virtNode("node1", withoutKVM, true))
+// virt-handler's kvm plugin reports its devices healthy for an instant when
+// it registers on a node without /dev/kvm: one report of KVM changes nothing.
+func TestVirtHook_ABriefKVMReportDoesNotTurnEmulationOff(t *testing.T) {
+	vc := virtClusterWith(t, kubeVirtWithEmulation(emulationIs(true)), virtNode("node1", kvmAvailable))
+	vc.sync("auto", 0)
 
-	syncVirt(t, h, "auto")
+	vc.setNode1(kvmMissing)
+	vc.syncAutoEvery(time.Hour)
 
-	wantEmulation(t, c, emulationIs(true))
+	vc.wantEmulation("true", "KVM reported once, then never again")
 }
 
-// On a fresh install PostInstall runs before virt-handler: nothing tells yet,
-// so the CR is left as kubevirt-cr.yaml made it, and Sync comes back until
-// virt-handler reports the nodes.
-func TestVirtHook_AutoWaitsForVirtHandlerOnAFreshInstall(t *testing.T) {
-	node := virtNode("node1", noHandler, false)
-	h, c := virtHookOn(kubeVirtWithEmulation(nil), node)
+// A node with /dev/kvm whose virt-handler crashed has nothing allocatable
+// until virt-handler is back: that never turns emulation on, however often
+// it happens.
+func TestVirtHook_ACrashedVirtHandlerDoesNotTurnEmulationOn(t *testing.T) {
+	vc := virtClusterWith(t, kubeVirtWithEmulation(emulationIs(false)), virtNode("node1", kvmAvailable))
+	vc.sync("auto", 0)
 
-	postInstall(t, h, "auto")
-	wantEmulation(t, c, nil)
-	after := syncVirt(t, h, "auto")
-	wantEmulation(t, c, nil)
-	if after <= 0 || after > time.Minute {
-		t.Fatalf("Sync asks to come back in %v, want within a minute while virt-handler is not up", after)
+	for range 3 {
+		vc.setNode1(kvmMissing)
+		vc.syncAutoEvery(9 * time.Minute)
+		vc.setNode1(kvmAvailable)
+		vc.sync("auto", emulationRecheckInterval)
 	}
 
-	// virt-handler starts: the node has no /dev/kvm.
-	ready := virtNode("node1", withoutKVM, true)
-	node.Labels = ready.Labels
-	if err := c.Update(context.Background(), node); err != nil {
-		t.Fatal(err)
-	}
-	node.Status = ready.Status
-	if err := c.Status().Update(context.Background(), node); err != nil {
-		t.Fatal(err)
-	}
-	if after := syncVirt(t, h, "auto"); after != 0 {
-		t.Errorf("Sync asks to come back in %v, want 0: the node has answered", after)
-	}
-	wantEmulation(t, c, emulationIs(true))
+	vc.wantEmulation("false", "three virt-handler outages of 9 minutes")
 }
 
-func TestVirtHook_SyncSetsKVMOnAFreshInstallOnceVirtHandlerReports(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(nil), virtNode("node1", withKVM, true))
-
-	syncVirt(t, h, "auto")
-
-	wantEmulation(t, c, emulationIs(false))
-}
-
-// KubeVirt's useEmulation is cluster-wide: with KVM on some nodes, VMs run on
-// those with KVM instead of everywhere emulated.
+// useEmulation is cluster-wide: with KVM on some nodes, VMs run on those
+// rather than everywhere emulated.
 func TestVirtHook_AutoUsesKVMWhenSomeNodesHaveIt(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(emulationIs(true)),
-		virtNode("node1", withoutKVM, true), virtNode("node2", withKVM, true), virtNode("node3", noHandler, false))
+	vc := virtClusterWith(t, kubeVirtWithEmulation(emulationIs(true)),
+		virtNode("node1", kvmMissing), virtNode("node2", kvmAvailable), virtNode("node3", kvmUnknown))
 
-	syncVirt(t, h, "auto")
+	vc.sync("auto", 0)
+	vc.sync("auto", kvmSettle)
 
-	wantEmulation(t, c, emulationIs(false))
+	vc.wantEmulation("false", "KVM on one node of three")
 }
 
-// A virt-handler that crashes leaves its node with the kvm resource and no
-// device allocatable until it is back. A reconcile in between must not turn
-// emulation on for a cluster that has KVM.
-func TestVirtHook_SyncDoesNotTurnEmulationOnWhenKVMGoesMissing(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(emulationIs(false)), virtNode("node1", withoutKVM, true))
+// The KVM nodes of a mixed cluster leave: the others run VMs in emulation.
+func TestVirtHook_AutoTurnsEmulationOnWhenTheKVMNodesLeave(t *testing.T) {
+	vc := virtClusterWith(t, kubeVirtWithEmulation(emulationIs(false)),
+		virtNode("node1", kvmMissing), virtNode("node2", kvmAvailable))
+	vc.sync("auto", 0)
 
-	syncVirt(t, h, "auto")
-
-	wantEmulation(t, c, emulationIs(false))
-}
-
-// Applying KubeVirt (a ClusterConfig change, a new version) decides again from
-// what the nodes report: emulation "false" set back to auto on nodes with no
-// KVM turns it on.
-func TestVirtHook_PostInstallTurnsEmulationOnWhenNoNodeHasKVM(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(emulationIs(false)), virtNode("node1", withoutKVM, true))
-
-	postInstall(t, h, "auto")
-
-	wantEmulation(t, c, emulationIs(true))
-}
-
-// A node whose virt-handler is not up (kubevirt.io/schedulable not "true")
-// does not count, even with a stale kvm resource.
-func TestVirtHook_NodesWithoutVirtHandlerDoNotCount(t *testing.T) {
-	h, c := virtHookOn(kubeVirtWithEmulation(nil),
-		virtNode("gone", withKVM, false), virtNode("node1", withoutKVM, true))
-
-	postInstall(t, h, "auto")
-
-	wantEmulation(t, c, emulationIs(true))
-}
-
-func TestVirtHook_ExplicitEmulationKeepsItsMeaning(t *testing.T) {
-	for _, tc := range []struct {
-		emulation string
-		node      string
-		want      bool
-	}{
-		{"true", withKVM, true},
-		{"false", withoutKVM, false},
-		{"true", noHandler, true},
-		{"false", noHandler, false},
-	} {
-		t.Run(tc.emulation+"/"+tc.node, func(t *testing.T) {
-			h, c := virtHookOn(kubeVirtWithEmulation(nil), virtNode("node1", tc.node, tc.node != noHandler))
-			postInstall(t, h, tc.emulation)
-			wantEmulation(t, c, &tc.want)
-
-			// Sync puts back a value changed by hand.
-			cr := kubeVirtWithEmulation(emulationIs(!tc.want))
-			cr.SetResourceVersion(currentResourceVersion(t, c))
-			if err := c.Update(context.Background(), cr); err != nil {
-				t.Fatal(err)
-			}
-			if after := syncVirt(t, h, tc.emulation); after != 0 {
-				t.Errorf("Sync asks to come back in %v, want 0", after)
-			}
-			wantEmulation(t, c, &tc.want)
-		})
-	}
-}
-
-func currentResourceVersion(t *testing.T, c client.Client) string {
-	t.Helper()
-	cr := &unstructured.Unstructured{}
-	cr.SetAPIVersion("kubevirt.io/v1")
-	cr.SetKind("KubeVirt")
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "kubevirt", Name: "kubevirt"}, cr); err != nil {
+	if err := vc.c.Delete(context.Background(), virtNode("node2", kvmAvailable)); err != nil {
 		t.Fatal(err)
 	}
-	return cr.GetResourceVersion()
+	vc.sync("auto", emulationRecheckInterval)
+	vc.syncAutoEvery(noKVMSettle)
+
+	vc.wantEmulation("true", "the KVM node left 10 minutes ago")
+}
+
+// On a fresh install nothing reports until virt-handler runs: the CR is left
+// as kubevirt-cr.yaml made it. Sync comes back every 30 seconds for 10
+// minutes, then only with the periodic reconcile.
+func TestVirtHook_AutoWaitsForVirtHandler(t *testing.T) {
+	vc := virtClusterWith(t, kubeVirtWithEmulation(nil), virtNode("node1", kvmUnknown))
+
+	if after := vc.sync("auto", 0); after != emulationRecheckInterval {
+		t.Errorf("Sync asks to come back in %v, want %v while nothing reports", after, emulationRecheckInterval)
+	}
+	vc.syncAutoEvery(unreportedRecheckWindow - emulationRecheckInterval)
+	if after := vc.sync("auto", emulationRecheckInterval); after != 0 {
+		t.Errorf("after 10 minutes without reports Sync asks to come back in %v, want 0 (the periodic reconcile)", after)
+	}
+	vc.wantEmulation("unset", "nothing reports")
+
+	vc.setNode1(kvmMissing)
+	if after := vc.sync("auto", 5*time.Minute); after != emulationRecheckInterval {
+		t.Errorf("virt-handler is up: Sync asks to come back in %v, want %v", after, emulationRecheckInterval)
+	}
+	vc.syncAutoEvery(noKVMSettle)
+	vc.wantEmulation("true", "virt-handler up for 10 minutes on a node without KVM")
 }
 
 // Sync runs on every reconcile, also before virt-operator has created the
 // KubeVirt CRD or the CR: it waits, it does not fail.
 func TestVirtHook_SyncWaitsForTheKubeVirtCR(t *testing.T) {
-	noCRD := interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
-		return &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "kubevirt.io", Kind: "KubeVirt"}}
-	}}
 	for name, c := range map[string]client.Client{
-		"no CR":  fake.NewClientBuilder().WithObjects(virtNode("node1", withKVM, true)).Build(),
-		"no CRD": fake.NewClientBuilder().WithInterceptorFuncs(noCRD).Build(),
+		"no CR":  fake.NewClientBuilder().WithObjects(virtNode("node1", kvmAvailable)).Build(),
+		"no CRD": noKubeVirtCRD(),
 	} {
 		t.Run(name, func(t *testing.T) {
-			after, err := NewVirtHook(c, logr.Discard()).Sync(context.Background(), k4allv1alpha1.ComponentSpec{}, virtConfig("auto"))
-			if err != nil || after <= 0 {
-				t.Fatalf("got (%v, %v), want to come back later without an error", after, err)
+			vc := newVirtCluster(t, c)
+			if after := vc.sync("auto", 0); after != emulationRecheckInterval {
+				t.Errorf("Sync asks to come back in %v, want %v", after, emulationRecheckInterval)
+			}
+			vc.syncAutoEvery(unreportedRecheckWindow - emulationRecheckInterval)
+			if after := vc.sync("auto", emulationRecheckInterval); after != 0 {
+				t.Errorf("after 10 minutes Sync asks to come back in %v, want 0 (the periodic reconcile)", after)
 			}
 		})
 	}
 }
 
-func TestVirtHook_IsASyncer(t *testing.T) {
+// A node whose virt-handler is down (kubevirt.io/schedulable "false") does not
+// count, even with a stale kvm resource.
+func TestVirtHook_NodesWithoutVirtHandlerDoNotCount(t *testing.T) {
+	gone := virtNode("gone", kvmAvailable)
+	gone.Labels[schedulableLabel] = strconv.FormatBool(false)
+	vc := virtClusterWith(t, kubeVirtWithEmulation(nil), gone, virtNode("node1", kvmMissing))
+
+	vc.sync("auto", 0)
+	vc.syncAutoEvery(noKVMSettle)
+
+	vc.wantEmulation("true", "KVM only on a node whose virt-handler is down")
+}
+
+// The ClusterConfig owns useEmulation: "true" and "false" are set at once,
+// whatever the nodes report, and a value changed by hand is put back.
+func TestVirtHook_ExplicitEmulationIsSetAndKept(t *testing.T) {
+	for _, tc := range []struct {
+		on   bool
+		node kvmOnNodes
+	}{
+		{true, kvmAvailable},
+		{false, kvmMissing},
+		{true, kvmUnknown},
+		{false, kvmUnknown},
+	} {
+		mode := strconv.FormatBool(tc.on)
+		t.Run(mode+"/"+tc.node.String(), func(t *testing.T) {
+			vc := virtClusterWith(t, kubeVirtWithEmulation(emulationIs(!tc.on)), virtNode("node1", tc.node))
+			if after := vc.sync(mode, 0); after != 0 {
+				t.Errorf("Sync asks to come back in %v, want 0", after)
+			}
+			vc.wantEmulation(mode, "first Sync")
+
+			cr := vc.kubeVirt()
+			if err := unstructured.SetNestedField(cr.Object, !tc.on, useEmulationPath...); err != nil {
+				t.Fatal(err)
+			}
+			if err := vc.c.Update(context.Background(), cr); err != nil {
+				t.Fatal(err)
+			}
+			vc.sync(mode, time.Minute)
+			vc.wantEmulation(mode, "Sync after an edit by hand")
+		})
+	}
+}
+
+// Switching away from auto and back starts the wait again.
+func TestVirtHook_BackToAutoWaitsAgain(t *testing.T) {
+	vc := virtClusterWith(t, kubeVirtWithEmulation(nil), virtNode("node1", kvmMissing))
+	vc.syncAutoEvery(noKVMSettle - time.Minute)
+
+	vc.sync("false", emulationRecheckInterval)
+	vc.syncAutoEvery(time.Minute)
+	vc.wantEmulation("unset", "one minute back on auto")
+
+	vc.syncAutoEvery(noKVMSettle)
+	vc.wantEmulation("true", "eleven minutes back on auto")
+}
+
+func TestRegistry_KubeVirtHookIsASyncer(t *testing.T) {
 	if _, ok := NewRegistry(fake.NewClientBuilder().Build(), logr.Discard()).Get("kubevirt").(Syncer); !ok {
-		t.Fatal("the kubevirt hook does not implement Syncer: emulation auto would never be re-checked")
+		t.Fatal("the kubevirt hook is not a Syncer: emulation auto would never follow the nodes")
 	}
 }
