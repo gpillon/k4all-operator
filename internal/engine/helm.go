@@ -12,10 +12,12 @@ import (
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/getter"
 	"helm.sh/helm/v3/pkg/registry"
+	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/repo"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -69,9 +71,7 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 	if err != nil {
 		return fmt.Errorf("helm action config: %w", err)
 	}
-
-	installed, currentVersion, err := h.getRelease(cfg, name)
-	if err != nil {
+	if err := h.recoverPendingRelease(cfg, name, time.Now()); err != nil {
 		return err
 	}
 
@@ -80,9 +80,22 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 		return fmt.Errorf("pull chart: %w", err)
 	}
 
-	chart, err := loader.Load(chartPath)
+	ch, err := loader.Load(chartPath)
 	if err != nil {
 		return fmt.Errorf("load chart %s: %w", chartPath, err)
+	}
+
+	return h.installOrUpgrade(ctx, cfg, name, spec, ch, values, wait)
+}
+
+// installOrUpgrade installs the release, or upgrades it when it exists.
+func (h *HelmInstaller) installOrUpgrade(
+	ctx context.Context, cfg *action.Configuration, name string, spec k4allv1alpha1.ComponentSpec,
+	ch *chart.Chart, values map[string]interface{}, wait bool,
+) error {
+	installed, currentVersion, err := h.getRelease(cfg, name)
+	if err != nil {
+		return err
 	}
 
 	if !installed {
@@ -93,7 +106,7 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 		install.CreateNamespace = true
 		install.Wait = wait
 		install.Timeout = 10 * time.Minute
-		_, err = install.RunWithContext(ctx, chart, values)
+		_, err = install.RunWithContext(ctx, ch, values)
 		return err
 	}
 
@@ -108,7 +121,7 @@ func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1
 	upgrade.Wait = wait
 	upgrade.Timeout = 10 * time.Minute
 	upgrade.MaxHistory = 3
-	_, err = upgrade.RunWithContext(ctx, name, chart, values)
+	_, err = upgrade.RunWithContext(ctx, name, ch, values)
 	return err
 }
 
@@ -131,6 +144,82 @@ func (h *HelmInstaller) Uninstall(ctx context.Context, name, namespace string) e
 	uninstall.Timeout = 5 * time.Minute
 	_, err = uninstall.Run(name)
 	return err
+}
+
+// ErrHelmReleaseBusy says a release's last revision is pending and too recent
+// to be taken as left by a stopped operator: an operation may still hold it.
+var ErrHelmReleaseBusy = goerrors.New("a helm operation on the release is in progress")
+
+// pendingReleaseGrace is how old a pending revision must be before the
+// operator takes it as left by an operator process that stopped in the middle
+// of the operation. Only the leader runs Helm on these releases, one
+// reconcile at a time and synchronously; the grace covers a previous leader
+// still finishing its last call during a hand-over.
+const pendingReleaseGrace = time.Minute
+
+// recoverPendingRelease clears a last revision left pending-install,
+// pending-upgrade or pending-rollback by an operator process that stopped in
+// the middle of it (deleted by k4all's CRI-O bridge handover on a fresh
+// install, OOM-killed, or rebooted with its node), on which Helm refuses every
+// install or upgrade with "another operation is in progress". Nothing is
+// uninstalled: an uninstall would delete what the operation created, CRDs
+// and their objects included.
+//   - No deployed revision (a first install): only the stuck release record is
+//     deleted; the install that follows adopts the objects that already carry
+//     this release's Helm ownership metadata.
+//   - A deployed revision: the release is rolled back to it; the upgrade that
+//     follows goes on from there.
+//
+// A pending revision younger than pendingReleaseGrace is left alone and
+// reported with ErrHelmReleaseBusy.
+func (h *HelmInstaller) recoverPendingRelease(cfg *action.Configuration, name string, now time.Time) error {
+	last, err := cfg.Releases.Last(name)
+	if goerrors.Is(err, driver.ErrReleaseNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("helm release %s: %w", name, err)
+	}
+	if last.Info == nil || !last.Info.Status.IsPending() {
+		return nil
+	}
+	if age := now.Sub(last.Info.LastDeployed.Time); age < pendingReleaseGrace {
+		return fmt.Errorf("helm release %s: revision %d is %s since %s: %w",
+			name, last.Version, last.Info.Status, age.Round(time.Second), ErrHelmReleaseBusy)
+	}
+
+	deployed, err := cfg.Releases.Deployed(name)
+	switch {
+	case goerrors.Is(err, driver.ErrNoDeployedReleases) || goerrors.Is(err, driver.ErrReleaseNotFound):
+		h.log.Info("helm release left pending by an operator that stopped during the operation: "+
+			"deleting its stuck record, the install adopts what it created",
+			"name", name, "revision", last.Version, "status", last.Info.Status)
+		if _, err := cfg.Releases.Delete(name, last.Version); err != nil {
+			return fmt.Errorf("delete the stuck revision %d of helm release %s: %w", last.Version, name, err)
+		}
+		return nil
+	case err != nil:
+		return fmt.Errorf("helm release %s: %w", name, err)
+	}
+
+	h.log.Info("helm release left pending by an operator that stopped during the operation: "+
+		"rolling it back to its last deployed revision",
+		"name", name, "revision", last.Version, "status", last.Info.Status, "deployed", deployed.Version)
+	// Helm's own state for an operation that did not finish: the history
+	// then shows what happened, and the rollback is the last revision.
+	last.Info.Status = release.StatusFailed
+	last.Info.Description = "left pending by an operator that stopped during it; marked failed by k4all-operator"
+	if err := cfg.Releases.Update(last); err != nil {
+		return fmt.Errorf("mark the stuck revision %d of helm release %s failed: %w", last.Version, name, err)
+	}
+	rollback := action.NewRollback(cfg)
+	rollback.Version = deployed.Version
+	rollback.Timeout = 10 * time.Minute
+	rollback.MaxHistory = 3
+	if err := rollback.Run(name); err != nil {
+		return fmt.Errorf("roll back helm release %s to revision %d: %w", name, deployed.Version, err)
+	}
+	return nil
 }
 
 func (h *HelmInstaller) getRelease(cfg *action.Configuration, name string) (installed bool, version string, err error) {
