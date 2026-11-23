@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/gpillon/k4all-operator/internal/engine"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -15,7 +16,8 @@ import (
 // its CR's status: observedField is the version it runs, targetField the one
 // it is rolling out. It is ready once the two match and the CR is Available,
 // neither Progressing nor Degraded. No CR, or no CRD, means not installed; a
-// CR with no observed version is an error, as nothing tells what runs.
+// CR with no observed version is an error wrapping engine.ErrNoVersionYet, as
+// nothing tells what runs (its operator is starting, or scaled to 0).
 func operatorCRVersion(
 	ctx context.Context, c client.Client, apiVersion, kind string, key types.NamespacedName, observedField, targetField string,
 ) (string, bool, error) {
@@ -25,7 +27,7 @@ func operatorCRVersion(
 	}
 	observed, _, _ := unstructured.NestedString(cr.Object, "status", observedField)
 	if observed == "" {
-		return "", false, fmt.Errorf("%s %s reports no version yet: is its operator running?", kind, key)
+		return "", false, fmt.Errorf("%s %s %w: is its operator running?", kind, key, engine.ErrNoVersionYet)
 	}
 	target, _, _ := unstructured.NestedString(cr.Object, "status", targetField)
 	ready := observed == target &&

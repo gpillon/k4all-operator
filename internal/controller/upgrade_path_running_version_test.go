@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
+	"github.com/gpillon/k4all-operator/internal/engine"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/release"
@@ -190,6 +192,47 @@ func TestReconcile_SwitchToManagedWaitsUntilTheRunningVersionIsReady(t *testing.
 	reconcileProbe(t, r)
 	if st := probeStatus(t, c); st.InstalledVersion != probeStep {
 		t.Fatalf("installedVersion %q once v1.14.0 is ready, want the step v1.15.0", st.InstalledVersion)
+	}
+}
+
+// gpillon/k4all#81: on a fresh install the first apply can fail once the CR
+// is in (its operator is still coming up). The component then has no
+// installedVersion and a CR with no version: that is an operator starting,
+// not a failure. The component waits, soon, and goes on once it reports.
+func TestReconcile_FreshInstallWaitsForTheOperatorToReportItsVersion(t *testing.T) {
+	running := &runningProbe{err: fmt.Errorf("KubeVirt kubevirt/kubevirt %w", engine.ErrNoVersionYet)}
+	c, r := onEnvtest(t, probeWithUpgradePath(), k4allv1alpha1.ComponentStatus{
+		State:              k4allv1alpha1.ComponentStateFailed,
+		Message:            "failed calling webhook: connection refused",
+		LastTransitionTime: metav1.Now(),
+	})
+	r.hookReg = hooks.NewRegistry(c, logr.Discard())
+	r.hookReg.Register("probe", running)
+
+	res := reconcileProbe(t, r)
+	st := probeStatus(t, c)
+	if st.State != k4allv1alpha1.ComponentStatePending || st.InstalledVersion != "" {
+		t.Fatalf("%s at %q (%s), want Pending with no installedVersion while the operator reports no version",
+			st.State, st.InstalledVersion, st.Message)
+	}
+	if !strings.Contains(st.Message, "reports no version yet") {
+		t.Errorf("message %q should say what it waits for", st.Message)
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > 30*time.Second {
+		t.Errorf("waiting for the operator should come back soon, got RequeueAfter %v", res.RequeueAfter)
+	}
+
+	running.err, running.version = nil, probeRelease // reported, still rolling out
+	reconcileProbe(t, r)
+	if st := probeStatus(t, c); st.State != k4allv1alpha1.ComponentStatePending {
+		t.Fatalf("%s (%s), want still Pending while %s is not ready", st.State, st.Message, probeRelease)
+	}
+
+	running.ready = true
+	reconcileProbe(t, r)
+	st = probeStatus(t, c)
+	if st.InstalledVersion != probeRelease || st.State != k4allv1alpha1.ComponentStateInstalled {
+		t.Fatalf("%s at %q (%s), want Installed at %s once it runs it", st.State, st.InstalledVersion, st.Message, probeRelease)
 	}
 }
 

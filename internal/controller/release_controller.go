@@ -474,7 +474,9 @@ func (w waitForStep) Error() string { return w.reason }
 // not run a ready version to go on from yet. Running past the recorded step
 // is fine: the status write after a step can be lost. Any other error means
 // nothing may be applied: what runs cannot be read, or it is newer than the
-// release (no downgrades).
+// release (no downgrades). A CR whose operator has not reported a version yet
+// is waited on too: on a fresh install the first apply can fail after the CR
+// is in, and its operator is then still starting (gpillon/k4all#81).
 func (r *ReleaseReconciler) upgradePathStart(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, st k4allv1alpha1.ComponentStatus,
 ) (string, error) {
@@ -488,6 +490,8 @@ func (r *ReleaseReconciler) upgradePathStart(
 	}
 	running, ready, err := reporter.RunningVersion(ctx)
 	switch {
+	case err != nil && switchedToManaged && goerrors.Is(err, engine.ErrNoVersionYet):
+		return "", waitForStep{fmt.Sprintf("%v; waiting for it before going on towards %s", err, spec.Version)}
 	case err != nil && switchedToManaged:
 		return "", fmt.Errorf("cannot tell which version of %s runs: %w", name, err)
 	case err != nil:

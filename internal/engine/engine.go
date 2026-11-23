@@ -160,6 +160,11 @@ func (e *Engine) UninstallComponent(ctx context.Context, name string, spec k4all
 	}
 }
 
+// ErrNoVersionYet is what a VersionReporter wraps when the component's
+// operator has its CR but has not reported a version on it yet (it is still
+// starting, or scaled to 0).
+var ErrNoVersionYet = goerrors.New("reports no version yet")
+
 // VersionReporter tells which version of a component runs in the cluster.
 type VersionReporter interface {
 	// RunningVersion returns the version the component runs, "" when it is

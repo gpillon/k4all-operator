@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -123,5 +124,25 @@ func TestVirtHook_ACRWithoutAnObservedVersionCannotTell(t *testing.T) {
 
 	if err == nil {
 		t.Fatalf("got version %q and no error, want an error: the CR reports no version", version)
+	}
+	// The reconciler waits on this one instead of failing the component
+	// (gpillon/k4all#81): on a fresh install the CR exists before its
+	// operator has reported on it.
+	if !errors.Is(err, engine.ErrNoVersionYet) {
+		t.Errorf("error %q does not wrap engine.ErrNoVersionYet", err)
+	}
+}
+
+func TestCDIHook_ACRWithoutAnObservedVersionCannotTell(t *testing.T) {
+	cdi := &unstructured.Unstructured{}
+	cdi.SetAPIVersion("cdi.kubevirt.io/v1beta1")
+	cdi.SetKind("CDI")
+	cdi.SetName("cdi")
+	h := NewCDIHook(fake.NewClientBuilder().WithObjects(cdi).Build())
+
+	_, _, err := h.RunningVersion(context.Background())
+
+	if !errors.Is(err, engine.ErrNoVersionYet) {
+		t.Fatalf("error %v does not wrap engine.ErrNoVersionYet", err)
 	}
 }
