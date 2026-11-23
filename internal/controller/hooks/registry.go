@@ -70,6 +70,26 @@ type UninstallGuard interface {
 	UninstallBlocked(ctx context.Context, name string) (reason string, err error)
 }
 
+// UninstallPreparer is implemented by a hook whose component's operator must
+// uninstall what it created before k4all deletes the operator: KubeVirt and
+// CDI create CRDs, webhooks and APIServices that are in no manifest, and
+// only their operator removes them, when its CR is deleted. The reconciler
+// calls PrepareUninstall once the UninstallGuard (if any) lets the uninstall
+// start, and at every reconcile after that until it is done:
+//   - "" and no error: the operator is done; the engine's uninstall and the
+//     Cleanup hook follow, as for any component;
+//   - a pending message: the component stays Uninstalling with it, and the
+//     reconciler comes back soon; past uninstallWait it is Failed, still
+//     with its operator;
+//   - an error: the component is Failed, its operator kept, and the next
+//     reconcile asks again.
+//
+// It must not block: it starts the operator's uninstall (deletes the CR) and
+// reports how far it got.
+type UninstallPreparer interface {
+	PrepareUninstall(ctx context.Context, name string) (pending string, err error)
+}
+
 // Registry maps component names to their hooks.
 type Registry struct {
 	hooks map[string]Hook
