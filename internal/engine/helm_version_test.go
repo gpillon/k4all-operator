@@ -8,6 +8,7 @@ import (
 	"github.com/go-logr/logr"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/chartutil"
 	kubefake "helm.sh/helm/v3/pkg/kube/fake"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage"
@@ -26,7 +27,10 @@ func helmWith(t *testing.T, revisions ...*release.Release) *HelmInstaller {
 	}
 	h := NewHelmInstaller(nil, logr.Discard())
 	h.configFor = func(string) (*action.Configuration, error) {
-		return &action.Configuration{Releases: store, KubeClient: &kubefake.PrintingKubeClient{Out: io.Discard}, Log: func(string, ...interface{}) {}}, nil
+		return &action.Configuration{
+			Releases: store, KubeClient: &kubefake.PrintingKubeClient{Out: io.Discard},
+			Capabilities: chartutil.DefaultCapabilities, Log: func(string, ...interface{}) {},
+		}, nil
 	}
 	return h
 }

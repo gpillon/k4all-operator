@@ -30,7 +30,10 @@ const kubevirtManagerNamespace = "kubevirt-manager"
 
 // KubevirtManagerHook removes kubevirt-manager, which Hangar replaces from
 // k4all v2.7.0 (management: Removed). It deletes what kubevirt-manager
-// v1.5.4 (k4all v2.2-v2.6) runs as, and never the VMs.
+// v1.5.4 (k4all v2.2-v2.6) runs as, and never the VMs. It is a Remover,
+// not an UninstallGuard: it keeps what VMs still use (PriorityClasses) and
+// what holds the user's objects, so the removal need not wait for the VMs
+// to go, and v2.7.0 removes kubevirt-manager on clusters with VMs too.
 type KubevirtManagerHook struct {
 	BaseHook
 	client client.Client
