@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
@@ -20,25 +21,23 @@ import (
 // TopolvmHook handles pre-install tasks for TopoLVM:
 //   - Labels the topolvm-system and kube-system namespaces with topolvm.io/webhook=ignore
 //   - Deletes the topolvm-provisioner StorageClass when the values change its
-//     volumeBindingMode, for helm to create it again
+//     volumeBindingMode, for helm to create it again, and keeps the spec of its
+//     CDI StorageProfile across the recreate (Sync, topolvm_storageprofile.go)
 //
 // Mirrors the logic from setup-topolvm.sh.
 type TopolvmHook struct {
 	BaseHook
 	client client.Client
 	log    logr.Logger
+	now    func() time.Time
 }
 
 func NewTopolvmHook(c client.Client, log logr.Logger) *TopolvmHook {
-	return &TopolvmHook{client: c, log: log}
+	return &TopolvmHook{client: c, log: log, now: time.Now}
 }
 
 func (h *TopolvmHook) PreInstall(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {
-	ns := "topolvm-system"
-
-	if err := h.recreateStorageClassIfModeChanges(ctx, name, spec, config); err != nil {
-		return values, err
-	}
+	ns := topolvmNamespace
 
 	if err := h.ensureNamespace(ctx, ns); err != nil {
 		return values, fmt.Errorf("ensure namespace %s: %w", ns, err)
@@ -50,6 +49,11 @@ func (h *TopolvmHook) PreInstall(ctx context.Context, name string, spec k4allv1a
 
 	if err := h.labelNamespace(ctx, "kube-system"); err != nil {
 		h.log.V(1).Info("failed to label kube-system (non-fatal)", "error", err)
+	}
+
+	// After the namespace: the StorageProfile spec is saved there.
+	if err := h.recreateStorageClassIfModeChanges(ctx, name, spec, config); err != nil {
+		return values, err
 	}
 
 	return values, nil
@@ -95,12 +99,17 @@ func (h *TopolvmHook) labelNamespace(ctx context.Context, name string) error {
 // topolvmStorageClass is the StorageClass the k4all values name.
 const topolvmStorageClass = "topolvm-provisioner"
 
+// topolvmNamespace is where the k4all release installs TopoLVM.
+const topolvmNamespace = "topolvm-system"
+
 // recreateStorageClassIfModeChanges deletes the topolvm-provisioner
 // StorageClass when the values about to be applied give it another
 // volumeBindingMode, which is immutable: helm then creates it again. PVs and
 // PVCs name their class, so they stay bound. Up to k4all v2.2.x the values
 // left the mode out and the API server made the class Immediate; from
 // v2.4.0 they ask WaitForFirstConsumer, which multi-node clusters need.
+// CDI's StorageProfile of the class loses its spec with the class: it is
+// saved first, and Sync puts it back.
 func (h *TopolvmHook) recreateStorageClassIfModeChanges(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
 ) error {
@@ -118,6 +127,9 @@ func (h *TopolvmHook) recreateStorageClassIfModeChanges(
 	}
 	if have == want {
 		return nil
+	}
+	if err := h.saveStorageProfile(ctx); err != nil {
+		return err
 	}
 	h.log.Info("deleting the StorageClass for helm to recreate it: volumeBindingMode is immutable",
 		"storageClass", topolvmStorageClass, "from", have, "to", want)
