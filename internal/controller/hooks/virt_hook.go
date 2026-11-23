@@ -2,106 +2,40 @@ package hooks
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"os"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
-	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// VirtHook handles post-install logic for KubeVirt:
-//   - Enables/disables software emulation based on ClusterConfig
+// VirtHook keeps KubeVirt's software emulation in line with the ClusterConfig
+// (Sync, virt_emulation.go) and reports the KubeVirt version that runs.
 type VirtHook struct {
 	BaseHook
 	client client.Client
 	log    logr.Logger
+	now    func() time.Time
+
+	// streak is what the nodes have reported about KVM over consecutive
+	// Syncs, and since when. It lives in memory: an operator restart starts
+	// it again, which only delays a change.
+	mu     sync.Mutex
+	streak kvmStreak
 }
 
 func NewVirtHook(c client.Client, log logr.Logger) *VirtHook {
-	return &VirtHook{client: c, log: log}
+	return &VirtHook{client: c, log: log, now: time.Now}
 }
 
-func (h *VirtHook) PostInstall(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error {
-	emulation := config.Features.Virt.Emulation
-	if emulation == "" {
-		emulation = "auto"
-	}
+var kubeVirtKey = types.NamespacedName{Name: "kubevirt", Namespace: "kubevirt"}
 
-	useEmulation := false
-	switch emulation {
-	case "true":
-		useEmulation = true
-	case "false":
-		useEmulation = false
-	case "auto":
-		useEmulation = !hasKVMDevice()
-	}
-
-	h.log.Info("configuring KubeVirt emulation", "emulation", emulation, "useEmulation", useEmulation)
-	return h.patchKubeVirt(ctx, useEmulation)
-}
-
-func (h *VirtHook) patchKubeVirt(ctx context.Context, useEmulation bool) error {
-	kv := &unstructured.Unstructured{}
-	kv.SetAPIVersion("kubevirt.io/v1")
-	kv.SetKind("KubeVirt")
-
-	key := types.NamespacedName{Name: "kubevirt", Namespace: "kubevirt"}
-
-	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		err := h.client.Get(waitCtx, key, kv)
-		if err == nil {
-			break
-		}
-		if !errors.IsNotFound(err) {
-			return fmt.Errorf("get KubeVirt CR: %w", err)
-		}
-		select {
-		case <-waitCtx.Done():
-			return fmt.Errorf("timed out waiting for KubeVirt CR")
-		case <-ticker.C:
-		}
-	}
-
-	patch := map[string]interface{}{
-		"spec": map[string]interface{}{
-			"configuration": map[string]interface{}{
-				"developerConfiguration": map[string]interface{}{
-					"useEmulation": useEmulation,
-				},
-			},
-		},
-	}
-
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return err
-	}
-
-	return h.client.Patch(ctx, kv, client.RawPatch(types.MergePatchType, patchBytes))
-}
-
-func hasKVMDevice() bool {
-	_, err := os.Stat("/dev/kvm")
-	return err == nil
-}
+const kubeVirtAPIVersion, kubeVirtKind = "kubevirt.io/v1", "KubeVirt"
 
 // RunningVersion reads the KubeVirt CR: virt-operator reports there the
 // version it runs and the one it is rolling out.
 func (h *VirtHook) RunningVersion(ctx context.Context) (string, bool, error) {
-	return operatorCRVersion(ctx, h.client, "kubevirt.io/v1", "KubeVirt",
-		types.NamespacedName{Namespace: "kubevirt", Name: "kubevirt"},
+	return operatorCRVersion(ctx, h.client, kubeVirtAPIVersion, kubeVirtKind, kubeVirtKey,
 		"observedKubeVirtVersion", "targetKubeVirtVersion")
 }

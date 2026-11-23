@@ -90,6 +90,13 @@ const upgradeStepInterval = 10 * time.Second
 // upgradePollInterval is how often a paused reconcile checks whether the hop is over.
 const upgradePollInterval = 30 * time.Second
 
+// resyncInterval is how soon a reconcile comes back when nothing asks for sooner.
+const resyncInterval = 5 * time.Minute
+
+// hookFailedPrefix starts the message of an installed component whose
+// PostInstall or Sync failed.
+const hookFailedPrefix = "installed but hook failed: "
+
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("releasemanifest", req.Name)
 	rm := &k4allv1alpha1.ReleaseManifest{}
@@ -168,7 +175,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// component held (traefik: the node's ports and the "nginx" IngressClass).
 	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	inactiveOK := r.reconcileInactiveComponents(ctx, log, rm, active, config.Spec)
-	activeOK, stepsLeft := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
+	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
 
 	if err := r.patchStatus(ctx, rm); err != nil {
@@ -179,10 +186,11 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Update ClusterConfig status
 	r.updateClusterConfigStatus(ctx, config, rm)
 
+	requeue := resyncInterval
 	if stepsLeft {
-		return ctrl.Result{RequeueAfter: upgradeStepInterval}, nil
+		requeue = upgradeStepInterval
 	}
-	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	return ctrl.Result{RequeueAfter: sooner(requeue, hookRequeue)}, nil
 }
 
 // handleForceResync resets the matching Installed components to Pending so the
@@ -304,11 +312,12 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 // reconcileActiveComponents installs or upgrades the active components in
 // dependency order, running the PreInstall/PostInstall hooks around each one.
 // A component with an upgradePath moves by one step per call. It returns false
-// if any component failed, and stepsLeft when some component is mid-path.
+// if any component failed, stepsLeft when some component is mid-path, and
+// hookRequeue when a hook's Sync asked to run again that soon (0: none asked).
 func (r *ReleaseReconciler) reconcileActiveComponents(
 	ctx context.Context, log logr.Logger, rm *k4allv1alpha1.ReleaseManifest, order []string,
 	active map[string]k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
-) (allOK, stepsLeft bool) {
+) (allOK, stepsLeft bool, hookRequeue time.Duration) {
 	allOK = true
 	for _, name := range order {
 		spec := active[name]
@@ -320,17 +329,14 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 		if currentStatus.State == k4allv1alpha1.ComponentStateUnmanaged && currentStatus.AppliedHash == hash {
 			continue
 		}
-		if r.engine.IsInstalled(ctx, name, spec, &currentStatus) {
-			switch currentStatus.AppliedHash {
-			case hash:
-				continue
-			case "":
-				// Installed by an operator that did not record hashes: adopt it
-				// instead of reinstalling every component on operator upgrade.
-				currentStatus.AppliedHash = hash
-				rm.Status.Components[name] = currentStatus
-				continue
-			}
+		if r.engine.IsInstalled(ctx, name, spec, &currentStatus) &&
+			(currentStatus.AppliedHash == hash || currentStatus.AppliedHash == "") {
+			// No hash: installed by an operator that did not record hashes.
+			// Adopt it instead of reinstalling every component on operator upgrade.
+			currentStatus.AppliedHash = hash
+			hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, &currentStatus))
+			rm.Status.Components[name] = currentStatus
+			continue
 		}
 
 		start, startErr := r.upgradePathStart(ctx, name, spec, currentStatus)
@@ -395,18 +401,49 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			st.State = k4allv1alpha1.ComponentStateUpgrading
 			st.Message = fmt.Sprintf("upgrade step %s installed, upgrading towards %s", toApply.Version, spec.Version)
 		}
-		rm.Status.Components[name] = *st
 
 		// Run PostInstall hook for post-install configuration
 		if hook := r.hookReg.Get(name); hook != nil {
 			if hookErr := hook.PostInstall(ctx, spec, config); hookErr != nil {
 				log.Error(hookErr, "post-install hook failed", "name", name)
-				st.Message = fmt.Sprintf("installed but hook failed: %v", hookErr)
-				rm.Status.Components[name] = *st
+				st.Message = hookFailedPrefix + hookErr.Error()
 			}
 		}
+		hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, st))
+		rm.Status.Components[name] = *st
 	}
-	return allOK, stepsLeft
+	return allOK, stepsLeft, hookRequeue
+}
+
+// syncHook runs the Sync of the component's hook, when the hook is a Syncer,
+// and returns how soon it wants to run again (0: at the periodic reconcile).
+// A failure goes into st's message like a PostInstall one; a success clears
+// such a message from an installed component.
+func (r *ReleaseReconciler) syncHook(
+	ctx context.Context, log logr.Logger, name string, spec k4allv1alpha1.ComponentSpec,
+	config k4allv1alpha1.ClusterConfigSpec, st *k4allv1alpha1.ComponentStatus,
+) time.Duration {
+	syncer, ok := r.hookReg.Get(name).(hooks.Syncer)
+	if !ok {
+		return 0
+	}
+	after, err := syncer.Sync(ctx, spec, config)
+	switch {
+	case err != nil:
+		log.Error(err, "hook sync failed", "name", name)
+		st.Message = hookFailedPrefix + err.Error()
+	case st.State == k4allv1alpha1.ComponentStateInstalled && strings.HasPrefix(st.Message, hookFailedPrefix):
+		st.Message = engine.InstalledMessage
+	}
+	return after
+}
+
+// sooner is the shorter of two positive durations, 0 standing for none.
+func sooner(a, b time.Duration) time.Duration {
+	if a <= 0 || (b > 0 && b < a) {
+		return b
+	}
+	return a
 }
 
 // waitForStep says a component's upgrade path cannot go on yet: nothing is

@@ -19,14 +19,9 @@ import (
 func operatorCRVersion(
 	ctx context.Context, c client.Client, apiVersion, kind string, key types.NamespacedName, observedField, targetField string,
 ) (string, bool, error) {
-	cr := &unstructured.Unstructured{}
-	cr.SetAPIVersion(apiVersion)
-	cr.SetKind(kind)
-	if err := c.Get(ctx, key, cr); err != nil {
-		if errors.IsNotFound(err) || meta.IsNoMatchError(err) {
-			return "", false, nil
-		}
-		return "", false, fmt.Errorf("get %s %s: %w", kind, key, err)
+	cr, found, err := getOperatorCR(ctx, c, apiVersion, kind, key)
+	if err != nil || !found {
+		return "", false, err
 	}
 	observed, _, _ := unstructured.NestedString(cr.Object, "status", observedField)
 	if observed == "" {
@@ -36,6 +31,23 @@ func operatorCRVersion(
 	ready := observed == target &&
 		conditionIs(cr, "Available", "True") && !conditionIs(cr, "Progressing", "True") && !conditionIs(cr, "Degraded", "True")
 	return observed, ready, nil
+}
+
+// getOperatorCR reads an operator's CR; found is false when neither the CR
+// nor its CRD exists yet.
+func getOperatorCR(
+	ctx context.Context, c client.Client, apiVersion, kind string, key types.NamespacedName,
+) (cr *unstructured.Unstructured, found bool, err error) {
+	cr = &unstructured.Unstructured{}
+	cr.SetAPIVersion(apiVersion)
+	cr.SetKind(kind)
+	if err := c.Get(ctx, key, cr); err != nil {
+		if errors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("get %s %s: %w", kind, key, err)
+	}
+	return cr, true, nil
 }
 
 // conditionIs tells whether the CR's status has the condition typ at status.

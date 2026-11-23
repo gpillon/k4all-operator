@@ -123,9 +123,12 @@ func (e *Engine) ReconcileComponent(
 
 	st.State = k4allv1alpha1.ComponentStateInstalled
 	st.InstalledVersion = resolvedVersion
-	st.Message = "installed successfully"
+	st.Message = InstalledMessage
 	return st, nil
 }
+
+// InstalledMessage is the message of a component applied without errors.
+const InstalledMessage = "installed successfully"
 
 // UninstallComponent removes a previously installed component.
 // It resolves version templates before dispatching so that manifest URLs
