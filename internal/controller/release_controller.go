@@ -354,6 +354,10 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			// No hash: installed by an operator that did not record hashes.
 			// Adopt it instead of reinstalling every component on operator upgrade.
 			currentStatus.AppliedHash = hash
+			// Back in the release after a refused uninstall: nothing is refused now.
+			if strings.HasPrefix(currentStatus.Message, uninstallRefusedPrefix) {
+				currentStatus.Message = engine.InstalledMessage
+			}
 			hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, &currentStatus))
 			rm.Status.Components[name] = currentStatus
 			continue

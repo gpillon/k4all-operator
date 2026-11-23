@@ -112,3 +112,46 @@ func TestReconcile_UninstallIsRefusedWhenTheHookCannotTell(t *testing.T) {
 		t.Fatalf("status %s (%s), want Installed with the refusal", st.State, st.Message)
 	}
 }
+
+// A component whose uninstall was refused and that comes back to the release
+// (its feature on again, management Managed) drops the refusal from its
+// status: nothing is refused any more, and the refusal must not read as a
+// reason to wait for the user (k4all-upgrade settles on it).
+func TestReconcile_AComponentBackInTheReleaseDropsTheRefusal(t *testing.T) {
+	spec := k4allv1alpha1.ComponentSpec{
+		Type: k4allv1alpha1.ComponentTypeManifest, Version: "v1", InlineManifests: []string{guardedConfigMap},
+		Management: k4allv1alpha1.ComponentManagementRemoved,
+	}
+	c, r := installedOnEnvtest(t, spec, "v1")
+	ctx := context.Background()
+	cm := &corev1.ConfigMap{}
+	cm.Name, cm.Namespace = "guarded", "default"
+	if err := c.Create(ctx, cm); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), cm) })
+	r.hookReg = hooks.NewRegistry(c, logr.Discard())
+	r.hookReg.Register("probe", &guardProbe{reason: "CephCluster rook-ceph/rook-ceph holds data"})
+
+	reconcileProbe(t, r)
+	if st := probeStatus(t, c); !strings.HasPrefix(st.Message, "uninstall refused: ") {
+		t.Fatalf("status %s (%s), want the refusal", st.State, st.Message)
+	}
+
+	rm := &k4allv1alpha1.ReleaseManifest{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "k4all"}, rm); err != nil {
+		t.Fatal(err)
+	}
+	back := rm.Spec.Components["probe"]
+	back.Management = k4allv1alpha1.ComponentManagementManaged
+	rm.Spec.Components["probe"] = back
+	if err := c.Update(ctx, rm); err != nil {
+		t.Fatal(err)
+	}
+	reconcileProbe(t, r)
+
+	st := probeStatus(t, c)
+	if st.State != k4allv1alpha1.ComponentStateInstalled || strings.HasPrefix(st.Message, "uninstall refused: ") {
+		t.Fatalf("status %s (%s), want Installed without the refusal", st.State, st.Message)
+	}
+}
