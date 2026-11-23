@@ -106,6 +106,8 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 	r.hooks["topolvm"] = NewTopolvmHook(c, log.WithName("hook-topolvm"))
 	r.hooks["calico"] = NewCalicoHook(c, log.WithName("hook-calico"))
 	r.hooks["nmstate"] = NewNMStateHook(c, log.WithName("hook-nmstate"))
+	r.hooks["rook-ceph"] = NewRookHook(c, log.WithName("hook-rook"))
+	r.hooks["ceph-csi-drivers"] = NewCephCSIDriversHook(c)
 	return r
 }
 

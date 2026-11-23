@@ -112,3 +112,35 @@ func TestReconcile_UninstallIsRefusedWhenTheHookCannotTell(t *testing.T) {
 		t.Fatalf("status %s (%s), want Installed with the refusal", st.State, st.Message)
 	}
 }
+
+// Without Rook's CRDs no CephCluster can exist: rook-ceph, its feature
+// turned off, is uninstalled.
+func TestReconcile_RookWithoutItsCRDsIsUninstalled(t *testing.T) {
+	spec := k4allv1alpha1.ComponentSpec{
+		Type: k4allv1alpha1.ComponentTypeManifest, Version: "v1", InlineManifests: []string{guardedConfigMap},
+		FeatureGate: "rook",
+	}
+	c, r := installedOnEnvtest(t, spec, "v1")
+	rm := &k4allv1alpha1.ReleaseManifest{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "k4all"}, rm); err != nil {
+		t.Fatal(err)
+	}
+	// The probe is rook-ceph: the operator's own hooks, Rook's included.
+	rm.Spec.Components = map[string]k4allv1alpha1.ComponentSpec{"rook-ceph": spec}
+	if err := c.Update(context.Background(), rm); err != nil {
+		t.Fatal(err)
+	}
+	rm.Status.Components = map[string]k4allv1alpha1.ComponentStatus{"rook-ceph": rm.Status.Components["probe"]}
+	if err := c.Status().Update(context.Background(), rm); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileProbe(t, r)
+
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "k4all"}, rm); err != nil {
+		t.Fatal(err)
+	}
+	if st := rm.Status.Components["rook-ceph"]; st.State != k4allv1alpha1.ComponentStateSkipped {
+		t.Fatalf("rook-ceph %s (%s), want Skipped: uninstalled", st.State, st.Message)
+	}
+}
