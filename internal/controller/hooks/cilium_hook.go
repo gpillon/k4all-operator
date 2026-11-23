@@ -23,6 +23,14 @@ func NewCiliumHook(c client.Client, log logr.Logger) *CiliumHook {
 	return &CiliumHook{client: c, log: log}
 }
 
+// ciliumValuesRevision changes whenever BuildCiliumValues renders other
+// values for the same ClusterConfig. 2: socketLB.hostNamespaceOnly with
+// KubeVirt, cni.exclusive off with Multus, rollOutCiliumPods with either.
+const ciliumValuesRevision = "2"
+
+// ValuesRevision implements ValuesRevisioner.
+func (h *CiliumHook) ValuesRevision() string { return ciliumValuesRevision }
+
 func (h *CiliumHook) PreInstall(_ context.Context, _ string, _ k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {
 	extra := BuildCiliumValues(config)
 	for k, v := range extra {
@@ -93,6 +101,29 @@ func BuildCiliumValues(config k4allv1alpha1.ClusterConfigSpec) map[string]interf
 			devices = append(devices, ovsBridgeDevice)
 		}
 		values["devices"] = append(devices, cilium.AdditionalDevices...)
+	}
+
+	// KubeVirt: a VM on the pod network sends its packets through
+	// virt-launcher's NAT, not from a socket in the pod. With the socket load
+	// balancer on in pods, Cilium skips the per-packet translation there, so
+	// a VM reaches no ClusterIP, the cluster DNS included. This is Cilium's
+	// documented setting for KubeVirt (and Kata).
+	if config.Features.Virt.Enabled {
+		values["socketLB"] = map[string]interface{}{"hostNamespaceOnly": true}
+	}
+
+	// Multus (feature ovsCni) delegates to Cilium through its own CNI
+	// configuration: with cni.exclusive Cilium renames it at every start, so
+	// pods and VMs never get their secondary networks.
+	if config.Features.OVSCNI.Enabled {
+		values["cni"] = map[string]interface{}{"exclusive": false}
+	}
+
+	// Cilium agents read their ConfigMap only at start: roll them when the
+	// values above are in play, so a running cluster picks up the change
+	// (once; the datapath keeps forwarding while each agent restarts).
+	if config.Features.Virt.Enabled || config.Features.OVSCNI.Enabled {
+		values["rollOutCiliumPods"] = true
 	}
 
 	if cilium.GatewayAPI {

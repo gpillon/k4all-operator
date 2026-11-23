@@ -667,14 +667,21 @@ func (r *ReleaseReconciler) appliedHash(
 		Spec     k4allv1alpha1.ComponentSpec      `json:"spec"`
 		Override *k4allv1alpha1.ComponentOverride `json:"override,omitempty"`
 		Config   *k4allv1alpha1.ClusterConfigSpec `json:"config,omitempty"`
+		// The hook's values revision: a new one re-applies the component
+		// after an operator upgrade. Empty (left out) for most hooks, so
+		// their hashes stay the same.
+		HookRevision string `json:"hookRevision,omitempty"`
 	}{Spec: spec}
 	if override, ok := config.ComponentOverrides[name]; ok {
 		inputs.Override = &override
 	}
-	if r.hookReg.Get(name) != nil {
+	if hook := r.hookReg.Get(name); hook != nil {
 		hookConfig := config
 		hookConfig.ComponentOverrides = nil
 		inputs.Config = &hookConfig
+		if rev, ok := hook.(hooks.ValuesRevisioner); ok {
+			inputs.HookRevision = rev.ValuesRevision()
+		}
 	}
 	raw, err := json.Marshal(inputs)
 	if err != nil {

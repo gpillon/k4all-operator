@@ -2,10 +2,14 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"testing"
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/controller/hooks"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -102,5 +106,42 @@ func TestReconcile_SpecChangeAtSameVersionIsReapplied(t *testing.T) {
 	cl.reconcile()
 	if st := cl.state("probe"); st != k4allv1alpha1.ComponentStateFailed {
 		t.Fatalf("spec changed at the same version: state = %q, want Failed (i.e. applied again)", st)
+	}
+}
+
+// oldAppliedHash is the hash v0.5.2 and earlier recorded: no hook revision.
+func oldAppliedHash(t *testing.T, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) string {
+	t.Helper()
+	hookConfig := config
+	hookConfig.ComponentOverrides = nil
+	inputs := struct {
+		Spec     k4allv1alpha1.ComponentSpec      `json:"spec"`
+		Override *k4allv1alpha1.ComponentOverride `json:"override,omitempty"`
+		Config   *k4allv1alpha1.ClusterConfigSpec `json:"config,omitempty"`
+	}{Spec: spec, Config: &hookConfig}
+	raw, err := json.Marshal(inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// A hook with a values revision (cilium) changes the hash an older operator
+// recorded, so the component is applied again after the operator upgrade;
+// hooks without one (topolvm) keep their hash and are left alone.
+func TestAppliedHash_HookRevisionReappliesOnlyThatComponent(t *testing.T) {
+	r := &ReleaseReconciler{Log: logr.Discard()}
+	r.hookReg = hooks.NewRegistry(nil, logr.Discard())
+	var config k4allv1alpha1.ClusterConfigSpec
+	config.Networking.CNI.Type = "cilium"
+	config.Features.Virt.Enabled = true
+	spec := k4allv1alpha1.ComponentSpec{Type: "helm", Version: "1.19.8"}
+
+	if r.appliedHash("cilium", spec, config) == oldAppliedHash(t, spec, config) {
+		t.Errorf("cilium: the hash ignores the hook revision, running clusters would keep the old Cilium values")
+	}
+	if r.appliedHash("topolvm", spec, config) != oldAppliedHash(t, spec, config) {
+		t.Errorf("topolvm: the hash changed without a hook revision, every cluster would re-apply it")
 	}
 }
