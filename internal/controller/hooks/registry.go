@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"context"
+	"time"
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
@@ -35,6 +36,15 @@ func (BaseHook) PostInstall(_ context.Context, _ k4allv1alpha1.ComponentSpec, _ 
 
 func (BaseHook) Cleanup(_ context.Context, _ string, _ k4allv1alpha1.ClusterConfigSpec) error {
 	return nil
+}
+
+// Syncer is implemented by a hook that keeps its component in line with the
+// cluster between installs (KubeVirt: emulation "auto" follows the nodes).
+// The reconciler calls Sync after PostInstall and on every reconcile while
+// the component is installed and up to date. A positive duration asks for the
+// next reconcile within that time, also with an error (which is logged).
+type Syncer interface {
+	Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) (time.Duration, error)
 }
 
 // ValuesRevisioner is implemented by a hook whose PreInstall values change
