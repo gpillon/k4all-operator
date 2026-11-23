@@ -33,7 +33,7 @@ var kubeVirtKey = types.NamespacedName{Name: "kubevirt", Namespace: "kubevirt"}
 
 // virtApplyRevision changes whenever the KubeVirt and CDI CRs are applied
 // otherwise for the same ClusterConfig. 1: with spec.uninstallStrategy
-// BlockUninstallIfWorkloadsExist (k4all-operator v0.5.6).
+// BlockUninstallIfWorkloadsExist (k4all-operator v0.5.7).
 const virtApplyRevision = "1"
 
 // ValuesRevision implements ValuesRevisioner: every cluster applies
