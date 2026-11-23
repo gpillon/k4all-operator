@@ -37,6 +37,15 @@ func (BaseHook) Cleanup(_ context.Context, _ string, _ k4allv1alpha1.ClusterConf
 	return nil
 }
 
+// ValuesRevisioner is implemented by a hook whose PreInstall values change
+// between operator versions for the same ClusterConfig. The reconciler adds
+// the revision to the component's appliedHash, so a cluster re-applies the
+// component once after the operator upgrade instead of keeping the values
+// the previous operator rendered.
+type ValuesRevisioner interface {
+	ValuesRevision() string
+}
+
 // Registry maps component names to their hooks.
 type Registry struct {
 	hooks map[string]Hook
