@@ -292,6 +292,12 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 			r.engine.IsInstalled(ctx, name, spec, &prevStatus)
 
 		if wasInstalled {
+			if reason := r.uninstallRefusal(ctx, name); reason != "" {
+				log.Info("uninstall refused by the component's hook", "name", name, "reason", reason)
+				rm.Status.Components[name] = refusedUninstall(prevStatus, reason)
+				allOK = false
+				continue
+			}
 			log.Info("uninstalling component disabled by feature gate or CNI switch", "name", name)
 			uninstallErrs := r.uninstallWithCleanup(ctx, log, name, spec, prevStatus.InstalledVersion, config)
 			if len(uninstallErrs) > 0 {
@@ -348,6 +354,10 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			// No hash: installed by an operator that did not record hashes.
 			// Adopt it instead of reinstalling every component on operator upgrade.
 			currentStatus.AppliedHash = hash
+			// Back in the release after a refused uninstall: nothing is refused now.
+			if strings.HasPrefix(currentStatus.Message, uninstallRefusedPrefix) {
+				currentStatus.Message = engine.InstalledMessage
+			}
 			hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, &currentStatus))
 			rm.Status.Components[name] = currentStatus
 			continue
@@ -546,6 +556,12 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 		prevStatus, hasPrev := rm.Status.Components[name]
 		if hasPrev && (prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
 			prevStatus.State == k4allv1alpha1.ComponentStateFailed) {
+			if reason := r.uninstallRefusal(ctx, name); reason != "" {
+				log.Info("removal refused by the component's hook", "name", name, "reason", reason)
+				rm.Status.Components[name] = refusedUninstall(prevStatus, reason)
+				allOK = false
+				continue
+			}
 			log.Info("removing component (management=Removed)", "name", name)
 			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
 				State:              k4allv1alpha1.ComponentStateUninstalling,
@@ -573,6 +589,38 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 		}
 	}
 	return allOK
+}
+
+// uninstallRefusedPrefix starts the message of a component whose hook
+// refuses its uninstall.
+const uninstallRefusedPrefix = "uninstall refused: "
+
+// uninstallRefusal is why the component's hook, when it is an
+// UninstallGuard, refuses to let the component be uninstalled now; empty
+// when it lets it, or has no say. A hook that cannot tell refuses.
+func (r *ReleaseReconciler) uninstallRefusal(ctx context.Context, name string) string {
+	guard, ok := r.hookReg.Get(name).(hooks.UninstallGuard)
+	if !ok {
+		return ""
+	}
+	reason, err := guard.UninstallBlocked(ctx, name)
+	if err != nil {
+		return fmt.Sprintf("cannot tell whether %s may be uninstalled: %v", name, err)
+	}
+	return reason
+}
+
+// refusedUninstall is the status of a component kept installed because its
+// hook refuses the uninstall: still Installed at its version, so the next
+// reconcile asks the hook again, with the reason in its message.
+func refusedUninstall(prev k4allv1alpha1.ComponentStatus, reason string) k4allv1alpha1.ComponentStatus {
+	st := prev
+	if st.State != k4allv1alpha1.ComponentStateInstalled {
+		st.State = k4allv1alpha1.ComponentStateInstalled
+		st.LastTransitionTime = metav1.Now()
+	}
+	st.Message = uninstallRefusedPrefix + reason
+	return st
 }
 
 // uninstallWithCleanup uninstalls a component and runs its Cleanup hook (if any),
