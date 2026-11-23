@@ -350,8 +350,10 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 		}
 
 		prevStatus := rm.Status.Components[name]
+		// A refused downgrade is Failed but still runs its installedVersion.
 		wasInstalled := prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
-			uninstallUnfinished(prevStatus) || r.engine.IsInstalled(ctx, name, spec, &prevStatus)
+			uninstallUnfinished(prevStatus) || strings.HasPrefix(prevStatus.Message, downgradeRefusedPrefix) ||
+			r.engine.IsInstalled(ctx, name, spec, &prevStatus)
 
 		if wasInstalled {
 			if !uninstallStarted(prevStatus) {
@@ -645,9 +647,9 @@ func downgradeRefused(rm *k4allv1alpha1.ReleaseManifest, name string, spec k4all
 		downgradeAllowed(rm.GetAnnotations()[AllowDowngradeAnnotation], name, spec.Version) {
 		return ""
 	}
-	return fmt.Sprintf("the release pins %s, older than the installed %s: not downgrading "+
+	return fmt.Sprintf("%sthe release pins %s, older than the installed %s "+
 		"(to allow it, annotate the ReleaseManifest with %s: %s=%s)",
-		spec.Version, st.InstalledVersion, AllowDowngradeAnnotation, name, spec.Version)
+		downgradeRefusedPrefix, spec.Version, st.InstalledVersion, AllowDowngradeAnnotation, name, spec.Version)
 }
 
 // downgradeAllowed tells whether the AllowDowngradeAnnotation value has the
@@ -670,10 +672,17 @@ func downgradeAllowed(value, name, version string) bool {
 // left at a version newer than the release pins (downgradeRefused).
 const downgradeRefusedCondition = "DowngradeRefused"
 
+// downgradeRefusedPrefix starts the message of a component the reconcile
+// did not downgrade.
+const downgradeRefusedPrefix = "not downgrading: "
+
+// setDowngradeRefused sets downgradeRefusedCondition from what this
+// reconcile did: a component that waits for its operator's uninstall, say,
+// was not refused, whatever its installedVersion.
 func setDowngradeRefused(rm *k4allv1alpha1.ReleaseManifest, active map[string]k4allv1alpha1.ComponentSpec) {
 	var refused []string
-	for name, spec := range active {
-		if downgradeRefused(rm, name, spec, rm.Status.Components[name]) != "" {
+	for name := range active {
+		if strings.HasPrefix(rm.Status.Components[name].Message, downgradeRefusedPrefix) {
 			refused = append(refused, name)
 		}
 	}

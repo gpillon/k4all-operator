@@ -321,3 +321,34 @@ func (cl *cluster) config() *k4allv1alpha1.ClusterConfig {
 	}
 	return cc
 }
+
+// MigrationsAhead stops uninstalls too: a component that leaves the release,
+// either way, stays installed until the count fits.
+func TestReconcile_MigrationsAheadKeepsComponentsThatLeaveTheRelease(t *testing.T) {
+	for name, goAway := range map[string]func(*k4allv1alpha1.ComponentSpec){
+		"its feature is off":    func(s *k4allv1alpha1.ComponentSpec) { s.FeatureGate = gateOff },
+		"management is Removed": func(s *k4allv1alpha1.ComponentSpec) { s.Management = k4allv1alpha1.ComponentManagementRemoved },
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := k4allv1alpha1.ComponentSpec{Type: "unsupported", Version: "v1"}
+			goAway(&spec)
+			installed := k4allv1alpha1.ComponentStatus{State: k4allv1alpha1.ComponentStateInstalled, InstalledVersion: "v1"}
+			cl := newCluster(t, map[string]k4allv1alpha1.ComponentSpec{"probe": spec},
+				map[string]k4allv1alpha1.ComponentStatus{"probe": installed})
+			setMigrationCount(t, cl, strconv.Itoa(len(migrations.All)+1))
+
+			cl.reconcile()
+
+			if st := cl.manifest().Status.Components["probe"]; st.State != installed.State || st.InstalledVersion != "v1" {
+				t.Fatalf("probe = %s at %q (%s), want it left Installed at v1", st.State, st.InstalledVersion, st.Message)
+			}
+
+			setMigrationCount(t, cl, strconv.Itoa(len(migrations.All)))
+			cl.reconcile()
+
+			if st := cl.manifest().Status.Components["probe"]; st.State == installed.State {
+				t.Errorf("probe still %s (%s) once the count fits, want its uninstall tried", st.State, st.Message)
+			}
+		})
+	}
+}
