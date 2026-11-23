@@ -398,6 +398,18 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			opts = append(opts, engine.WaitUntilReady())
 		}
 		st, err := r.engine.ReconcileComponent(ctx, name, toApply, extraValues, opts...)
+		if goerrors.Is(err, engine.ErrHelmReleaseBusy) {
+			// A helm operation that may still run (a previous leader
+			// finishing it): come back soon, as on an upgrade step.
+			stepsLeft = true
+			if currentStatus.State != k4allv1alpha1.ComponentStatePending {
+				currentStatus.State = k4allv1alpha1.ComponentStatePending
+				currentStatus.LastTransitionTime = metav1.Now()
+			}
+			currentStatus.Message = err.Error()
+			rm.Status.Components[name] = currentStatus
+			continue
+		}
 		if err != nil {
 			log.Error(err, "component reconciliation failed", "name", name)
 			allOK = false
