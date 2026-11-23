@@ -31,6 +31,15 @@ func NewVirtHook(c client.Client, log logr.Logger) *VirtHook {
 
 var kubeVirtKey = types.NamespacedName{Name: "kubevirt", Namespace: "kubevirt"}
 
+// virtApplyRevision changes whenever the KubeVirt and CDI CRs are applied
+// otherwise for the same ClusterConfig. 1: with spec.uninstallStrategy
+// BlockUninstallIfWorkloadsExist (k4all-operator v0.5.7).
+const virtApplyRevision = "1"
+
+// ValuesRevision implements ValuesRevisioner: every cluster applies
+// KubeVirt again once after the operator upgrade.
+func (h *VirtHook) ValuesRevision() string { return virtApplyRevision }
+
 const kubeVirtAPIVersion, kubeVirtKind = "kubevirt.io/v1", "KubeVirt"
 
 // RunningVersion reads the KubeVirt CR: virt-operator reports there the

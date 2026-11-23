@@ -36,6 +36,15 @@ func installedOnEnvtest(t *testing.T, spec k4allv1alpha1.ComponentSpec, installe
 // onEnvtest is installedOnEnvtest with any status for "probe".
 func onEnvtest(t *testing.T, spec k4allv1alpha1.ComponentSpec, status k4allv1alpha1.ComponentStatus) (client.Client, *ReleaseReconciler) {
 	t.Helper()
+	return componentOnEnvtest(t, "probe", spec, status)
+}
+
+// componentOnEnvtest is onEnvtest for the component name, so the
+// reconciler gives it its built-in hook, if it has one.
+func componentOnEnvtest(
+	t *testing.T, name string, spec k4allv1alpha1.ComponentSpec, status k4allv1alpha1.ComponentStatus,
+) (client.Client, *ReleaseReconciler) {
+	t.Helper()
 	cfg := envtestConfig(t)
 	s := gateScheme(t)
 	c, err := client.New(cfg, client.Options{Scheme: s})
@@ -52,7 +61,7 @@ func onEnvtest(t *testing.T, spec k4allv1alpha1.ComponentSpec, status k4allv1alp
 	}
 	rm := &k4allv1alpha1.ReleaseManifest{
 		ObjectMeta: metav1.ObjectMeta{Name: "k4all"},
-		Spec:       k4allv1alpha1.ReleaseManifestSpec{Components: map[string]k4allv1alpha1.ComponentSpec{"probe": spec}},
+		Spec:       k4allv1alpha1.ReleaseManifestSpec{Components: map[string]k4allv1alpha1.ComponentSpec{name: spec}},
 	}
 	for _, obj := range []client.Object{cc, rm} {
 		if err := c.Create(ctx, obj); err != nil {
@@ -60,7 +69,7 @@ func onEnvtest(t *testing.T, spec k4allv1alpha1.ComponentSpec, status k4allv1alp
 		}
 		t.Cleanup(func() { _ = c.Delete(context.Background(), obj) })
 	}
-	rm.Status.Components = map[string]k4allv1alpha1.ComponentStatus{"probe": status}
+	rm.Status.Components = map[string]k4allv1alpha1.ComponentStatus{name: status}
 	if err := c.Status().Update(ctx, rm); err != nil {
 		t.Fatal(err)
 	}

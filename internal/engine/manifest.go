@@ -219,6 +219,9 @@ func decodeMultiDoc(data []byte) ([]unstructured.Unstructured, error) {
 
 func (m *ManifestApplier) serverSideApply(ctx context.Context, obj *unstructured.Unstructured) error {
 	obj.SetManagedFields(nil)
+	if err := blockUninstallIfWorkloadsExist(obj); err != nil {
+		return fmt.Errorf("%s %s: set spec.uninstallStrategy: %w", obj.GetKind(), obj.GetName(), err)
+	}
 	if len(additiveListsOf(obj)) == 0 {
 		return m.apply(ctx, obj)
 	}

@@ -113,34 +113,45 @@ func TestReconcile_UninstallIsRefusedWhenTheHookCannotTell(t *testing.T) {
 	}
 }
 
-// Without Rook's CRDs no CephCluster can exist: rook-ceph, its feature
-// turned off, is uninstalled.
-func TestReconcile_RookWithoutItsCRDsIsUninstalled(t *testing.T) {
+// A component whose uninstall was refused and that comes back to the release
+// (its feature on again, management Managed) drops the refusal from its
+// status: nothing is refused any more, and the refusal must not read as a
+// reason to wait for the user (k4all-upgrade settles on it).
+func TestReconcile_AComponentBackInTheReleaseDropsTheRefusal(t *testing.T) {
 	spec := k4allv1alpha1.ComponentSpec{
 		Type: k4allv1alpha1.ComponentTypeManifest, Version: "v1", InlineManifests: []string{guardedConfigMap},
-		FeatureGate: "rook",
+		Management: k4allv1alpha1.ComponentManagementRemoved,
 	}
 	c, r := installedOnEnvtest(t, spec, "v1")
-	rm := &k4allv1alpha1.ReleaseManifest{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "k4all"}, rm); err != nil {
+	ctx := context.Background()
+	cm := &corev1.ConfigMap{}
+	cm.Name, cm.Namespace = "guarded", "default"
+	if err := c.Create(ctx, cm); err != nil {
 		t.Fatal(err)
 	}
-	// The probe is rook-ceph: the operator's own hooks, Rook's included.
-	rm.Spec.Components = map[string]k4allv1alpha1.ComponentSpec{"rook-ceph": spec}
-	if err := c.Update(context.Background(), rm); err != nil {
-		t.Fatal(err)
-	}
-	rm.Status.Components = map[string]k4allv1alpha1.ComponentStatus{"rook-ceph": rm.Status.Components["probe"]}
-	if err := c.Status().Update(context.Background(), rm); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), cm) })
+	r.hookReg = hooks.NewRegistry(c, logr.Discard())
+	r.hookReg.Register("probe", &guardProbe{reason: "CephCluster rook-ceph/rook-ceph holds data"})
 
 	reconcileProbe(t, r)
+	if st := probeStatus(t, c); !strings.HasPrefix(st.Message, "uninstall refused: ") {
+		t.Fatalf("status %s (%s), want the refusal", st.State, st.Message)
+	}
 
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "k4all"}, rm); err != nil {
+	rm := &k4allv1alpha1.ReleaseManifest{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "k4all"}, rm); err != nil {
 		t.Fatal(err)
 	}
-	if st := rm.Status.Components["rook-ceph"]; st.State != k4allv1alpha1.ComponentStateSkipped {
-		t.Fatalf("rook-ceph %s (%s), want Skipped: uninstalled", st.State, st.Message)
+	back := rm.Spec.Components["probe"]
+	back.Management = k4allv1alpha1.ComponentManagementManaged
+	rm.Spec.Components["probe"] = back
+	if err := c.Update(ctx, rm); err != nil {
+		t.Fatal(err)
+	}
+	reconcileProbe(t, r)
+
+	st := probeStatus(t, c)
+	if st.State != k4allv1alpha1.ComponentStateInstalled || strings.HasPrefix(st.Message, "uninstall refused: ") {
+		t.Fatalf("status %s (%s), want Installed without the refusal", st.State, st.Message)
 	}
 }

@@ -18,6 +18,10 @@ func NewCDIHook(c client.Client) *CDIHook {
 	return &CDIHook{client: c}
 }
 
+// ValuesRevision implements ValuesRevisioner: every cluster applies CDI
+// again once after the operator upgrade (virtApplyRevision).
+func (h *CDIHook) ValuesRevision() string { return virtApplyRevision }
+
 // RunningVersion reads the CDI CR, where cdi-operator reports the version it
 // runs and the one it is rolling out.
 func (h *CDIHook) RunningVersion(ctx context.Context) (string, bool, error) {
