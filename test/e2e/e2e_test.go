@@ -520,9 +520,10 @@ func kubeVirtCRSpec(version string, path ...string) k4allv1alpha1.ComponentSpec 
 
 func cdiCRSpec(version string) k4allv1alpha1.ComponentSpec {
 	return k4allv1alpha1.ComponentSpec{
-		Type:      k4allv1alpha1.ComponentTypeManifest,
-		Version:   version,
-		Sources:   []string{"https://github.com/kubevirt/containerized-data-importer/releases/download/{{ version }}/cdi-cr.yaml"},
+		Type:    k4allv1alpha1.ComponentTypeManifest,
+		Version: version,
+		Sources: []string{"https://github.com/kubevirt/containerized-data-importer/releases/download/" +
+			"{{ version }}/cdi-cr.yaml"},
 		Namespace: "cdi",
 	}
 }
@@ -928,8 +929,10 @@ var _ = Describe("K4All Operator", Ordered, func() {
 			By("setting feature gates and a host device by hand")
 			patchByHand(kubeVirt, `{"spec":{"configuration":{
 				"developerConfiguration":{"featureGates":["HostDevices","Snapshot","DeclarativeHotplugVolumes"]},
-				"permittedHostDevices":{"pciHostDevices":[{"pciVendorSelector":"8086:46a6","resourceName":"example.com/iris-xe-vf"}]}}}}`)
-			patchByHand(cdi, `{"spec":{"config":{"featureGates":["HonorWaitForFirstConsumer","WebhookPvcRendering","DataVolumeClaimAdoption"]}}}`)
+				"permittedHostDevices":{"pciHostDevices":[
+					{"pciVendorSelector":"8086:46a6","resourceName":"example.com/iris-xe-vf"}]}}}}`)
+			patchByHand(cdi, `{"spec":{"config":{"featureGates":[
+				"HonorWaitForFirstConsumer","WebhookPvcRendering","DataVolumeClaimAdoption"]}}}`)
 
 			By("upgrading KubeVirt v1.7.4 -> v1.8.4 -> v1.9.1 and CDI v1.65.0 -> v1.66.1")
 			setGatedCRComponents(kubeVirtCRSpec("v1.9.1", "v1.8.4"), cdiCRSpec("v1.66.1"))
