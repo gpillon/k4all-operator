@@ -131,59 +131,8 @@ func (h *IngressNginxHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha
 			h.log.Info("cannot delete an ingress-nginx leftover", "namespace", ns, "name", obj.GetName(), "error", err.Error())
 		}
 	}
-	if h.restConfig == nil {
-		return nil
-	}
-	left, err := h.waitForLeftovers(ctx, ns)
-	switch {
-	case err != nil:
-		h.log.Info("namespace kept: cannot tell whether it is empty", "namespace", ns, "error", err.Error())
-	case len(left) > 0:
-		h.log.Info("namespace kept: it holds objects ingress-nginx did not leave", "namespace", ns, "objects", left)
-	default:
-		err := h.client.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
-		if err != nil && !errors.IsNotFound(err) {
-			h.log.Info("cannot delete the namespace", "namespace", ns, "error", err.Error())
-		} else if err == nil {
-			h.log.Info("deleted the namespace ingress-nginx left", "namespace", ns)
-		}
-	}
+	deleteNamespaceIfEmpty(ctx, h.client, h.restConfig, h.log, ns, h.settle, h.poll)
 	return nil
-}
-
-// Defaults for how long and how often the cleanup waits for what helm
-// uninstall is still deleting. Short: removals run before the other
-// components, and Traefik, which replaces ingress-nginx, comes after.
-const (
-	cleanupSettle = 30 * time.Second
-	cleanupPoll   = 2 * time.Second
-)
-
-// waitForLeftovers checks the namespace until nothing is left in it, or
-// until the settle time: helm uninstall does not wait for what it deletes,
-// and right after it the namespace still holds objects on their way out
-// (in an e2e run, the controller pod, listed without its owner). It returns
-// the last check.
-func (h *IngressNginxHook) waitForLeftovers(ctx context.Context, ns string) ([]string, error) {
-	settle, poll := h.settle, h.poll
-	if settle == 0 {
-		settle = cleanupSettle
-	}
-	if poll == 0 {
-		poll = cleanupPoll
-	}
-	deadline := time.Now().Add(settle)
-	for {
-		left, err := namespaceLeftovers(ctx, h.restConfig, ns)
-		if (err == nil && len(left) == 0) || time.Now().After(deadline) {
-			return left, err
-		}
-		select {
-		case <-ctx.Done():
-			return left, ctx.Err()
-		case <-time.After(poll):
-		}
-	}
 }
 
 // CleanIngressNginxNamespace does what Cleanup does after the uninstall, for

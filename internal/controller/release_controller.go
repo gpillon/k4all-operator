@@ -576,17 +576,25 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 }
 
 // uninstallWithCleanup uninstalls a component and runs its Cleanup hook (if any),
-// returning the collected error messages. Both steps always run.
+// returning the collected error messages. Both steps always run. A hook that
+// is a Remover uninstalls the component in place of the engine.
 func (r *ReleaseReconciler) uninstallWithCleanup(
 	ctx context.Context, log logr.Logger, name string, spec k4allv1alpha1.ComponentSpec,
 	installedVersion string, config k4allv1alpha1.ClusterConfigSpec,
 ) []string {
 	var uninstallErrs []string
-	if err := r.engine.UninstallComponent(ctx, name, spec, installedVersion); err != nil {
+	hook := r.hookReg.Get(name)
+	var err error
+	if remover, ok := hook.(hooks.Remover); ok {
+		err = remover.Remove(ctx, spec, config)
+	} else {
+		err = r.engine.UninstallComponent(ctx, name, spec, installedVersion)
+	}
+	if err != nil {
 		log.Error(err, "uninstall failed", "name", name)
 		uninstallErrs = append(uninstallErrs, fmt.Sprintf("uninstall: %v", err))
 	}
-	if hook := r.hookReg.Get(name); hook != nil {
+	if hook != nil {
 		if err := hook.Cleanup(ctx, name, config); err != nil {
 			log.Error(err, "cleanup hook failed", "name", name)
 			uninstallErrs = append(uninstallErrs, fmt.Sprintf("cleanup hook: %v", err))

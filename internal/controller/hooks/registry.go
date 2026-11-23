@@ -58,6 +58,14 @@ type ValuesRevisioner interface {
 	ValuesRevision() string
 }
 
+// Remover is implemented by a hook that removes its component itself: the
+// reconciler calls Remove instead of deleting every object the component's
+// manifests list (kubevirt-manager: VMs name its PriorityClasses, and its
+// CRD holds the user's objects). Cleanup still runs after it.
+type Remover interface {
+	Remove(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error
+}
+
 // OverrideMerger is implemented by a hook that layers its component's
 // ClusterConfig componentOverride on the PreInstall values itself, instead
 // of the plain deep merge, where a list of the override replaces the
@@ -104,6 +112,9 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 	r.hooks["topolvm"] = NewTopolvmHook(c, log.WithName("hook-topolvm"))
 	r.hooks["calico"] = NewCalicoHook(c, log.WithName("hook-calico"))
 	r.hooks["nmstate"] = NewNMStateHook(c, log.WithName("hook-nmstate"))
+	kvm := NewKubevirtManagerHook(c, log.WithName("hook-kubevirt-manager"))
+	kvm.restConfig = o.restConfig
+	r.hooks["kubevirt-manager"] = kvm
 	return r
 }
 
