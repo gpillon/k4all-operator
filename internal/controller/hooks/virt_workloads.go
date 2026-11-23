@@ -19,6 +19,12 @@ func (h *VirtHook) UninstallBlocked(ctx context.Context, name string) (string, e
 	return vmsBlock(ctx, h.client, name)
 }
 
+// UninstallBlocked refuses the uninstall of kubevirt-manager while VMs
+// exist: see vmsBlock and KubevirtManagerHook.
+func (h *KubevirtManagerHook) UninstallBlocked(ctx context.Context, name string) (string, error) {
+	return vmsBlock(ctx, h.client, name)
+}
+
 // workloadKind is a kind whose objects keep a component installed while
 // they exist.
 type workloadKind struct {
@@ -39,8 +45,9 @@ var vmKinds = []workloadKind{
 // VirtualMachine or a VirtualMachineInstance exists, in any namespace. An
 // uninstall deletes the objects of the component's manifests, the operator
 // first: for KubeVirt, virt-operator, then the kubevirt namespace with
-// virt-controller and virt-handler, from under the running VMs. Empty once
-// no VM is left, or the cluster does not serve the kinds.
+// virt-controller and virt-handler, from under the running VMs; for
+// kubevirt-manager, the PriorityClasses its VMs name (KubevirtManagerHook).
+// Empty once no VM is left, or the cluster does not serve the kinds.
 func vmsBlock(ctx context.Context, c client.Client, name string) (string, error) {
 	found := make([]workloadsFound, 0, len(vmKinds))
 	for _, kind := range vmKinds {

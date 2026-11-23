@@ -69,7 +69,7 @@ func virtWorkloadAPIs(t *testing.T) {
 }
 
 // virtOnEnvtest is a cluster with the virt feature off where the component
-// name (kubevirt or cdi, with its built-in hook) is still
+// name (kubevirt, cdi or kubevirt-manager, with its built-in hook) is still
 // installed: the ConfigMap it returns stands for the component's objects.
 func virtOnEnvtest(t *testing.T, name string) (client.Client, *ReleaseReconciler, *corev1.ConfigMap) {
 	t.Helper()
@@ -183,6 +183,26 @@ func TestReconcile_KubeVirtStaysWhileVMsExist(t *testing.T) {
 	}
 }
 
+// Turning virt off keeps kubevirt-manager while VMs exist too: its
+// uninstall deletes the PriorityClasses vm-standard and vm-preemptible, and
+// a VM made with its form names vm-standard: it could not start again.
+func TestReconcile_KubevirtManagerStaysWhileVMsExist(t *testing.T) {
+	virtWorkloadAPIs(t)
+	c, r, objects := virtOnEnvtest(t, "kubevirt-manager")
+	vm := kubevirtObject("VirtualMachine", "vm1")
+	createAll(t, c, vm)
+
+	reconcileProbe(t, r)
+	assertUninstallRefused(t, c, "kubevirt-manager", objects,
+		"uninstall refused: 1 VirtualMachine (default/vm1) exists: delete it or set kubevirt-manager Unmanaged first")
+
+	if err := deleteNow(c, vm); err != nil {
+		t.Fatal(err)
+	}
+	reconcileProbe(t, r)
+	assertUninstalled(t, c, "kubevirt-manager", objects)
+}
+
 // pvc is a PersistentVolumeClaim in the default namespace.
 func pvc(name string, labels, annotations map[string]string) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
@@ -241,7 +261,7 @@ func TestReconcile_CDIStaysWhileItsVolumesExist(t *testing.T) {
 // (their operators never ran, or the CRDs are gone), turning virt off
 // uninstalls them: nothing can need them.
 func TestReconcile_VirtUninstallsWhereTheWorkloadKindsAreNotServed(t *testing.T) {
-	for _, component := range []string{"kubevirt", "cdi"} {
+	for _, component := range []string{"kubevirt", "cdi", "kubevirt-manager"} {
 		t.Run(component, func(t *testing.T) {
 			c, r, objects := virtOnEnvtest(t, component)
 			crd := &unstructured.Unstructured{}
