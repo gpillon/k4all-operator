@@ -58,6 +58,18 @@ type ValuesRevisioner interface {
 	ValuesRevision() string
 }
 
+// UninstallGuard is implemented by a hook whose component must not be
+// uninstalled while something still needs it (Rook: a CephCluster holds
+// data, and without the operator its daemons and finalizers are stranded).
+// The reconciler asks before every uninstall, whichever the cause: the
+// component's feature turned off, a CNI switch, management Removed. A
+// non-empty reason refuses it: the component stays installed, its status
+// says why, and the reconciler asks again at every reconcile. An error
+// refuses it too: the hook cannot tell that it is safe.
+type UninstallGuard interface {
+	UninstallBlocked(ctx context.Context, name string) (reason string, err error)
+}
+
 // Registry maps component names to their hooks.
 type Registry struct {
 	hooks map[string]Hook
