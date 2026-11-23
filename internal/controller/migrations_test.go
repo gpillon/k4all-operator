@@ -2,12 +2,15 @@ package controller
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -250,4 +253,71 @@ func TestMigrations_CleanTheIngressNginxNamespaceLeftByV050(t *testing.T) {
 	if v := stored.Annotations[migrations.AppliedAnnotation]; v != "2" {
 		t.Errorf("%s = %q, want \"2\"", migrations.AppliedAnnotation, v)
 	}
+}
+
+// An operator older than the one that ran the ClusterConfig's migrations
+// (k4all#77) applies no component: they may need what it does not know.
+// The ClusterConfig and the ReleaseManifest say why until the count fits.
+func TestReconcile_StopsWhenTheMigrationCountIsAheadOfTheOperator(t *testing.T) {
+	cl := newCluster(t,
+		// Unsupported type: a reconcile of it would mark it Failed.
+		map[string]k4allv1alpha1.ComponentSpec{"probe": {Type: "unsupported", Version: "v2"}},
+		map[string]k4allv1alpha1.ComponentStatus{"probe": {State: k4allv1alpha1.ComponentStateInstalled, InstalledVersion: "v1"}},
+	)
+	setMigrationCount(t, cl, strconv.Itoa(len(migrations.All)+1))
+
+	if res := cl.reconcile(); res.RequeueAfter <= 0 {
+		t.Errorf("RequeueAfter = %v, want a later look", res.RequeueAfter)
+	}
+
+	rm := cl.manifest()
+	if st := rm.Status.Components["probe"]; st.State != k4allv1alpha1.ComponentStateInstalled || st.InstalledVersion != "v1" {
+		t.Errorf("probe = %s at %q (%s), want it left Installed at v1", st.State, st.InstalledVersion, st.Message)
+	}
+	for _, conds := range map[string][]metav1.Condition{
+		"ReleaseManifest": rm.Status.Conditions, "ClusterConfig": cl.config().Status.Conditions,
+	} {
+		ahead := meta.FindStatusCondition(conds, "MigrationsAhead")
+		if ahead == nil || ahead.Status != metav1.ConditionTrue || !strings.Contains(ahead.Message, "older than the operator that ran them") {
+			t.Errorf("MigrationsAhead = %+v, want True naming the older operator", ahead)
+		}
+	}
+	if ready := meta.FindStatusCondition(rm.Status.Conditions, "Ready"); ready == nil || ready.Reason != "MigrationsAhead" {
+		t.Errorf("Ready = %+v, want reason MigrationsAhead", ready)
+	}
+
+	// once the count fits (a newer operator, or a person who checked), the
+	// components go on and the condition goes
+	setMigrationCount(t, cl, strconv.Itoa(len(migrations.All)))
+	cl.reconcile()
+	rm = cl.manifest()
+	if st := rm.Status.Components["probe"]; st.State != k4allv1alpha1.ComponentStateFailed {
+		t.Errorf("probe = %s, want it reconciled again (Failed: unsupported type)", st.State)
+	}
+	for _, conds := range [][]metav1.Condition{rm.Status.Conditions, cl.config().Status.Conditions} {
+		if meta.IsStatusConditionTrue(conds, "MigrationsAhead") {
+			t.Errorf("MigrationsAhead still True: %+v", conds)
+		}
+	}
+}
+
+func setMigrationCount(t *testing.T, cl *cluster, count string) {
+	t.Helper()
+	cc := cl.config()
+	if cc.Annotations == nil {
+		cc.Annotations = map[string]string{}
+	}
+	cc.Annotations[migrations.AppliedAnnotation] = count
+	if err := cl.c.Update(context.Background(), cc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (cl *cluster) config() *k4allv1alpha1.ClusterConfig {
+	cl.t.Helper()
+	cc := &k4allv1alpha1.ClusterConfig{}
+	if err := cl.c.Get(context.Background(), types.NamespacedName{Name: "k4all-cluster-config"}, cc); err != nil {
+		cl.t.Fatal(err)
+	}
+	return cc
 }
