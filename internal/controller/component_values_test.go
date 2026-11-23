@@ -201,8 +201,24 @@ func TestComponentValues_CiliumDevices(t *testing.T) {
 		return valueAt(normalize(t, got), "devices")
 	}
 
-	t.Run("auto-detected without additional devices", func(t *testing.T) {
-		if devices, ok := devicesFor(t, true); ok {
+	// Cilium 1.20 auto-detection skips openvswitch devices: ovs-bridge is
+	// named, and forceDeviceDetection keeps the NIC until the bridge exists.
+	t.Run("ovs-bridge named, auto-detection kept for the rest", func(t *testing.T) {
+		devices, _ := devicesFor(t, true)
+		if want := []interface{}{"ovs-bridge"}; !reflect.DeepEqual(devices, want) {
+			t.Errorf("devices = %v, want %v", devices, want)
+		}
+		config := ciliumConfig()
+		config.Features.OVSBridge.Enabled = true
+		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectValue(t, got, true, "forceDeviceDetection")
+	})
+
+	t.Run("auto-detected without the OVS bridge and additional devices", func(t *testing.T) {
+		if devices, ok := devicesFor(t, false); ok {
 			t.Errorf("devices = %v, want unset so Cilium auto-detects", devices)
 		}
 	})
