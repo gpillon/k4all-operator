@@ -34,26 +34,23 @@ spec:
         control-plane: controller-manager
         app.kubernetes.io/name: k4all-operator
     spec:
-      # TODO(user): Uncomment the following code to configure the nodeAffinity expression
-      # according to the platforms which are supported by your solution.
-      # It is considered best practice to support multiple architectures. You can
-      # build your manager image using the makefile target docker-buildx.
-      # affinity:
-      #   nodeAffinity:
-      #     requiredDuringSchedulingIgnoredDuringExecution:
-      #       nodeSelectorTerms:
-      #         - matchExpressions:
-      #           - key: kubernetes.io/arch
-      #             operator: In
-      #             values:
-      #               - amd64
-      #               - arm64
-      #               - ppc64le
-      #               - s390x
-      #           - key: kubernetes.io/os
-      #             operator: In
-      #             values:
-      #               - linux
+      # Deliberately not the scaffold's commented-out architecture affinity.
+      # The operator tolerates the cordon (below); with more nodes, a
+      # cordoned node would be as good a fit as any, so the drain that evicts
+      # this pod could put it back on the node about to reboot (k4all#86).
+      # Whoever drains a node for a hop labels it draining=true with the
+      # cordon: the ClusterUpgrade, k4all-upgrade, or the admin by hand
+      # (docs/upgrades.md). Only preferred: a single node must still fit.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: k4all.magesgate.com/draining
+                    operator: NotIn
+                    values:
+                      - "true"
       securityContext:
         # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
         # This ensures that deployments meet the highest security requirements for Kubernetes.
