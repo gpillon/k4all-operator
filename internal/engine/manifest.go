@@ -12,9 +12,11 @@ import (
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -217,14 +219,40 @@ func decodeMultiDoc(data []byte) ([]unstructured.Unstructured, error) {
 
 func (m *ManifestApplier) serverSideApply(ctx context.Context, obj *unstructured.Unstructured) error {
 	obj.SetManagedFields(nil)
-
-	patch := client.Apply
-	opts := []client.PatchOption{
-		client.FieldOwner("k4all-operator"),
-		client.ForceOwnership,
+	if len(additiveListsOf(obj)) == 0 {
+		return m.apply(ctx, obj)
 	}
 
-	return m.client.Patch(ctx, obj, patch, opts...)
+	// Lists the admins add to (additive_lists.go) are merged with the object
+	// as read, in the one apply. The apply is conditional on that
+	// resourceVersion: a change made in between makes it fail with a
+	// conflict, and the merge starts again from a fresh read.
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		desired := obj.DeepCopy()
+		live := &unstructured.Unstructured{}
+		live.SetGroupVersionKind(obj.GroupVersionKind())
+		switch err := m.client.Get(ctx, client.ObjectKeyFromObject(obj), live); {
+		case errors.IsNotFound(err), meta.IsNoMatchError(err):
+			live = nil // a fresh install: upstream's lists as they are
+		case err != nil:
+			return fmt.Errorf("read the live %s: %w", obj.GetKind(), err)
+		default:
+			desired.SetResourceVersion(live.GetResourceVersion())
+		}
+		if err := keepLiveEntries(desired, live); err != nil {
+			return err
+		}
+		return m.apply(ctx, desired)
+	})
+}
+
+// apply server-side applies obj as the k4all-operator, taking over the fields
+// it sets from any other manager.
+func (m *ManifestApplier) apply(ctx context.Context, obj *unstructured.Unstructured) error {
+	return m.client.Patch(ctx, obj, client.Apply,
+		client.FieldOwner("k4all-operator"),
+		client.ForceOwnership,
+	)
 }
 
 // isNamespaced returns true for resources that are typically namespaced.

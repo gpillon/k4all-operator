@@ -497,6 +497,81 @@ func upgradeTo(file string, from, to *k4allv1alpha1.ReleaseManifest) {
 	}, testTimeout, pollInterval).Should(BeTrue())
 }
 
+// The KubeVirt and CDI CRs as upstream publishes them, on the CRDs of
+// test/crds (no virt-operator or cdi-operator: kind has no /dev/kvm), under
+// components named apart from "kubevirt" and "cdi" so their hooks stay out.
+const (
+	kubeVirtCRComponent = "kubevirt-cr"
+	cdiCRComponent      = "cdi-cr"
+)
+
+func kubeVirtCRSpec(version string, path ...string) k4allv1alpha1.ComponentSpec {
+	spec := k4allv1alpha1.ComponentSpec{
+		Type:      k4allv1alpha1.ComponentTypeManifest,
+		Version:   version,
+		Sources:   []string{"https://github.com/kubevirt/kubevirt/releases/download/{{ version }}/kubevirt-cr.yaml"},
+		Namespace: "kubevirt",
+	}
+	for _, v := range path {
+		spec.UpgradePath = append(spec.UpgradePath, k4allv1alpha1.UpgradeStep{Version: v})
+	}
+	return spec
+}
+
+func cdiCRSpec(version string) k4allv1alpha1.ComponentSpec {
+	return k4allv1alpha1.ComponentSpec{
+		Type:    k4allv1alpha1.ComponentTypeManifest,
+		Version: version,
+		Sources: []string{"https://github.com/kubevirt/containerized-data-importer/releases/download/" +
+			"{{ version }}/cdi-cr.yaml"},
+		Namespace: "cdi",
+	}
+}
+
+// setGatedCRComponents puts the two components in the ReleaseManifest, as a
+// k4all release lists them, and waits until both are installed.
+func setGatedCRComponents(kubeVirt, cdi k4allv1alpha1.ComponentSpec) {
+	patch, err := json.Marshal(map[string]any{"spec": map[string]any{"components": map[string]any{
+		kubeVirtCRComponent: kubeVirt, cdiCRComponent: cdi,
+	}}})
+	Expect(err).NotTo(HaveOccurred())
+	kubectlMustSucceed("patch", "releasemanifest", releaseManifestName, "--type=merge", "-p", string(patch))
+	want := map[string]string{
+		kubeVirtCRComponent: "Installed/" + kubeVirt.Version,
+		cdiCRComponent:      "Installed/" + cdi.Version,
+	}
+	Eventually(func() []string {
+		var pending []string
+		for name, status := range want {
+			if got := componentStatus(name); got != status {
+				pending = append(pending, fmt.Sprintf("%s=%s, want %s (%s)", name, got, status, componentMessage(name)))
+			}
+		}
+		sort.Strings(pending)
+		return pending
+	}, 5*time.Minute, pollInterval).Should(BeEmpty())
+}
+
+// jsonPathOf reads a field of an object ("<kind> <name> [-n <namespace>]").
+func jsonPathOf(object []string, jsonPath string) string {
+	return kubectlMustSucceed(append(append([]string{"get"}, object...), "-o", "jsonpath={"+jsonPath+"}")...)
+}
+
+// featureGates reads the string list at jsonPath of an object.
+func featureGates(object []string, jsonPath string) []string {
+	out := jsonPathOf(object, jsonPath)
+	var gates []string
+	if out != "" {
+		ExpectWithOffset(1, json.Unmarshal([]byte(out), &gates)).To(Succeed(), "feature gates: %s", out)
+	}
+	return gates
+}
+
+// patchByHand merges patch into an object, as `kubectl patch --type merge`.
+func patchByHand(object []string, patch string) {
+	kubectlMustSucceed(append(append([]string{"patch"}, object...), "--type=merge", "-p", patch)...)
+}
+
 var _ = Describe("K4All Operator", Ordered, func() {
 	initial := mustReadReleaseManifest(releaseManifestFile)
 	expectedComponents := activeComponents(initial)
@@ -827,6 +902,50 @@ var _ = Describe("K4All Operator", Ordered, func() {
 			}
 		})
 	}
+
+	// ── Feature gates set by hand ───────────────────────────────────────
+
+	// Every apply of upstream's CR, each upgradePath step among them, used to
+	// replace the KubeVirt and CDI feature gates set on the cluster.
+	Context("Feature gates set by hand", func() {
+		kubeVirt := []string{"kubevirt", "kubevirt", "-n", "kubevirt"}
+		cdi := []string{"cdi", "cdi"}
+		const kubeVirtGates = ".spec.configuration.developerConfiguration.featureGates"
+		const cdiGates = ".spec.config.featureGates"
+
+		It("should install the KubeVirt and CDI CRs as upstream publishes them", func() {
+			kubectlMustSucceed("apply", "-f", "test/crds/kubevirt-cdi.yaml")
+			kubectlMustSucceed("wait", "--for=condition=Established", "--timeout=1m",
+				"crd/kubevirts.kubevirt.io", "crd/cdis.cdi.kubevirt.io")
+			if _, err := kubectl("get", "namespace", "kubevirt"); err != nil {
+				kubectlMustSucceed("create", "namespace", "kubevirt")
+			}
+			setGatedCRComponents(kubeVirtCRSpec("v1.7.4"), cdiCRSpec("v1.65.0"))
+			Expect(featureGates(kubeVirt, kubeVirtGates)).To(BeEmpty())
+			Expect(featureGates(cdi, cdiGates)).To(Equal([]string{"HonorWaitForFirstConsumer", "WebhookPvcRendering"}))
+		})
+
+		It("should keep the gates set by hand through an upgrade", func() {
+			By("setting feature gates and a host device by hand")
+			patchByHand(kubeVirt, `{"spec":{"configuration":{
+				"developerConfiguration":{"featureGates":["HostDevices","Snapshot","DeclarativeHotplugVolumes"]},
+				"permittedHostDevices":{"pciHostDevices":[
+					{"pciVendorSelector":"8086:46a6","resourceName":"example.com/iris-xe-vf"}]}}}}`)
+			patchByHand(cdi, `{"spec":{"config":{"featureGates":[
+				"HonorWaitForFirstConsumer","WebhookPvcRendering","DataVolumeClaimAdoption"]}}}`)
+
+			By("upgrading KubeVirt v1.7.4 -> v1.8.4 -> v1.9.1 and CDI v1.65.0 -> v1.66.1")
+			setGatedCRComponents(kubeVirtCRSpec("v1.9.1", "v1.8.4"), cdiCRSpec("v1.66.1"))
+
+			By("finding the gates and the host device as they were set")
+			Expect(featureGates(kubeVirt, kubeVirtGates)).
+				To(Equal([]string{"HostDevices", "Snapshot", "DeclarativeHotplugVolumes"}))
+			Expect(jsonPathOf(kubeVirt, ".spec.configuration.permittedHostDevices.pciHostDevices[0].resourceName")).
+				To(Equal("example.com/iris-xe-vf"))
+			Expect(featureGates(cdi, cdiGates)).
+				To(Equal([]string{"HonorWaitForFirstConsumer", "WebhookPvcRendering", "DataVolumeClaimAdoption"}))
+		})
+	})
 
 	// ── Diagnostics ─────────────────────────────────────────────────────
 

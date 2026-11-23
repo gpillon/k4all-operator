@@ -28,7 +28,11 @@ func envtestConfig(t *testing.T) *rest.Config {
 	}
 	envOnce.Do(func() {
 		testEnv = &envtest.Environment{
-			CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+			CRDDirectoryPaths: []string{
+				filepath.Join("..", "..", "config", "crd", "bases"),
+				// KubeVirt and CDI, cut down (feature_gates_test.go).
+				filepath.Join("..", "..", "test", "crds"),
+			},
 			ErrorIfCRDPathMissing: true,
 		}
 		envCfg, envErr = testEnv.Start()
