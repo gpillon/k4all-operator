@@ -2,9 +2,12 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-logr/logr"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -12,10 +15,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/controller/hooks"
 )
 
 // The test plays virt-operator and cdi-operator: each puts its finalizer on
@@ -468,5 +473,101 @@ func TestReconcile_KubeVirtTurnedBackOnWaitsForItsUninstall(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(objects), &corev1.ConfigMap{}); err != nil {
 		t.Fatalf("kubevirt's objects: %v, want them applied", err)
+	}
+}
+
+// previousOperatorHook is a component's hook as the previous operator had
+// it: its install hooks only, no values revision.
+type previousOperatorHook struct{ hooks.Hook }
+
+// The operator that brings uninstallStrategy BlockUninstallIfWorkloadsExist
+// re-applies KubeVirt and CDI once on every cluster with virt on, so their
+// CRs get it at the operator upgrade, not at some later apply. The apply
+// keeps what the cluster's admins set (feature gates, host devices), and
+// the next reconcile applies nothing.
+func TestReconcile_KubeVirtAndCDIAreAppliedOnceAfterTheOperatorUpgrade(t *testing.T) {
+	srv := upstreamReleases(t)
+	for _, tc := range []struct {
+		name, version, source, namespace, byHand string
+		cr                                       gatedCR
+		gates                                    []string
+	}{
+		{"kubevirt", "v1.9.1", "/kubevirt/{{ version }}/kubevirt-cr.yaml", "kubevirt",
+			`{"spec":{"uninstallStrategy":null,"configuration":{
+				"developerConfiguration":{"featureGates":["HostDevices","Snapshot"]},
+				"permittedHostDevices":{"pciHostDevices":[{"pciVendorSelector":"8086:46a6","resourceName":"example.com/iris-xe-vf"}]}}}}`,
+			kubeVirtCR, []string{"HostDevices", "Snapshot"}},
+		{"cdi", "v1.66.1", "/cdi/{{ version }}/cdi-cr.yaml", "cdi",
+			`{"spec":{"uninstallStrategy":null,"config":{"featureGates":["HonorWaitForFirstConsumer","DataVolumeClaimAdoption"]}}}`,
+			cdiCR, []string{"HonorWaitForFirstConsumer", "DataVolumeClaimAdoption"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := k4allv1alpha1.ComponentSpec{
+				Type: k4allv1alpha1.ComponentTypeManifest, Version: tc.version,
+				Sources: []string{srv + tc.source}, Namespace: tc.namespace,
+			}
+			c, previous := componentOnEnvtest(t, tc.name, spec, k4allv1alpha1.ComponentStatus{})
+			ctx := context.Background()
+			ensureNamespace(t, c, "kubevirt")
+			tc.cr.deleteOnCleanup(t, c)
+			cc := &k4allv1alpha1.ClusterConfig{}
+			if err := c.Get(ctx, client.ObjectKey{Name: "k4all-cluster-config"}, cc); err != nil {
+				t.Fatal(err)
+			}
+			cc.Spec.Features.Virt.Enabled = true
+			if err := c.Update(ctx, cc); err != nil {
+				t.Fatal(err)
+			}
+
+			// The previous operator installed it; the admins changed it since,
+			// and its CR has no uninstallStrategy.
+			previous.hookReg = hooks.NewRegistry(c, logr.Discard())
+			previous.hookReg.Register(tc.name, previousOperatorHook{previous.hookReg.Get(tc.name)})
+			reconcileProbe(t, previous)
+			if st := componentStatus(t, c, tc.name); st.State != k4allv1alpha1.ComponentStateInstalled {
+				t.Fatalf("previous operator: %s is %s (%s), want Installed", tc.name, st.State, st.Message)
+			}
+			tc.cr.patchByHand(t, c, tc.byHand)
+
+			watching, err := client.NewWithWatch(envtestConfig(t), client.Options{Scheme: gateScheme(t)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			applies := 0
+			upgraded := &ReleaseReconciler{Scheme: previous.Scheme, RestConfig: previous.RestConfig, Log: logr.Discard(),
+				Client: interceptor.NewClient(watching, interceptor.Funcs{
+					Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if patch.Type() == types.ApplyPatchType && obj.GetObjectKind().GroupVersionKind().Kind == tc.cr.gvk.Kind {
+							applies++
+						}
+						return cl.Patch(ctx, obj, patch, opts...)
+					},
+				})}
+
+			reconcileProbe(t, upgraded)
+
+			if applies != 1 {
+				t.Fatalf("%s applied %d times at the first reconcile of the new operator, want once", tc.cr.gvk.Kind, applies)
+			}
+			cr := tc.cr.get(t, c)
+			if strategy, _, _ := unstructured.NestedString(cr.Object, "spec", "uninstallStrategy"); strategy != blockUninstall {
+				t.Errorf("uninstallStrategy %q, want %s", strategy, blockUninstall)
+			}
+			if gates := tc.cr.featureGates(t, c); !slices.Equal(gates, tc.gates) {
+				t.Errorf("feature gates %v, want the ones set by hand %v", gates, tc.gates)
+			}
+			if tc.name == "kubevirt" {
+				devices, _, _ := unstructured.NestedSlice(cr.Object, "spec", "configuration", "permittedHostDevices", "pciHostDevices")
+				if len(devices) != 1 {
+					t.Errorf("pciHostDevices %v, want the one set by hand", devices)
+				}
+			}
+
+			reconcileProbe(t, upgraded)
+
+			if applies != 1 {
+				t.Fatalf("%s applied again at the next reconcile (%d applies in all), want once", tc.cr.gvk.Kind, applies)
+			}
+		})
 	}
 }

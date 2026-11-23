@@ -49,11 +49,11 @@ type Syncer interface {
 	Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) (time.Duration, error)
 }
 
-// ValuesRevisioner is implemented by a hook whose PreInstall values change
-// between operator versions for the same ClusterConfig. The reconciler adds
-// the revision to the component's appliedHash, so a cluster re-applies the
-// component once after the operator upgrade instead of keeping the values
-// the previous operator rendered.
+// ValuesRevisioner is implemented by a hook whose PreInstall values, or the
+// objects the apply writes (KubeVirt, CDI), change between operator versions
+// for the same ClusterConfig. The reconciler adds the revision to the
+// component's appliedHash, so a cluster re-applies the component once after
+// the operator upgrade instead of keeping what the previous operator applied.
 type ValuesRevisioner interface {
 	ValuesRevision() string
 }
