@@ -97,6 +97,37 @@ const upgradeStepInterval = 10 * time.Second
 // upgradePollInterval is how often a paused reconcile checks whether the hop is over.
 const upgradePollInterval = 30 * time.Second
 
+// uninstallPollInterval is how soon a reconcile comes back while an
+// operator uninstalls what it created (an Uninstalling component).
+const uninstallPollInterval = 15 * time.Second
+
+// anyUninstalling tells whether a component is Uninstalling.
+func anyUninstalling(rm *k4allv1alpha1.ReleaseManifest) bool {
+	for _, st := range rm.Status.Components {
+		if st.State == k4allv1alpha1.ComponentStateUninstalling {
+			return true
+		}
+	}
+	return false
+}
+
+// uninstallRefusedPollInterval is how soon a reconcile comes back while a
+// component's uninstall is refused, to start it soon after the user deleted
+// the last VM or DataVolume: nothing watches those. Each reconcile then lists
+// every VM, VMI, DataVolume and PVC of the cluster from the API server, so a
+// minute: short next to deleting VMs by hand, light on the API server.
+const uninstallRefusedPollInterval = time.Minute
+
+// anyUninstallRefused tells whether a component's uninstall is refused.
+func anyUninstallRefused(rm *k4allv1alpha1.ReleaseManifest) bool {
+	for _, st := range rm.Status.Components {
+		if strings.HasPrefix(st.Message, uninstallRefusedPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // resyncInterval is how soon a reconcile comes back when nothing asks for sooner.
 const resyncInterval = 5 * time.Minute
 
@@ -215,6 +246,12 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if stepsLeft {
 		requeue = upgradeStepInterval
 	}
+	if anyUninstalling(rm) {
+		requeue = sooner(requeue, uninstallPollInterval)
+	}
+	if anyUninstallRefused(rm) {
+		requeue = sooner(requeue, uninstallRefusedPollInterval)
+	}
 	return ctrl.Result{RequeueAfter: sooner(requeue, hookRequeue)}, nil
 }
 
@@ -314,9 +351,22 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 
 		prevStatus := rm.Status.Components[name]
 		wasInstalled := prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
-			r.engine.IsInstalled(ctx, name, spec, &prevStatus)
+			uninstallUnfinished(prevStatus) || r.engine.IsInstalled(ctx, name, spec, &prevStatus)
 
 		if wasInstalled {
+			if !uninstallStarted(prevStatus) {
+				if reason := r.uninstallRefusal(ctx, name); reason != "" {
+					log.Info("uninstall refused by the component's hook", "name", name, "reason", reason)
+					rm.Status.Components[name] = refusedUninstall(prevStatus, reason)
+					allOK = false
+					continue
+				}
+			}
+			if st := r.prepareUninstall(ctx, log, name, prevStatus); st != nil {
+				rm.Status.Components[name] = *st
+				allOK = allOK && st.State != k4allv1alpha1.ComponentStateFailed
+				continue
+			}
 			log.Info("uninstalling component disabled by feature gate or CNI switch", "name", name)
 			uninstallErrs := r.uninstallWithCleanup(ctx, log, name, spec, prevStatus.InstalledVersion, config)
 			if len(uninstallErrs) > 0 {
@@ -368,11 +418,27 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 		if currentStatus.State == k4allv1alpha1.ComponentStateUnmanaged && currentStatus.AppliedHash == hash {
 			continue
 		}
+		// Back in the release while its operator uninstalls it (KubeVirt,
+		// CDI): the install waits until that is over, then starts afresh.
+		// Applied to the CR being deleted, it would be Installed once the
+		// operator is done, with nothing running.
+		if uninstallStarted(currentStatus) {
+			if st := r.prepareUninstall(ctx, log, name, currentStatus); st != nil {
+				rm.Status.Components[name] = *st
+				allOK = allOK && st.State != k4allv1alpha1.ComponentStateFailed
+				continue
+			}
+			currentStatus = k4allv1alpha1.ComponentStatus{}
+		}
 		if r.engine.IsInstalled(ctx, name, spec, &currentStatus) &&
 			(currentStatus.AppliedHash == hash || currentStatus.AppliedHash == "") {
 			// No hash: installed by an operator that did not record hashes.
 			// Adopt it instead of reinstalling every component on operator upgrade.
 			currentStatus.AppliedHash = hash
+			// Back in the release after a refused uninstall: nothing is refused now.
+			if strings.HasPrefix(currentStatus.Message, uninstallRefusedPrefix) {
+				currentStatus.Message = engine.InstalledMessage
+			}
 			hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, &currentStatus))
 			rm.Status.Components[name] = currentStatus
 			continue
@@ -434,6 +500,18 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			opts = append(opts, engine.WaitUntilReady())
 		}
 		st, err := r.engine.ReconcileComponent(ctx, name, toApply, extraValues, opts...)
+		if goerrors.Is(err, engine.ErrHelmReleaseBusy) {
+			// A helm operation that may still run (a previous leader
+			// finishing it): come back soon, as on an upgrade step.
+			stepsLeft = true
+			if currentStatus.State != k4allv1alpha1.ComponentStatePending {
+				currentStatus.State = k4allv1alpha1.ComponentStatePending
+				currentStatus.LastTransitionTime = metav1.Now()
+			}
+			currentStatus.Message = err.Error()
+			rm.Status.Components[name] = currentStatus
+			continue
+		}
 		if err != nil {
 			log.Error(err, "component reconciliation failed", "name", name)
 			allOK = false
@@ -639,7 +717,21 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 	for name, spec := range removed {
 		prevStatus, hasPrev := rm.Status.Components[name]
 		if hasPrev && (prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
-			prevStatus.State == k4allv1alpha1.ComponentStateFailed) {
+			prevStatus.State == k4allv1alpha1.ComponentStateFailed ||
+			prevStatus.State == k4allv1alpha1.ComponentStateUninstalling) {
+			if !uninstallStarted(prevStatus) {
+				if reason := r.uninstallRefusal(ctx, name); reason != "" {
+					log.Info("removal refused by the component's hook", "name", name, "reason", reason)
+					rm.Status.Components[name] = refusedUninstall(prevStatus, reason)
+					allOK = false
+					continue
+				}
+			}
+			if st := r.prepareUninstall(ctx, log, name, prevStatus); st != nil {
+				rm.Status.Components[name] = *st
+				allOK = allOK && st.State != k4allv1alpha1.ComponentStateFailed
+				continue
+			}
 			log.Info("removing component (management=Removed)", "name", name)
 			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
 				State:              k4allv1alpha1.ComponentStateUninstalling,
@@ -669,6 +761,110 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 	return allOK
 }
 
+// uninstallRefusedPrefix starts the message of a component whose hook
+// refuses its uninstall.
+const uninstallRefusedPrefix = "uninstall refused: "
+
+// uninstallRefusal is why the component's hook, when it is an
+// UninstallGuard, refuses to let the component be uninstalled now; empty
+// when it lets it, or has no say. A hook that cannot tell refuses.
+func (r *ReleaseReconciler) uninstallRefusal(ctx context.Context, name string) string {
+	guard, ok := r.hookReg.Get(name).(hooks.UninstallGuard)
+	if !ok {
+		return ""
+	}
+	reason, err := guard.UninstallBlocked(ctx, name)
+	if err != nil {
+		return fmt.Sprintf("cannot tell whether %s may be uninstalled: %v", name, err)
+	}
+	return reason
+}
+
+// refusedUninstall is the status of a component kept installed because its
+// hook refuses the uninstall: still Installed at its version, so the next
+// reconcile asks the hook again, with the reason in its message.
+func refusedUninstall(prev k4allv1alpha1.ComponentStatus, reason string) k4allv1alpha1.ComponentStatus {
+	st := prev
+	if st.State != k4allv1alpha1.ComponentStateInstalled {
+		st.State = k4allv1alpha1.ComponentStateInstalled
+		st.LastTransitionTime = metav1.Now()
+	}
+	st.Message = uninstallRefusedPrefix + reason
+	return st
+}
+
+// How long an operator may take to uninstall what it created (KubeVirt, CDI)
+// before its component is Failed, and where to read how to recover.
+const (
+	uninstallWait        = 15 * time.Minute
+	uninstallRecovery    = "https://github.com/gpillon/k4all/issues/94"
+	uninstallStuckPrefix = "uninstall stuck: "
+	// uninstallFailedPrefix starts the message of a component whose
+	// uninstall failed; the next reconcile tries it again.
+	uninstallFailedPrefix = "uninstall failed"
+)
+
+// uninstallStarted tells whether the component's operator is uninstalling
+// what it created (its hook deleted its CR): the uninstall goes on, and the
+// UninstallGuard is not asked again, it can no longer stop it.
+func uninstallStarted(st k4allv1alpha1.ComponentStatus) bool {
+	return st.State == k4allv1alpha1.ComponentStateUninstalling ||
+		(st.State == k4allv1alpha1.ComponentStateFailed && strings.HasPrefix(st.Message, uninstallStuckPrefix))
+}
+
+// uninstallUnfinished tells whether the component's uninstall started and
+// is not over: under way, stuck, or failed (tried again).
+func uninstallUnfinished(st k4allv1alpha1.ComponentStatus) bool {
+	return uninstallStarted(st) ||
+		(st.State == k4allv1alpha1.ComponentStateFailed && strings.HasPrefix(st.Message, uninstallFailedPrefix))
+}
+
+// prepareUninstall asks the component's hook, when it is an
+// UninstallPreparer, whether its operator has uninstalled what it created.
+// It returns the status to record while it has not: Uninstalling, or Failed
+// once that took longer than uninstallWait (from the time the component
+// went Uninstalling) or the hook failed; the operator is kept either way.
+// Nil when the engine's uninstall may go on.
+func (r *ReleaseReconciler) prepareUninstall(
+	ctx context.Context, log logr.Logger, name string, prev k4allv1alpha1.ComponentStatus,
+) *k4allv1alpha1.ComponentStatus {
+	preparer, ok := r.hookReg.Get(name).(hooks.UninstallPreparer)
+	if !ok {
+		return nil
+	}
+	pending, err := preparer.PrepareUninstall(ctx, name)
+	if err != nil {
+		log.Error(err, "the operator's uninstall cannot go on", "name", name)
+		return &k4allv1alpha1.ComponentStatus{
+			State:              k4allv1alpha1.ComponentStateFailed,
+			Message:            fmt.Sprintf("%s: %v", uninstallFailedPrefix, err),
+			InstalledVersion:   prev.InstalledVersion,
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+	if pending == "" {
+		return nil
+	}
+	st := prev
+	switch {
+	case uninstallStarted(prev) && prev.State == k4allv1alpha1.ComponentStateFailed:
+		// stuck already: stays Failed, since the same time
+	case prev.State == k4allv1alpha1.ComponentStateUninstalling && time.Since(prev.LastTransitionTime.Time) > uninstallWait:
+		st.State = k4allv1alpha1.ComponentStateFailed
+		st.LastTransitionTime = metav1.Now()
+	case prev.State != k4allv1alpha1.ComponentStateUninstalling:
+		st.State = k4allv1alpha1.ComponentStateUninstalling
+		st.LastTransitionTime = metav1.Now()
+	}
+	st.Message = pending
+	if st.State == k4allv1alpha1.ComponentStateFailed {
+		log.Info("the operator's uninstall is stuck", "name", name, "pending", pending)
+		st.Message = fmt.Sprintf("%s%s, for more than %d minutes: k4all-operator keeps the operator "+
+			"until it is done; to recover see %s", uninstallStuckPrefix, pending, int(uninstallWait.Minutes()), uninstallRecovery)
+	}
+	return &st
+}
+
 // uninstallWithCleanup uninstalls a component and runs its Cleanup hook (if any),
 // returning the collected error messages. Both steps always run.
 func (r *ReleaseReconciler) uninstallWithCleanup(
@@ -690,32 +886,47 @@ func (r *ReleaseReconciler) uninstallWithCleanup(
 }
 
 // setReadySummary sets the Ready condition from the outcome of a full reconcile.
-// Components still on their upgrade path (Upgrading, or Pending on a step)
-// keep it False.
+// Components still on their upgrade path (Upgrading, or Pending on a step),
+// being uninstalled (Uninstalling: their operator removes what it created)
+// or kept installed by a refused uninstall keep it False.
 func setReadySummary(rm *k4allv1alpha1.ReleaseManifest, allOK bool, activeCount int) {
-	if !allOK {
-		engine.SetReadyCondition(rm, metav1.ConditionFalse, "ComponentsFailed",
-			"one or more components failed to reconcile")
-		return
-	}
-	installed := 0
-	var waiting []string
+	installed, failed := 0, false
+	var waiting, uninstalling, refused []string
 	for name, st := range rm.Status.Components {
-		switch st.State {
-		case k4allv1alpha1.ComponentStateInstalled:
+		if st.State == k4allv1alpha1.ComponentStateInstalled {
 			installed++
-		case k4allv1alpha1.ComponentStateUpgrading, k4allv1alpha1.ComponentStatePending:
+		}
+		switch {
+		case strings.HasPrefix(st.Message, uninstallRefusedPrefix):
+			refused = append(refused, name)
+		case st.State == k4allv1alpha1.ComponentStateFailed:
+			failed = true
+		case st.State == k4allv1alpha1.ComponentStateUninstalling:
+			uninstalling = append(uninstalling, name)
+		case st.State == k4allv1alpha1.ComponentStateUpgrading, st.State == k4allv1alpha1.ComponentStatePending:
 			waiting = append(waiting, name)
 		}
 	}
-	if len(waiting) > 0 {
-		sort.Strings(waiting)
+	sort.Strings(refused)
+	sort.Strings(uninstalling)
+	sort.Strings(waiting)
+	switch {
+	case !allOK && (failed || len(refused) == 0):
+		engine.SetReadyCondition(rm, metav1.ConditionFalse, "ComponentsFailed",
+			"one or more components failed to reconcile")
+	case len(refused) > 0:
+		engine.SetReadyCondition(rm, metav1.ConditionFalse, "UninstallRefused",
+			"components kept installed, their uninstall refused (see their status): "+strings.Join(refused, ", "))
+	case len(uninstalling) > 0:
+		engine.SetReadyCondition(rm, metav1.ConditionFalse, "ComponentsUninstalling",
+			"components being uninstalled (see their status): "+strings.Join(uninstalling, ", "))
+	case len(waiting) > 0:
 		engine.SetReadyCondition(rm, metav1.ConditionFalse, "ComponentsUpgrading",
 			"components on their upgrade path (see their status): "+strings.Join(waiting, ", "))
-		return
+	default:
+		engine.SetReadyCondition(rm, metav1.ConditionTrue, "AllComponentsReconciled",
+			fmt.Sprintf("%d/%d components installed", installed, activeCount))
 	}
-	engine.SetReadyCondition(rm, metav1.ConditionTrue, "AllComponentsReconciled",
-		fmt.Sprintf("%d/%d components installed", installed, activeCount))
 }
 
 func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, config *k4allv1alpha1.ClusterConfig, rm *k4allv1alpha1.ReleaseManifest) {
