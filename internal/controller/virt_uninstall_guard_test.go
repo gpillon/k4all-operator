@@ -295,3 +295,31 @@ func TestReconcile_KubeVirtRefusalCountsTheVMsAndNamesAFew(t *testing.T) {
 		"4 VirtualMachines (default/db, default/web-1, default/web-2, …) and "+
 		"2 VirtualMachineInstances (default/db, default/web-1) exist: delete them or set kubevirt Unmanaged first")
 }
+
+// While an uninstall is refused, the reconcile comes back within a minute,
+// not at the 5-minute resync: the uninstall starts soon after the user
+// deleted the last VM (on the lab it waited 4m20s). Nothing refused, the
+// resync is back to 5 minutes.
+func TestReconcile_ARefusedUninstallIsAskedAgainWithinAMinute(t *testing.T) {
+	virtWorkloadAPIs(t)
+	c, r, objects := virtOnEnvtest(t, "kubevirt")
+	vm := kubevirtObject("VirtualMachine", "vm1")
+	createAll(t, c, vm)
+
+	res := reconcileProbe(t, r)
+
+	assertUninstallRefused(t, c, "kubevirt", objects, "uninstall refused: ")
+	if res.RequeueAfter <= 0 || res.RequeueAfter > time.Minute {
+		t.Fatalf("RequeueAfter %s with the uninstall refused, want at most a minute", res.RequeueAfter)
+	}
+
+	if err := deleteNow(c, vm); err != nil {
+		t.Fatal(err)
+	}
+	res = reconcileProbe(t, r)
+
+	assertUninstalled(t, c, "kubevirt", objects)
+	if res.RequeueAfter != 5*time.Minute {
+		t.Fatalf("RequeueAfter %s with nothing refused, want the 5-minute resync", res.RequeueAfter)
+	}
+}

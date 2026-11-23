@@ -104,6 +104,23 @@ func anyUninstalling(rm *k4allv1alpha1.ReleaseManifest) bool {
 	return false
 }
 
+// uninstallRefusedPollInterval is how soon a reconcile comes back while a
+// component's uninstall is refused, to start it soon after the user deleted
+// the last VM or DataVolume: nothing watches those. Each reconcile then lists
+// every VM, VMI, DataVolume and PVC of the cluster from the API server, so a
+// minute: short next to deleting VMs by hand, light on the API server.
+const uninstallRefusedPollInterval = time.Minute
+
+// anyUninstallRefused tells whether a component's uninstall is refused.
+func anyUninstallRefused(rm *k4allv1alpha1.ReleaseManifest) bool {
+	for _, st := range rm.Status.Components {
+		if strings.HasPrefix(st.Message, uninstallRefusedPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // resyncInterval is how soon a reconcile comes back when nothing asks for sooner.
 const resyncInterval = 5 * time.Minute
 
@@ -206,6 +223,9 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	if anyUninstalling(rm) {
 		requeue = sooner(requeue, uninstallPollInterval)
+	}
+	if anyUninstallRefused(rm) {
+		requeue = sooner(requeue, uninstallRefusedPollInterval)
 	}
 	return ctrl.Result{RequeueAfter: sooner(requeue, hookRequeue)}, nil
 }
