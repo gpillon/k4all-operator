@@ -78,6 +78,13 @@ type ReleaseReconciler struct {
 
 const ForceResyncAnnotation = "k4all.magesgate.com/force-resync"
 
+// AllowDowngradeAnnotation on the ReleaseManifest names the downgrades a
+// person allows, as "component=version" entries separated by commas.
+// Without one the operator never applies a version lower than the one a
+// component has installed (k4all ADR-0010): the entry allows exactly that
+// version, so a stale annotation allows nothing else.
+const AllowDowngradeAnnotation = "k4all.magesgate.com/allow-downgrade"
+
 // UpgradeInProgressAnnotation is set by the host tool k4all-upgrade on its own
 // Node while an OS/Kubernetes hop is running (value "<from>-><to>"). While any
 // Node carries it, components are not reconciled: no installs, no upgrades, no
@@ -193,6 +200,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	inactiveOK := r.reconcileInactiveComponents(ctx, log, rm, active, config.Spec)
 	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
+	setDowngradeRefused(rm, active)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
 
 	if err := r.patchStatus(ctx, rm); err != nil {
@@ -370,6 +378,17 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			continue
 		}
 
+		if why := downgradeRefused(rm, name, spec, currentStatus); why != "" {
+			allOK = false
+			if currentStatus.State != k4allv1alpha1.ComponentStateFailed {
+				currentStatus.State = k4allv1alpha1.ComponentStateFailed
+				currentStatus.LastTransitionTime = metav1.Now()
+			}
+			currentStatus.Message = why
+			rm.Status.Components[name] = currentStatus
+			continue
+		}
+
 		start, startErr := r.upgradePathStart(ctx, name, spec, currentStatus)
 		var wait waitForStep
 		switch {
@@ -535,6 +554,64 @@ func (r *ReleaseReconciler) versionReporter(name string, spec k4allv1alpha1.Comp
 		return reporter
 	}
 	return r.engine.HelmReleaseReporter(name, spec)
+}
+
+// downgradeRefused says why the operator does not move a component from the
+// version it has installed down to the release's, or "" when it may go: the
+// release pins nothing lower, or AllowDowngradeAnnotation names this
+// downgrade. Versions compare as semver; a pin that is not semver ("latest")
+// is never refused.
+func downgradeRefused(rm *k4allv1alpha1.ReleaseManifest, name string, spec k4allv1alpha1.ComponentSpec,
+	st k4allv1alpha1.ComponentStatus) string {
+	if st.InstalledVersion == "" || !newerVersion(st.InstalledVersion, spec.Version) ||
+		downgradeAllowed(rm.GetAnnotations()[AllowDowngradeAnnotation], name, spec.Version) {
+		return ""
+	}
+	return fmt.Sprintf("the release pins %s, older than the installed %s: not downgrading "+
+		"(to allow it, annotate the ReleaseManifest with %s: %s=%s)",
+		spec.Version, st.InstalledVersion, AllowDowngradeAnnotation, name, spec.Version)
+}
+
+// downgradeAllowed tells whether the AllowDowngradeAnnotation value has the
+// entry name=version (semver equality, else the same text).
+func downgradeAllowed(value, name, version string) bool {
+	for _, entry := range strings.Split(value, ",") {
+		n, v, ok := strings.Cut(entry, "=")
+		if !ok || strings.TrimSpace(n) != name {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if c, ok := engine.CompareVersions(v, version); (ok && c == 0) || v == version {
+			return true
+		}
+	}
+	return false
+}
+
+// downgradeRefusedCondition lists, on the ReleaseManifest, the components
+// left at a version newer than the release pins (downgradeRefused).
+const downgradeRefusedCondition = "DowngradeRefused"
+
+func setDowngradeRefused(rm *k4allv1alpha1.ReleaseManifest, active map[string]k4allv1alpha1.ComponentSpec) {
+	var refused []string
+	for name, spec := range active {
+		if downgradeRefused(rm, name, spec, rm.Status.Components[name]) != "" {
+			refused = append(refused, name)
+		}
+	}
+	if len(refused) == 0 {
+		meta.RemoveStatusCondition(&rm.Status.Conditions, downgradeRefusedCondition)
+		return
+	}
+	sort.Strings(refused)
+	meta.SetStatusCondition(&rm.Status.Conditions, metav1.Condition{
+		Type:               downgradeRefusedCondition,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: rm.Generation,
+		Reason:             downgradeRefusedCondition,
+		Message: "the release pins these components lower than they are installed, and " +
+			AllowDowngradeAnnotation + " does not allow it: " + strings.Join(refused, ", "),
+	})
 }
 
 // newerVersion tells whether a is a later semver than b.
