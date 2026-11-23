@@ -334,6 +334,55 @@ func installedOnEnvtestAs(t *testing.T, name string, spec k4allv1alpha1.Componen
 	})
 }
 
+// k4all applies the KubeVirt and CDI CRs with spec.uninstallStrategy
+// BlockUninstallIfWorkloadsExist (upstream's CRs leave it unset): a CR
+// deleted by hand, or by anything else, then waits for the VMs and
+// DataVolumes to be gone instead of deleting them. A value set by hand is
+// replaced at the next apply.
+func TestReconcile_KubeVirtAndCDIAreAppliedWithBlockUninstallIfWorkloadsExist(t *testing.T) {
+	srv := upstreamReleases(t)
+	for _, tc := range []struct {
+		name, source, namespace string
+		cr                      gatedCR
+	}{
+		{"KubeVirt", "/kubevirt/{{ version }}/kubevirt-cr.yaml", "kubevirt", kubeVirtCR},
+		{"CDI", "/cdi/{{ version }}/cdi-cr.yaml", "cdi", cdiCR},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			version := "v1.9.1"
+			if tc.name == "CDI" {
+				version = "v1.66.1"
+			}
+			spec := k4allv1alpha1.ComponentSpec{
+				Type: k4allv1alpha1.ComponentTypeManifest, Version: version,
+				Sources: []string{srv + tc.source}, Namespace: tc.namespace,
+			}
+			c, r := onEnvtest(t, spec, k4allv1alpha1.ComponentStatus{})
+			ensureNamespace(t, c, "kubevirt")
+			tc.cr.deleteOnCleanup(t, c)
+			strategy := func() string {
+				s, _, _ := unstructured.NestedString(tc.cr.get(t, c).Object, "spec", "uninstallStrategy")
+				return s
+			}
+
+			reconcileProbeTo(t, c, r, version, k4allv1alpha1.ComponentStateInstalled)
+			if s := strategy(); s != blockUninstall {
+				t.Fatalf("fresh install: uninstallStrategy %q, want BlockUninstallIfWorkloadsExist", s)
+			}
+
+			tc.cr.patchByHand(t, c, `{"spec":{"uninstallStrategy":"RemoveWorkloads"}}`)
+			setProbe(t, c, k4allv1alpha1.ComponentSpec{
+				Type: k4allv1alpha1.ComponentTypeManifest, Version: version,
+				Sources: []string{srv + tc.source}, Namespace: tc.namespace, Custom: map[string]string{"apply": "again"},
+			})
+			reconcileProbeTo(t, c, r, version, k4allv1alpha1.ComponentStateInstalled)
+			if s := strategy(); s != blockUninstall {
+				t.Fatalf("next apply: uninstallStrategy %q, want BlockUninstallIfWorkloadsExist", s)
+			}
+		})
+	}
+}
+
 // The release is not Ready while a component is half-removed: its operator
 // still uninstalling what it created, stuck at it, or its uninstall refused.
 // It was Ready ("10/10 components installed") with KubeVirt half-deleted.
