@@ -97,6 +97,13 @@ rules:
   - update
   - watch
 - apiGroups:
+  - cilium.io
+  resources:
+  - ciliumnodes
+  verbs:
+  - get
+  - list
+- apiGroups:
   - k4all.magesgate.com
   resources:
   - clusterconfigs

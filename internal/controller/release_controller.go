@@ -648,6 +648,12 @@ func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, confi
 		Message:            fmt.Sprintf("CNI=%s, reconciled at %s", config.Status.ActiveCNI, config.Status.LastReconcileTime.Format(time.RFC3339)),
 	})
 
+	if config.Spec.Networking.CNI.Type == ciliumCNI {
+		meta.SetStatusCondition(&config.Status.Conditions, r.podNetworkOverlap(ctx, config, rm))
+	} else {
+		meta.RemoveStatusCondition(&config.Status.Conditions, PodNetworkOverlapCondition)
+	}
+
 	statusPayload := map[string]interface{}{
 		"status": config.Status,
 	}

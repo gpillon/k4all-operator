@@ -15,6 +15,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
+// defaultPodNetwork is spec.cluster.podNetwork in k4all-config.yaml.default:
+// a host address, not a network.
+const defaultPodNetwork = "10.100.0.1/18"
+
 // ciliumSpec is the cilium component as k4all-release.yaml pins it.
 var ciliumSpec = k4allv1alpha1.ComponentSpec{Type: "helm-oci", Version: "1.20.4", Namespace: "kube-system"}
 
@@ -37,7 +41,7 @@ func ciliumValues(t *testing.T, config k4allv1alpha1.ClusterConfigSpec, objects 
 // podNetwork is a host address (10.100.0.1/18): the pool is its network.
 func TestComponentValues_CiliumNewClusterTakesThePodNetwork(t *testing.T) {
 	config := ciliumConfig()
-	config.Cluster.PodNetwork = "10.100.0.1/18"
+	config.Cluster.PodNetwork = defaultPodNetwork
 
 	got := ciliumValues(t, config)
 
@@ -72,7 +76,7 @@ func ciliumConfigMap(cidrs, maskSize string) *corev1.ConfigMap {
 // Moving it would re-address the pods.
 func TestComponentValues_CiliumKeepsThePoolTheClusterRuns(t *testing.T) {
 	config := ciliumConfig()
-	config.Cluster.PodNetwork = "10.100.0.1/18"
+	config.Cluster.PodNetwork = defaultPodNetwork
 
 	got := ciliumValues(t, config, ciliumConfigMap("10.0.0.0/8", "24"))
 
