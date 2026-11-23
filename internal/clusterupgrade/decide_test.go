@@ -740,3 +740,73 @@ func condition(status k4allv1alpha1.ClusterUpgradeStatus, typ string) *metav1.Co
 	}
 	return nil
 }
+
+// A single-instance CloudNativePG primary: its budget allows no disruption,
+// healthy 1/1, so the drain of its node would never end (k4all#87).
+var cnpgPrimary = Blocker{PDB: "kubone-data/kubone-pg-primary", Pod: "kubone-data/kubone-pg-1"}
+
+func TestDecide_DoesNotCordonANodeItCouldNeverDrain(t *testing.T) {
+	in := Input{Spec: target("v2.7.0"), Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now,
+		Blockers: map[string][]Blocker{"cp-0": {cnpgPrimary}}}
+
+	status, actions := Decide(in)
+
+	expectActions(t, actions)
+	want := "v2.6.0: cp-0 cannot be drained: PDB kubone-data/kubone-pg-primary allows no disruption " +
+		"of pod kubone-data/kubone-pg-1 (a single-instance CloudNativePG cluster? see docs/upgrades.md, " +
+		"Drains that never end); the node is not cordoned"
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, want)
+	for _, n := range status.Nodes {
+		if n.Name == "cp-0" && (n.Phase != k4allv1alpha1.NodeUpgradePending ||
+			!strings.Contains(n.Message, "PDB kubone-data/kubone-pg-primary allows no disruption")) {
+			t.Errorf("cp-0 = %s %q, want Pending with the budget named", n.Phase, n.Message)
+		}
+	}
+
+	t.Run("goes on once the budget lets the pod go", func(t *testing.T) {
+		in.Blockers = nil
+		_, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Cordon, Node: "cp-0"})
+	})
+
+	t.Run("a blocker on another node waits for its turn", func(t *testing.T) {
+		in.Blockers = map[string][]Blocker{"w-0": {cnpgPrimary}}
+		_, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Cordon, Node: "cp-0"})
+	})
+
+	t.Run("names every blocker, up to three", func(t *testing.T) {
+		in.Blockers = map[string][]Blocker{"cp-0": {
+			{PDB: "a/p1", Pod: "a/x"}, {PDB: "a/p2", Pod: "a/y"}, {PDB: "b/p3", Pod: "b/z"}, {PDB: "c/p4", Pod: "c/w"}}}
+		status, _ := Decide(in)
+		for _, part := range []string{"PDB a/p1 allows no disruption of pod a/x; PDB a/p2", "PDB b/p3", "and 1 more"} {
+			if !strings.Contains(status.Message, part) {
+				t.Errorf("message = %q, want %q in it", status.Message, part)
+			}
+		}
+	})
+}
+
+// A single node is not drained: its budgets do not matter.
+func TestDecide_SingleNodeIgnoresTheBlockers(t *testing.T) {
+	_, actions := Decide(Input{
+		Spec:     k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: firstHop},
+		Nodes:    []Node{node("k4all", "bootstrap", "v2.5.0")},
+		Blockers: map[string][]Blocker{"k4all": {cnpgPrimary}},
+		Graph:    graph(t),
+		Now:      now,
+	})
+
+	expectActions(t, actions, Action{Kind: Cordon, Node: "k4all"}, Action{Kind: SetTarget, Node: "k4all", Release: firstHop})
+}
+
+// A node already cordoned when its pod became a blocker keeps draining, as
+// before: the drain timeout still applies.
+func TestDecide_BlockersDoNotStopADrainInProgress(t *testing.T) {
+	in := draining(t, now.Add(-time.Minute), 1)
+	in.Blockers = map[string][]Blocker{"cp-0": {cnpgPrimary}}
+	_, actions := Decide(in)
+	if len(actions) != 1 || actions[0].Kind != Evict {
+		t.Errorf("actions = %+v, want the drain to go on", actions)
+	}
+}

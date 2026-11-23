@@ -49,13 +49,45 @@ type Syncer interface {
 	Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) (time.Duration, error)
 }
 
-// ValuesRevisioner is implemented by a hook whose PreInstall values change
-// between operator versions for the same ClusterConfig. The reconciler adds
-// the revision to the component's appliedHash, so a cluster re-applies the
-// component once after the operator upgrade instead of keeping the values
-// the previous operator rendered.
+// ValuesRevisioner is implemented by a hook whose PreInstall values, or the
+// objects the apply writes (KubeVirt, CDI), change between operator versions
+// for the same ClusterConfig. The reconciler adds the revision to the
+// component's appliedHash, so a cluster re-applies the component once after
+// the operator upgrade instead of keeping what the previous operator applied.
 type ValuesRevisioner interface {
 	ValuesRevision() string
+}
+
+// UninstallGuard is implemented by a hook whose component must not be
+// uninstalled while something still needs it (Rook: a CephCluster holds
+// data, and without the operator its daemons and finalizers are stranded).
+// The reconciler asks before every uninstall, whichever the cause: the
+// component's feature turned off, a CNI switch, management Removed. A
+// non-empty reason refuses it: the component stays installed, its status
+// says why, and the reconciler asks again at every reconcile. An error
+// refuses it too: the hook cannot tell that it is safe.
+type UninstallGuard interface {
+	UninstallBlocked(ctx context.Context, name string) (reason string, err error)
+}
+
+// UninstallPreparer is implemented by a hook whose component's operator must
+// uninstall what it created before k4all deletes the operator: KubeVirt and
+// CDI create CRDs, webhooks and APIServices that are in no manifest, and
+// only their operator removes them, when its CR is deleted. The reconciler
+// calls PrepareUninstall once the UninstallGuard (if any) lets the uninstall
+// start, and at every reconcile after that until it is done:
+//   - "" and no error: the operator is done; the engine's uninstall and the
+//     Cleanup hook follow, as for any component;
+//   - a pending message: the component stays Uninstalling with it, and the
+//     reconciler comes back soon; past uninstallWait it is Failed, still
+//     with its operator;
+//   - an error: the component is Failed, its operator kept, and the next
+//     reconcile asks again.
+//
+// It must not block: it starts the operator's uninstall (deletes the CR) and
+// reports how far it got.
+type UninstallPreparer interface {
+	PrepareUninstall(ctx context.Context, name string) (pending string, err error)
 }
 
 // Registry maps component names to their hooks.
@@ -94,6 +126,7 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 	r.hooks["topolvm"] = NewTopolvmHook(c, log.WithName("hook-topolvm"))
 	r.hooks["calico"] = NewCalicoHook(c, log.WithName("hook-calico"))
 	r.hooks["nmstate"] = NewNMStateHook(c, log.WithName("hook-nmstate"))
+	r.hooks["kubevirt-manager"] = NewKubevirtManagerHook(c)
 	return r
 }
 
