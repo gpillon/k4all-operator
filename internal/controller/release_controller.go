@@ -250,15 +250,22 @@ func (r *ReleaseReconciler) handleForceResync(
 }
 
 // markUnmanagedComponents records the Unmanaged state for every component
-// whose lifecycle is not handled by the operator.
+// whose lifecycle is not handled by the operator. A component already marked
+// keeps its status as it is, so a reconcile that changes nothing writes
+// nothing.
 func markUnmanagedComponents(rm *k4allv1alpha1.ReleaseManifest) {
+	const message = "lifecycle not managed by operator"
 	for name, spec := range rm.Spec.Components {
-		if spec.Management == k4allv1alpha1.ComponentManagementUnmanaged {
-			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
-				State:              k4allv1alpha1.ComponentStateUnmanaged,
-				Message:            "lifecycle not managed by operator",
-				LastTransitionTime: metav1.Now(),
-			}
+		if spec.Management != k4allv1alpha1.ComponentManagementUnmanaged {
+			continue
+		}
+		if st := rm.Status.Components[name]; st.State == k4allv1alpha1.ComponentStateUnmanaged && st.Message == message {
+			continue
+		}
+		rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
+			State:              k4allv1alpha1.ComponentStateUnmanaged,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
 		}
 	}
 }
@@ -300,14 +307,21 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 			}
 		}
 
+		if prevStatus.State == k4allv1alpha1.ComponentStateSkipped && prevStatus.Message == skippedMessage {
+			continue
+		}
 		rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
 			State:              k4allv1alpha1.ComponentStateSkipped,
-			Message:            "disabled by ClusterConfig feature gate",
+			Message:            skippedMessage,
 			LastTransitionTime: metav1.Now(),
 		}
 	}
 	return allOK
 }
+
+// skippedMessage is the message of a component its feature gate or the CNI
+// leaves out.
+const skippedMessage = "disabled by ClusterConfig feature gate"
 
 // reconcileActiveComponents installs or upgrades the active components in
 // dependency order, running the PreInstall/PostInstall hooks around each one.
