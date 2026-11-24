@@ -16,10 +16,14 @@ on:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/k4all-operator
+  # The metadata server (cmd/metadata-server), same tag as the operator: the
+  # operator's k4all-metadata component runs it in VMs' pods.
+  METADATA_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/k4all-metadata
 
 jobs:
   # ------------------------------------------------------------------
-  # 1. Build per-arch images on native runners (fast, no QEMU)
+  # 1. Build per-arch images on native runners (fast, no QEMU): the
+  #    operator and the metadata server
   # ------------------------------------------------------------------
   build-image:
     runs-on: ${{ matrix.runner }}
@@ -29,11 +33,22 @@ jobs:
     strategy:
       matrix:
         arch: [amd64, arm64]
+        image: [operator, metadata]
         include:
           - arch: amd64
             runner: ubuntu-latest
           - arch: arm64
             runner: ubuntu-24.04-arm
+          - image: operator
+            name: k4all-operator
+            dockerfile: Dockerfile
+            title: K4All Operator
+            description: Kubernetes operator for K4All cluster lifecycle
+          - image: metadata
+            name: k4all-metadata
+            dockerfile: cmd/metadata-server/Dockerfile
+            title: K4All metadata server
+            description: The 169.254.169.254 metadata service of K4All VMs
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -72,7 +87,9 @@ jobs:
 
       # Layers come from the GHA layer cache (cache-from/to below); the Go build
       # cache mount used by the Dockerfile is persisted with buildkit-cache-dance.
+      # The operator's Go build cache; the metadata server builds in seconds.
       - name: Cache Go build cache for the image build
+        if: matrix.image == 'operator'
         id: docker-go-cache
         uses: actions/cache@v6
         with:
@@ -82,6 +99,7 @@ jobs:
             docker-go-build-${{ runner.os }}-${{ matrix.arch }}-
 
       - name: Inject Go build cache into BuildKit
+        if: matrix.image == 'operator'
         uses: reproducible-containers/buildkit-cache-dance@v3
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -98,23 +116,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (${{ matrix.arch }})
+      - name: Build and push ${{ matrix.name }} (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
           push: true
           provenance: false
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
-            org.opencontainers.image.title=K4All Operator
-            org.opencontainers.image.description=Kubernetes operator for K4All cluster lifecycle
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.description=${{ matrix.description }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # The operator keeps its cache scopes (amd64, arm64).
+          cache-from: type=gha,scope=${{ matrix.image == 'operator' && matrix.arch || format('metadata-{0}', matrix.arch) }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image == 'operator' && matrix.arch || format('metadata-{0}', matrix.arch) }}
 
   # ------------------------------------------------------------------
   # 2. Create multi-arch manifest from per-arch images
@@ -132,20 +152,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create multi-arch manifest
+      - name: Create multi-arch manifests
         run: |
           VERSION="${{ needs.build-image.outputs.version }}"
-          docker manifest create "${{ env.IMAGE_NAME }}:${VERSION}" \
-            "${{ env.IMAGE_NAME }}:${VERSION}-amd64" \
-            "${{ env.IMAGE_NAME }}:${VERSION}-arm64"
-          docker manifest push "${{ env.IMAGE_NAME }}:${VERSION}"
+          for IMAGE in "${{ env.IMAGE_NAME }}" "${{ env.METADATA_IMAGE_NAME }}"; do
+            docker manifest create "${IMAGE}:${VERSION}" \
+              "${IMAGE}:${VERSION}-amd64" \
+              "${IMAGE}:${VERSION}-arm64"
+            docker manifest push "${IMAGE}:${VERSION}"
 
-          if [ "${{ needs.build-image.outputs.is_tag }}" = "true" ]; then
-            docker manifest create "${{ env.IMAGE_NAME }}:latest" \
-              "${{ env.IMAGE_NAME }}:${VERSION}-amd64" \
-              "${{ env.IMAGE_NAME }}:${VERSION}-arm64"
-            docker manifest push "${{ env.IMAGE_NAME }}:latest"
-          fi
+            if [ "${{ needs.build-image.outputs.is_tag }}" = "true" ]; then
+              docker manifest create "${IMAGE}:latest" \
+                "${IMAGE}:${VERSION}-amd64" \
+                "${IMAGE}:${VERSION}-arm64"
+              docker manifest push "${IMAGE}:latest"
+            fi
+          done
 
   # ------------------------------------------------------------------
   # 3. Generate install.yaml and create GitHub Release
@@ -197,9 +219,10 @@ jobs:
             kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ needs.build-image.outputs.version }}/install.yaml
             ```
 
-            ### Container Image
+            ### Container Images
             ```
             ghcr.io/${{ github.repository_owner }}/k4all-operator:${{ needs.build-image.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/k4all-metadata:${{ needs.build-image.outputs.version }}
             ```
 
       - name: Create/update latest prerelease

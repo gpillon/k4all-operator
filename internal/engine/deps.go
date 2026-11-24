@@ -127,6 +127,10 @@ const (
 	// serves both (KubeVirt and Hangar snapshot VM disks, ceph-rbd has a
 	// VolumeSnapshotClass). It has no ClusterConfig switch of its own.
 	FeatureSnapshots = "snapshots"
+	// FeatureVirtMetadata is the metadata service of VMs: virt, plus
+	// features.virt.metadata.enabled. An operator before v0.6.0 does not
+	// know it and leaves the k4all-metadata component out.
+	FeatureVirtMetadata = "virtMetadata"
 )
 
 // FeatureEnabled says whether the ClusterConfig turns on the feature gate; an
@@ -143,6 +147,9 @@ func FeatureEnabled(gate string, config k4allv1alpha1.ClusterConfigSpec) bool {
 		return rookEnabled(config)
 	case FeatureSnapshots:
 		return config.Features.Virt.Enabled || rookEnabled(config)
+	case FeatureVirtMetadata:
+		md := config.Features.Virt.Metadata
+		return config.Features.Virt.Enabled && md != nil && md.Enabled
 	}
 	return false
 }

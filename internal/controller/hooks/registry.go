@@ -202,6 +202,9 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 	r.hooks["rook-ceph"] = NewRookHook(c, log.WithName("hook-rook"))
 	r.hooks["ceph-csi-drivers"] = NewCephCSIDriversHook(c)
 	r.hooks["snapshot-controller"] = NewSnapshotControllerHook(c, log.WithName("hook-snapshot-controller"))
+	md := NewMetadataHook(c, log.WithName("hook-metadata"))
+	md.restConfig = o.restConfig
+	r.hooks[MetadataComponent] = md
 	return r
 }
 

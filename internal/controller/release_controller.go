@@ -981,6 +981,11 @@ func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, confi
 		meta.RemoveStatusCondition(&config.Status.Conditions, k4allv1alpha1.ConditionRookReady)
 	}
 	r.setKubeVirtSettings(ctx, config)
+	if cond, ok := metadataServiceCondition(config, rm); ok {
+		meta.SetStatusCondition(&config.Status.Conditions, cond)
+	} else {
+		meta.RemoveStatusCondition(&config.Status.Conditions, k4allv1alpha1.ConditionMetadataService)
+	}
 
 	r.patchClusterConfigStatus(ctx, config)
 }
