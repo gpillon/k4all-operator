@@ -35,7 +35,30 @@ func NewManifestApplier(c client.Client, log logr.Logger) *ManifestApplier {
 	}
 }
 
-func (m *ManifestApplier) Apply(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec) error {
+// ObjectMutator changes objects of a manifest component before their
+// server-side apply, knowing what the cluster has: a component hook folds
+// ClusterConfig settings into them (VirtHook: the KubeVirt CR), so the
+// settings and the manifest are one apply, by one field manager, and an
+// apply of the manifest never drops them (spec R3).
+type ObjectMutator interface {
+	// Mutates tells whether Mutate changes obj, an object of the
+	// component's manifests: only those are read from the cluster first.
+	Mutates(obj *unstructured.Unstructured) bool
+	// Mutate changes desired, the object about to be applied, from live,
+	// the object in the cluster (nil: not there yet). spec is the component
+	// being applied, its version resolved. The engine does not merge the
+	// additive lists (additive_lists.go) of an object Mutate changes: Mutate
+	// merges them, with MergeSharedList. It may run more than once for one
+	// apply: on a conflict, with a fresh live object.
+	Mutate(ctx context.Context, spec k4allv1alpha1.ComponentSpec, desired, live *unstructured.Unstructured) error
+}
+
+// Apply server-side applies the objects of the component's manifests, URL
+// sources first, then inline manifests. mutator, if not nil, changes the
+// objects it claims before their apply.
+func (m *ManifestApplier) Apply(
+	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, mutator ObjectMutator,
+) error {
 	urls := spec.Sources
 	if len(urls) == 0 && spec.Source != "" {
 		urls = []string{spec.Source}
@@ -60,7 +83,7 @@ func (m *ManifestApplier) Apply(ctx context.Context, name string, spec k4allv1al
 				}
 			}
 
-			if err := m.serverSideApply(ctx, &obj); err != nil {
+			if err := m.serverSideApply(ctx, &obj, spec, mutator); err != nil {
 				return fmt.Errorf("apply %s %s/%s: %w",
 					obj.GetKind(), obj.GetNamespace(), obj.GetName(), err)
 			}
@@ -82,7 +105,7 @@ func (m *ManifestApplier) Apply(ctx context.Context, name string, spec k4allv1al
 				}
 			}
 
-			if err := m.serverSideApplyWithRetry(ctx, &obj); err != nil {
+			if err := m.serverSideApplyWithRetry(ctx, &obj, spec, mutator); err != nil {
 				return fmt.Errorf("apply inline %s %s/%s: %w",
 					obj.GetKind(), obj.GetNamespace(), obj.GetName(), err)
 			}
@@ -92,7 +115,9 @@ func (m *ManifestApplier) Apply(ctx context.Context, name string, spec k4allv1al
 	return nil
 }
 
-func (m *ManifestApplier) serverSideApplyWithRetry(ctx context.Context, obj *unstructured.Unstructured) error {
+func (m *ManifestApplier) serverSideApplyWithRetry(
+	ctx context.Context, obj *unstructured.Unstructured, spec k4allv1alpha1.ComponentSpec, mutator ObjectMutator,
+) error {
 	retryCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
@@ -100,7 +125,7 @@ func (m *ManifestApplier) serverSideApplyWithRetry(ctx context.Context, obj *uns
 	defer ticker.Stop()
 
 	for {
-		err := m.serverSideApply(retryCtx, obj)
+		err := m.serverSideApply(retryCtx, obj, spec, mutator)
 		if err == nil {
 			return nil
 		}
@@ -217,19 +242,24 @@ func decodeMultiDoc(data []byte) ([]unstructured.Unstructured, error) {
 	return result, nil
 }
 
-func (m *ManifestApplier) serverSideApply(ctx context.Context, obj *unstructured.Unstructured) error {
+func (m *ManifestApplier) serverSideApply(
+	ctx context.Context, obj *unstructured.Unstructured, spec k4allv1alpha1.ComponentSpec, mutator ObjectMutator,
+) error {
 	obj.SetManagedFields(nil)
 	if err := blockUninstallIfWorkloadsExist(obj); err != nil {
 		return fmt.Errorf("%s %s: set spec.uninstallStrategy: %w", obj.GetKind(), obj.GetName(), err)
 	}
-	if len(additiveListsOf(obj)) == 0 {
+	stripEmptyFields(obj)
+	mutates := mutator != nil && mutator.Mutates(obj)
+	if !mutates && len(additiveListsOf(obj)) == 0 {
 		return m.apply(ctx, obj)
 	}
 
-	// Lists the admins add to (additive_lists.go) are merged with the object
-	// as read, in the one apply. The apply is conditional on that
-	// resourceVersion: a change made in between makes it fail with a
-	// conflict, and the merge starts again from a fresh read.
+	// Lists the admins add to (additive_lists.go), and the settings a hook
+	// folds in, are merged with the object as read, in the one apply. The
+	// apply is conditional on that resourceVersion: a change made in between
+	// makes it fail with a conflict, and the merge starts again from a fresh
+	// read.
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		desired := obj.DeepCopy()
 		live := &unstructured.Unstructured{}
@@ -242,7 +272,11 @@ func (m *ManifestApplier) serverSideApply(ctx context.Context, obj *unstructured
 		default:
 			desired.SetResourceVersion(live.GetResourceVersion())
 		}
-		if err := keepLiveEntries(desired, live); err != nil {
+		if mutates {
+			if err := mutator.Mutate(ctx, spec, desired, live); err != nil {
+				return err
+			}
+		} else if err := keepLiveEntries(desired, live); err != nil {
 			return err
 		}
 		return m.apply(ctx, desired)

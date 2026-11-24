@@ -10,8 +10,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// VirtHook keeps KubeVirt's software emulation in line with the ClusterConfig
-// (Sync, virt_emulation.go) and reports the KubeVirt version that runs.
+// VirtHook folds the ClusterConfig's KubeVirt settings into the KubeVirt CR
+// at its apply (ManifestMutator, virt_settings.go), keeps KubeVirt's
+// software emulation in line with the ClusterConfig (Sync, virt_emulation.go)
+// and reports the KubeVirt version that runs.
 type VirtHook struct {
 	BaseHook
 	client client.Client
@@ -33,12 +35,20 @@ var kubeVirtKey = types.NamespacedName{Name: "kubevirt", Namespace: "kubevirt"}
 
 // virtApplyRevision changes whenever the KubeVirt and CDI CRs are applied
 // otherwise for the same ClusterConfig. 1: with spec.uninstallStrategy
-// BlockUninstallIfWorkloadsExist (k4all-operator v0.5.7).
+// BlockUninstallIfWorkloadsExist (k4all-operator v0.5.7). CDI's CR is still
+// applied as v0.5.7 applied it.
 const virtApplyRevision = "1"
+
+// kubeVirtApplyRevision is virtApplyRevision for the KubeVirt CR alone. 2:
+// without upstream's empty fields, and with the features.virt.kubevirt
+// settings and their gate merge (k4all-operator v0.6.0). With no settings,
+// the re-apply changes no field KubeVirt reads: virt-operator does not roll
+// its infra for it.
+const kubeVirtApplyRevision = "2"
 
 // ValuesRevision implements ValuesRevisioner: every cluster applies
 // KubeVirt again once after the operator upgrade.
-func (h *VirtHook) ValuesRevision() string { return virtApplyRevision }
+func (h *VirtHook) ValuesRevision() string { return kubeVirtApplyRevision }
 
 const kubeVirtAPIVersion, kubeVirtKind = "kubevirt.io/v1", "KubeVirt"
 

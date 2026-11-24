@@ -6,8 +6,11 @@ import (
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/gpillon/k4all-operator/internal/engine"
 )
 
 // Hook is called around component installation and removal.
@@ -108,6 +111,50 @@ type Remover interface {
 type OverrideMerger interface {
 	MergeOverride(spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
 		values map[string]interface{}, override k4allv1alpha1.ComponentOverride) (map[string]interface{}, error)
+}
+
+// ManifestMutator is implemented by a hook that folds ClusterConfig settings
+// into objects of its manifest component before their server-side apply
+// (VirtHook: feature gates and vmStateStorageClass into the KubeVirt CR):
+// one apply by one field manager, which no later apply of the manifest
+// undoes (spec R3). The reconciler hands it to the engine at every apply of
+// the component (ObjectMutator).
+type ManifestMutator interface {
+	// MutatesManifest tells whether MutateManifest changes obj, an object of
+	// the component's manifests: only those are read from the cluster first.
+	MutatesManifest(obj *unstructured.Unstructured) bool
+	// MutateManifest changes desired, the object about to be applied, from
+	// config and live, the object in the cluster (nil: not there yet). spec
+	// is the component being applied, its version resolved. The object's
+	// additive lists are its to merge (engine.ObjectMutator).
+	MutateManifest(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+		desired, live *unstructured.Unstructured) error
+}
+
+// ObjectMutator is what the engine's apply of a component passes its objects
+// through: the component's hook as a ManifestMutator, with config at hand.
+// nil when the hook is none.
+func ObjectMutator(hook Hook, config k4allv1alpha1.ClusterConfigSpec) engine.ObjectMutator {
+	m, ok := hook.(ManifestMutator)
+	if !ok {
+		return nil
+	}
+	return manifestMutator{m: m, config: config}
+}
+
+type manifestMutator struct {
+	m      ManifestMutator
+	config k4allv1alpha1.ClusterConfigSpec
+}
+
+func (a manifestMutator) Mutates(obj *unstructured.Unstructured) bool {
+	return a.m.MutatesManifest(obj)
+}
+
+func (a manifestMutator) Mutate(
+	ctx context.Context, spec k4allv1alpha1.ComponentSpec, desired, live *unstructured.Unstructured,
+) error {
+	return a.m.MutateManifest(ctx, spec, a.config, desired, live)
 }
 
 // Registry maps component names to their hooks.

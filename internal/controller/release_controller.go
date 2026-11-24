@@ -497,7 +497,7 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			continue
 		}
 
-		var opts []engine.ReconcileOption
+		opts := []engine.ReconcileOption{engine.MutateObjects(hooks.ObjectMutator(r.hookReg.Get(name), config))}
 		if intermediate {
 			opts = append(opts, engine.WaitUntilReady())
 		}
@@ -975,6 +975,7 @@ func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, confi
 	} else {
 		meta.RemoveStatusCondition(&config.Status.Conditions, PodNetworkOverlapCondition)
 	}
+	r.setKubeVirtSettings(ctx, config)
 
 	r.patchClusterConfigStatus(ctx, config)
 }
