@@ -73,7 +73,7 @@ func TestWaitForPDBs_WaitsForTheSettleTimeAfterTheLastNode(t *testing.T) {
 
 func TestBlockedMessage_NamesUpToThreeBlockers(t *testing.T) {
 	b := []Blocker{{PDB: "a/p1", Pod: "a/x"}, {PDB: "a/p2", Pod: "a/y"}, {PDB: "a/p3", Pod: "a/z"}, {PDB: "a/p4", Pod: "a/w"}}
-	got := BlockedMessage(b)
+	got := BlockedMessage(b, nil)
 	if !strings.HasPrefix(got, "cannot be drained: PDB a/p1 allows no disruption of pod a/x; ") ||
 		!strings.Contains(got, "and 1 more") || !strings.HasSuffix(got, "the node is not cordoned") {
 		t.Errorf("message = %q", got)

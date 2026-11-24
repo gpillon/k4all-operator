@@ -151,6 +151,12 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if in.Blockers, err = d.drainBlockers(ctx); err != nil {
 			return ctrl.Result{}, err
 		}
+		// Read before the next cordon only: a node in flight moves first.
+		if inFlight == "" {
+			if in.BarePods, err = d.barePods(ctx); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
 	status, actions := clusterupgrade.Decide(in)

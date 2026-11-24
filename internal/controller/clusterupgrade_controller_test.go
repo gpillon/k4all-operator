@@ -110,8 +110,28 @@ func (b *upgradeTestbed) node(name string) *corev1.Node {
 	return n
 }
 
+// replicaSet is the controller of a pod b.pod creates without owners.
+var replicaSet = metav1.OwnerReference{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "app-7c9d",
+	UID: "rs-uid", Controller: ptrTo(true)}
+
 // pod creates a running pod bound to the node cu-cp, the one drained first.
+// Without owners a ReplicaSet is its controller; barePod makes one without.
 func (b *upgradeTestbed) pod(name string, owners ...metav1.OwnerReference) *corev1.Pod {
+	b.t.Helper()
+	if len(owners) == 0 {
+		owners = []metav1.OwnerReference{replicaSet}
+	}
+	return b.createPod(name, owners)
+}
+
+// barePod creates a pod on cu-cp that declares no controller, as `kubectl
+// run` does.
+func (b *upgradeTestbed) barePod(name string) *corev1.Pod {
+	b.t.Helper()
+	return b.createPod(name, nil)
+}
+
+func (b *upgradeTestbed) createPod(name string, owners []metav1.OwnerReference) *corev1.Pod {
 	b.t.Helper()
 	p := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, OwnerReferences: owners},

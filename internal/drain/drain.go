@@ -24,6 +24,10 @@ type Pod struct {
 	Namespace, Name string
 	Created         time.Time
 	Terminating     bool
+	// NoController: no ownerReference is its controller, so nothing
+	// recreates it once evicted. The drain leaves it to the admin, as
+	// `kubectl drain` without --force does (k4all#99).
+	NoController bool
 }
 
 func (p Pod) String() string { return p.Namespace + "/" + p.Name }
@@ -84,7 +88,8 @@ type Progress struct {
 	Left []Pod
 	// The pods put back on the node since the drain started.
 	Back []Pod
-	// The pods to evict now (namespace/name): Left, less the terminating.
+	// The pods to evict now (namespace/name): Left, less the terminating
+	// and those that declare no controller (Pod.NoController).
 	Evict []string
 	// What is left, or why the drain timed out; empty once Drained.
 	Message string
@@ -102,10 +107,18 @@ func Drain(pods []Pod, started, now time.Time, s Settings, single bool) Progress
 	if now.Sub(started) < s.Timeout {
 		p.Outcome = Evicting
 		p.Message = fmt.Sprintf("%d pods left: %s", len(left), Names(left))
+		var bare []string
 		for _, pod := range left {
-			if !pod.Terminating {
+			switch {
+			case pod.NoController:
+				bare = append(bare, pod.String())
+			case !pod.Terminating:
 				p.Evict = append(p.Evict, pod.String())
 			}
+		}
+		if len(bare) > 0 {
+			p.Message += "; not evicted, they declare no controller: " + nameSome(bare) +
+				" (delete them, or recreate them under a controller)"
 		}
 		return p
 	}
@@ -159,18 +172,40 @@ func WaitForPDBs(unhealthy []PDB, lastDone, now time.Time, settle time.Duration)
 }
 
 // BlockedMessage says why a node is not cordoned: pods on it that its drain
-// could never evict (k4all#87). Changing a budget is the admin's call.
-func BlockedMessage(blockers []Blocker) string {
-	named := make([]string, 0, 4)
-	for j, b := range blockers {
-		if j == 3 {
-			named = append(named, fmt.Sprintf("and %d more", len(blockers)-3))
-			break
+// could never evict (blockers, k4all#87), or would delete for good because
+// they declare no controller (bare, namespace/name, k4all#99). Changing a
+// budget or deleting a pod is the admin's call. "" when neither.
+func BlockedMessage(blockers []Blocker, bare []string) string {
+	var why []string
+	if len(blockers) > 0 {
+		named := make([]string, 0, 4)
+		for j, b := range blockers {
+			if j == 3 {
+				named = append(named, fmt.Sprintf("and %d more", len(blockers)-3))
+				break
+			}
+			named = append(named, fmt.Sprintf("PDB %s allows no disruption of pod %s", b.PDB, b.Pod))
 		}
-		named = append(named, fmt.Sprintf("PDB %s allows no disruption of pod %s", b.PDB, b.Pod))
+		why = append(why, "cannot be drained: "+strings.Join(named, "; ")+
+			" (a single-instance CloudNativePG cluster? see docs/upgrades.md, Drains that never end)")
 	}
-	return "cannot be drained: " + strings.Join(named, "; ") +
-		" (a single-instance CloudNativePG cluster? see docs/upgrades.md, Drains that never end); the node is not cordoned"
+	if len(bare) > 0 {
+		why = append(why, "runs pods that declare no controller: "+nameSome(bare)+
+			" (a drain would delete them, and nothing recreates them: delete them, or recreate them under a"+
+			" controller; see docs/upgrades.md, Pods that declare no controller)")
+	}
+	if len(why) == 0 {
+		return ""
+	}
+	return strings.Join(why, "; ") + "; the node is not cordoned"
+}
+
+// nameSome names up to three of names and counts the rest.
+func nameSome(names []string) string {
+	if len(names) <= 3 {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(names[:3], ", "), len(names)-3)
 }
 
 // Self is the operator's own pod and the node it runs on.

@@ -40,7 +40,7 @@ func (d drainer) pods(ctx context.Context, nodeName string) ([]drain.Pod, error)
 	out := make([]drain.Pod, 0, len(pods))
 	for _, p := range pods {
 		out = append(out, drain.Pod{Namespace: p.Namespace, Name: p.Name, Created: p.CreationTimestamp.Time,
-			Terminating: p.DeletionTimestamp != nil})
+			Terminating: p.DeletionTimestamp != nil, NoController: declaresNoController(p)})
 	}
 	return out, nil
 }
@@ -91,6 +91,46 @@ func drainMoves(p corev1.Pod, self types.NamespacedName) bool {
 		return false
 	}
 	return !ownedByDaemonSet(p)
+}
+
+// declaresNoController tells whether no ownerReference of p is its
+// controller, so nothing recreates it once evicted: `kubectl drain` refuses
+// it without --force (unreplicatedFilter, k8s.io/kubectl pkg/drain). A
+// finished, static (mirror) or terminating pod does not count.
+func declaresNoController(p corev1.Pod) bool {
+	if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
+		return false
+	}
+	if _, mirror := p.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
+		return false
+	}
+	return metav1.GetControllerOf(&p) == nil
+}
+
+// barePods lists, by node, the pods a drain would delete for good
+// (findBarePods). It reads every pod once, uncached.
+func (d drainer) barePods(ctx context.Context) (map[string][]string, error) {
+	pods := &corev1.PodList{}
+	if err := d.APIReader.List(ctx, pods); err != nil {
+		return nil, fmt.Errorf("list pods: %w", err)
+	}
+	return findBarePods(pods.Items, d.Self), nil
+}
+
+// findBarePods lists, by node and sorted (namespace/name), the pods the
+// drain would move that declare no controller.
+func findBarePods(pods []corev1.Pod, self types.NamespacedName) map[string][]string {
+	out := map[string][]string{}
+	for _, p := range pods {
+		if p.Spec.NodeName == "" || !drainMoves(p, self) || !declaresNoController(p) {
+			continue
+		}
+		out[p.Spec.NodeName] = append(out[p.Spec.NodeName], p.Namespace+"/"+p.Name)
+	}
+	for _, names := range out {
+		sort.Strings(names)
+	}
+	return out
 }
 
 func ownedByDaemonSet(p corev1.Pod) bool {

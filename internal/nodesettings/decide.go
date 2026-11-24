@@ -349,7 +349,7 @@ func (d *decision) startStep(i int, write *Action) {
 	single := len(d.nodes) == 1
 	if class.Drains() && !single {
 		if blockers := d.in.Blockers[n.Name]; len(blockers) > 0 {
-			ps.Message = drain.BlockedMessage(blockers)
+			ps.Message = drain.BlockedMessage(blockers, nil)
 			d.block("DrainBlocked", n.Name+" "+ps.Message)
 			return
 		}

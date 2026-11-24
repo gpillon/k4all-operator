@@ -80,6 +80,10 @@ type Input struct {
 	// Blockers holds, for each node, the pods on it that its drain could
 	// never evict, sorted.
 	Blockers map[string][]Blocker
+	// BarePods holds, for each node not cordoned by the operator, the pods
+	// on it the drain would move that declare no controller
+	// (namespace/name, sorted): a drain would delete them for good.
+	BarePods map[string][]string
 	// Graph is nil when it could not be read (GraphErr).
 	Graph    *upgradegraph.Graph
 	GraphErr error
@@ -160,20 +164,21 @@ func decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action, string) {
 }
 
 // blockedNext says why the next node is not cordoned: pods on it that its
-// drain could never evict (k4all#87). The upgrade waits, without a cordon,
-// until the admin lets them go; changing a budget is the admin's call. A
-// single node is not drained, so nothing blocks it.
+// drain could never evict (k4all#87), or would delete for good because they
+// declare no controller (k4all#99). The upgrade waits, without a cordon,
+// until the admin lets them go; changing a budget or deleting a pod is the
+// admin's call. A single node is not drained, so nothing blocks it.
 func blockedNext(in Input, status *k4allv1alpha1.ClusterUpgradeStatus) string {
 	i := nextPending(*status)
 	if i < 0 || len(in.Nodes) <= 1 {
 		return ""
 	}
 	n := &status.Nodes[i]
-	blockers := in.Blockers[n.Name]
-	if len(blockers) == 0 {
+	why := drainpkg.BlockedMessage(in.Blockers[n.Name], in.BarePods[n.Name])
+	if why == "" {
 		return ""
 	}
-	n.Message = drainpkg.BlockedMessage(blockers)
+	n.Message = why
 	return n.Name + " " + n.Message
 }
 
