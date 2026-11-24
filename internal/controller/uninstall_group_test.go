@@ -144,7 +144,7 @@ func recordDeletes(t *testing.T, r *ReleaseReconciler) *[]string {
 		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 			kind := obj.GetObjectKind().GroupVersionKind().Kind
 			switch {
-			case kind == "KubeVirt" || kind == "CDI":
+			case kind == kubeVirtCR.gvk.Kind || kind == cdiCR.gvk.Kind:
 				deleted = append(deleted, kind+" CR")
 			case strings.HasPrefix(obj.GetName(), "component-"):
 				deleted = append(deleted, strings.TrimPrefix(obj.GetName(), "component-"))
