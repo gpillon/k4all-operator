@@ -103,30 +103,62 @@ func groupsOnEnvtest(t *testing.T, components map[string]k4allv1alpha1.Component
 		t.Fatal(err)
 	}
 	r := &ReleaseReconciler{Client: c, Scheme: s, RestConfig: cfg, Log: logr.Discard()}
-	standInHooks(r)
+	standInHooks(t, r)
 	return c, r
 }
 
-// withoutRemover is a built-in hook without its Remover, its UninstallGuard
-// kept: the engine uninstalls the component, as it does any manifest
-// component, so the stand-in ConfigMap (componentObject) goes.
-// hangar-node-agent's and snapshot-controller's Removers delete the objects
-// of their upstream manifests, which these components do not have.
-type withoutRemover struct{ hooks.Hook }
+// standInRemover stands in for the Remover of a built-in hook, its
+// UninstallGuard and Cleanup kept: snapshot-controller's Remover deletes
+// the named objects of upstream's deploy files, which the stand-in
+// component does not have. It deletes the
+// component's stand-in ConfigMap (componentObject) through the reconciler's
+// client, so the delete recorder (recordDeletes) sees the Remover at its
+// place in the removal order, and counts its calls (removals): the engine,
+// which would delete the same ConfigMap, does not run for a Remover.
+type standInRemover struct {
+	hooks.Hook
+	name    string
+	client  client.Client
+	removed int
+}
 
-func (w withoutRemover) UninstallBlocked(ctx context.Context, name string) (string, error) {
-	if guard, ok := w.Hook.(hooks.UninstallGuard); ok {
+func (s *standInRemover) UninstallBlocked(ctx context.Context, name string) (string, error) {
+	if guard, ok := s.Hook.(hooks.UninstallGuard); ok {
 		return guard.UninstallBlocked(ctx, name)
 	}
 	return "", nil
 }
 
+func (s *standInRemover) Remove(ctx context.Context, _ k4allv1alpha1.ComponentSpec, _ k4allv1alpha1.ClusterConfigSpec) error {
+	s.removed++
+	return client.IgnoreNotFound(s.client.Delete(ctx, componentObject(s.name)))
+}
+
 // standInHooks gives r the built-in hooks on its client, with
-// hangar-node-agent and snapshot-controller as withoutRemover.
-func standInHooks(r *ReleaseReconciler) {
+// snapshot-controller's Remover as standInRemover. hangar-node-agent keeps
+// its own: it deletes the objects of the component's manifests, inline ones
+// included, so the stand-in ConfigMap (builtInRemover).
+func standInHooks(t *testing.T, r *ReleaseReconciler) {
+	t.Helper()
 	r.hookReg = hooks.NewRegistry(r.Client, r.Log, hooks.WithRestConfig(r.RestConfig))
-	for _, name := range []string{"hangar-node-agent", "snapshot-controller"} {
-		r.hookReg.Register(name, withoutRemover{r.hookReg.Get(name)})
+	hook := r.hookReg.Get("snapshot-controller")
+	if _, ok := hook.(hooks.Remover); !ok {
+		t.Fatalf("snapshot-controller's built-in hook is %T, no Remover: standInHooks stands in for one", hook)
+	}
+	r.hookReg.Register("snapshot-controller", &standInRemover{Hook: hook, name: "snapshot-controller", client: r.Client})
+}
+
+// builtInRemover fails the test unless the component name has its built-in
+// hook and it is a Remover: the reconciler removes the component through it,
+// never through the engine.
+func builtInRemover(t *testing.T, r *ReleaseReconciler, name string) {
+	t.Helper()
+	hook := r.hookReg.Get(name)
+	if _, standIn := hook.(*standInRemover); standIn {
+		t.Fatalf("%s's hook is the stand-in, want its built-in Remover", name)
+	}
+	if _, ok := hook.(hooks.Remover); !ok {
+		t.Fatalf("%s's hook is %T, want a Remover", name, hook)
 	}
 }
 
@@ -152,8 +184,19 @@ func recordDeletes(t *testing.T, r *ReleaseReconciler) *[]string {
 			return cl.Delete(ctx, obj, opts...)
 		},
 	})
-	standInHooks(r)
+	standInHooks(t, r)
 	return &deleted
+}
+
+// removals is how many times the stand-in Remover of the component name
+// (standInHooks) removed it.
+func removals(t *testing.T, r *ReleaseReconciler, name string) int {
+	t.Helper()
+	stand, ok := r.hookReg.Get(name).(*standInRemover)
+	if !ok {
+		t.Fatalf("%s's hook is %T, want the stand-in Remover", name, r.hookReg.Get(name))
+	}
+	return stand.removed
 }
 
 // assertKept fails the test unless every component of names is Installed
@@ -220,6 +263,8 @@ func TestReconcile_AFeatureStaysWholeWhileOneOfItsComponentsRefuses(t *testing.T
 	if res.RequeueAfter <= 0 || res.RequeueAfter > time.Minute {
 		t.Errorf("RequeueAfter %s with the uninstall refused, want at most a minute", res.RequeueAfter)
 	}
+	// hangar-node-agent's Remover would have deleted its objects (assertKept).
+	builtInRemover(t, r, "hangar-node-agent")
 
 	if err := deleteNow(c, vm); err != nil {
 		t.Fatal(err)
@@ -264,6 +309,9 @@ func TestReconcile_AFeatureGoesInReverseDependencyOrder(t *testing.T) {
 
 	reconcileProbe(t, r)
 
+	// hangar-node-agent goes through its own Remover, at its place in the
+	// order.
+	builtInRemover(t, r, "hangar-node-agent")
 	if want := []string{"hangar", "hangar-node-agent", "virtctl", "CDI CR"}; !slices.Equal(*deleted, want) {
 		t.Fatalf("deleted %v, want %v", *deleted, want)
 	}
@@ -382,6 +430,9 @@ func TestReconcile_AComponentWithItsOwnGateGoesOnlyWithIt(t *testing.T) {
 		assertGone(t, c, rook...)
 		assertKept(t, c, vmRefusal, virt...)
 		assertKept(t, c, "uninstall queued: waiting for hangar to be uninstalled first", "snapshot-controller")
+		if n := removals(t, r, "snapshot-controller"); n != 0 {
+			t.Errorf("snapshot-controller's Remover ran %d times while queued, want never", n)
+		}
 
 		if err := deleteNow(c, vm); err != nil {
 			t.Fatal(err)
@@ -389,6 +440,9 @@ func TestReconcile_AComponentWithItsOwnGateGoesOnlyWithIt(t *testing.T) {
 		reconcileProbe(t, r)
 
 		assertGone(t, c, append(virt, "snapshot-controller")...)
+		if n := removals(t, r, "snapshot-controller"); n != 1 {
+			t.Errorf("snapshot-controller's Remover ran %d times, want once", n)
+		}
 	})
 
 	t.Run("its own gate on", func(t *testing.T) {
