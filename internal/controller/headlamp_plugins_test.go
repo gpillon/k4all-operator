@@ -127,8 +127,7 @@ func virtOn() k4allv1alpha1.ClusterConfigSpec {
 }
 
 // Hangar is the console of KubeVirt: with virtualization on, Headlamp loads
-// it next to the k4all plugin. Cairn needs Rook, which the ClusterConfig
-// cannot turn on yet.
+// it next to the k4all plugin. Cairn needs Rook, off here.
 func TestHeadlampPlugins_HangarWithVirtualization(t *testing.T) {
 	r := newValuesReconciler()
 
@@ -144,6 +143,25 @@ func TestHeadlampPlugins_NoHangarWithoutVirtualization(t *testing.T) {
 	got := helmValues(t, r, headlampRelease(t), k4allv1alpha1.ClusterConfigSpec{})
 
 	expectPlugins(t, got, "k4all-plugin")
+}
+
+// Cairn is the console of Rook: Headlamp loads it with features.rook
+// enabled, with or without virtualization, and drops it when Rook is off.
+func TestHeadlampPlugins_CairnWithRook(t *testing.T) {
+	r := newValuesReconciler()
+	rookOn := func(config k4allv1alpha1.ClusterConfigSpec) k4allv1alpha1.ClusterConfigSpec {
+		config.Features.Rook = &k4allv1alpha1.RookConfig{Enabled: true}
+		return config
+	}
+
+	expectPlugins(t, helmValues(t, r, headlampRelease(t), rookOn(k4allv1alpha1.ClusterConfigSpec{})),
+		"k4all-plugin", "cairn-plugin")
+	expectPlugins(t, helmValues(t, r, headlampRelease(t), rookOn(virtOn())),
+		"k4all-plugin", "hangar-plugin", "cairn-plugin")
+
+	off := virtOn()
+	off.Features.Rook = &k4allv1alpha1.RookConfig{Enabled: false}
+	expectPlugins(t, helmValues(t, r, headlampRelease(t), off), "k4all-plugin", "hangar-plugin")
 }
 
 // withHeadlampOverride sets componentOverrides.headlamp.values.

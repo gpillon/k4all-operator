@@ -123,6 +123,10 @@ func FilterRemovedComponents(
 const (
 	FeatureVirt = "virt"
 	FeatureRook = "rook"
+	// FeatureSnapshots is on with virt or rook: the CSI snapshot controller
+	// serves both (KubeVirt and Hangar snapshot VM disks, ceph-rbd has a
+	// VolumeSnapshotClass). It has no ClusterConfig switch of its own.
+	FeatureSnapshots = "snapshots"
 )
 
 // FeatureEnabled says whether the ClusterConfig turns on the feature gate; an
@@ -137,15 +141,27 @@ func FeatureEnabled(gate string, config k4allv1alpha1.ClusterConfigSpec) bool {
 		return config.Features.OVSCNI.Enabled
 	case FeatureRook:
 		return rookEnabled(config)
+	case FeatureSnapshots:
+		return config.Features.Virt.Enabled || rookEnabled(config)
 	}
 	return false
 }
 
-// rookEnabled says whether k4all runs Rook. The ClusterConfig has no Rook
-// field yet (that API awaits approval), so Rook and what needs it (Cairn and
-// its Headlamp plugin) stay off; once the field exists this returns it.
-func rookEnabled(_ k4allv1alpha1.ClusterConfigSpec) bool {
-	return false
+// rookEnabled says whether k4all runs Rook: features.rook.enabled. A cluster
+// without the field (every cluster before k4all v2.7.0) runs none.
+func rookEnabled(config k4allv1alpha1.ClusterConfigSpec) bool {
+	return config.Features.Rook != nil && config.Features.Rook.Enabled
+}
+
+// hangarNodeAgent is the component of Hangar's privileged node agent.
+const hangarNodeAgent = "hangar-node-agent"
+
+// hangarNodeAgentWanted says whether the ClusterConfig keeps Hangar's node
+// agent: yes unless features.virt.hangar.nodeAgent is false. Absent is the
+// release's default, which installs it with virt (D6).
+func hangarNodeAgentWanted(config k4allv1alpha1.ClusterConfigSpec) bool {
+	hangar := config.Features.Virt.Hangar
+	return hangar == nil || hangar.NodeAgent == nil || *hangar.NodeAgent
 }
 
 // CNI types accepted by ClusterConfig.spec.networking.cni.type.
@@ -175,6 +191,11 @@ func shouldInstall(name string, spec k4allv1alpha1.ComponentSpec, config k4allv1
 				return false
 			}
 		}
+	}
+
+	// Hangar's node agent: with its feature gate (virt), unless left out.
+	if name == hangarNodeAgent && !hangarNodeAgentWanted(config) {
+		return false
 	}
 
 	// Feature-gated components
