@@ -82,6 +82,38 @@ func TestBlockedMessage_NamesUpToThreeBlockers(t *testing.T) {
 
 // k4all#97: the drain of the node that runs the operator moves the operator
 // off it, so the leader is elsewhere when the node reboots.
+// k4all#99: a pod that declares no controller is never evicted, only named.
+func TestDrain_LeavesAPodThatDeclaresNoController(t *testing.T) {
+	bare := pod("debug-x", start.Add(-time.Hour))
+	bare.NoController = true
+	p := Drain([]Pod{pod("a", start.Add(-time.Hour)), bare}, start, start.Add(time.Minute), Settings{Timeout: 30 * time.Minute}, false)
+	if p.Outcome != Evicting || !reflect.DeepEqual(p.Evict, []string{"ns/a"}) {
+		t.Errorf("outcome %v, evict %v, want Evicting ns/a only", p.Outcome, p.Evict)
+	}
+	want := "2 pods left: ns/a, ns/debug-x; not evicted, they declare no controller: ns/debug-x " +
+		"(delete them, or recreate them under a controller)"
+	if p.Message != want {
+		t.Errorf("message = %q, want %q", p.Message, want)
+	}
+}
+
+func TestBlockedMessage_NamesBarePodsAndBlockers(t *testing.T) {
+	if got := BlockedMessage(nil, nil); got != "" {
+		t.Errorf("message = %q with nothing in the way, want none", got)
+	}
+	got := BlockedMessage(nil, []string{"a/p1", "a/p2", "b/p3", "c/p4"})
+	if !strings.HasPrefix(got, "runs pods that declare no controller: a/p1, a/p2, b/p3, and 1 more (a drain would delete them") ||
+		!strings.HasSuffix(got, "Pods that declare no controller); the node is not cordoned") {
+		t.Errorf("message = %q", got)
+	}
+	got = BlockedMessage([]Blocker{{PDB: "a/p", Pod: "a/x"}}, []string{"b/y"})
+	if !strings.HasPrefix(got, "cannot be drained: PDB a/p allows no disruption of pod a/x (") ||
+		!strings.Contains(got, "Drains that never end); runs pods that declare no controller: b/y (") ||
+		strings.Count(got, "the node is not cordoned") != 1 {
+		t.Errorf("message = %q", got)
+	}
+}
+
 func TestEvictSelf(t *testing.T) {
 	self := &Self{Node: "w-1", Pod: pod("k4all-operator", start.Add(-time.Hour))}
 	back := &Self{Node: "w-1", Pod: pod("k4all-operator-2", start.Add(time.Minute))}
