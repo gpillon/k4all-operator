@@ -149,6 +149,9 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 	kvm := NewKubevirtManagerHook(c, log.WithName("hook-kubevirt-manager"))
 	kvm.restConfig = o.restConfig
 	r.hooks["kubevirt-manager"] = kvm
+	agent := NewHangarNodeAgentHook(c, log.WithName("hook-hangar-node-agent"))
+	agent.restConfig = o.restConfig
+	r.hooks["hangar-node-agent"] = agent
 	r.hooks["rook-ceph"] = NewRookHook(c, log.WithName("hook-rook"))
 	r.hooks["ceph-csi-drivers"] = NewCephCSIDriversHook(c)
 	r.hooks["snapshot-controller"] = NewSnapshotControllerHook(c, log.WithName("hook-snapshot-controller"))
