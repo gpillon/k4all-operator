@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/controller/hooks"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -146,5 +147,52 @@ func TestReconcile_RemovedComponentForgetsItsInstalledRelease(t *testing.T) {
 	if old.State != k4allv1alpha1.ComponentStateRemoved || old.InstalledVersion != "" || old.AppliedHash != "" {
 		t.Fatalf("status of the removed component = %s/%q hash %q, want Removed with no version or hash",
 			old.State, old.InstalledVersion, old.AppliedHash)
+	}
+}
+
+// removeProbe is the hook of a component that removes it itself.
+type removeProbe struct {
+	hooks.BaseHook
+	removed int
+}
+
+func (p *removeProbe) Remove(context.Context, k4allv1alpha1.ComponentSpec, k4allv1alpha1.ClusterConfigSpec) error {
+	p.removed++
+	return nil
+}
+
+// kubevirt-manager's manifests hold PriorityClasses that VMs name and a CRD
+// with the user's objects: deleting every object they list would stop those
+// VMs from starting. A hook that removes its component decides what goes,
+// and the manifests' objects are not deleted for it.
+func TestReconcile_AHookRemovesItsComponentInsteadOfTheManifests(t *testing.T) {
+	cl := newCluster(t,
+		map[string]k4allv1alpha1.ComponentSpec{"old": {
+			Type: k4allv1alpha1.ComponentTypeManifest, Version: "v1.0.0",
+			Management:      k4allv1alpha1.ComponentManagementRemoved,
+			InlineManifests: []string{handedOverConfigMap},
+		}},
+		map[string]k4allv1alpha1.ComponentStatus{"old": {
+			State: k4allv1alpha1.ComponentStateInstalled, InstalledVersion: "v1.0.0",
+		}},
+	)
+	kept := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "handed-over", Namespace: "default"}}
+	if err := cl.c.Create(context.Background(), kept); err != nil {
+		t.Fatal(err)
+	}
+	probe := &removeProbe{}
+	cl.r.hookReg = hooks.NewRegistry(cl.c, logr.Discard())
+	cl.r.hookReg.Register("old", probe)
+
+	cl.reconcile()
+
+	if probe.removed != 1 {
+		t.Errorf("Remove called %d times, want 1", probe.removed)
+	}
+	if err := cl.c.Get(context.Background(), client.ObjectKeyFromObject(kept), &corev1.ConfigMap{}); err != nil {
+		t.Errorf("an object of the manifests was deleted for a hook that removes its component: %v", err)
+	}
+	if st := cl.state("old"); st != k4allv1alpha1.ComponentStateRemoved {
+		t.Errorf("state %q, want Removed", st)
 	}
 }

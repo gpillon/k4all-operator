@@ -118,6 +118,36 @@ func FilterRemovedComponents(
 	return removed
 }
 
+// Feature gates a component can name in its featureGate, also read by the
+// hooks that add or leave out parts of a component (headlamp's plugins).
+const (
+	FeatureVirt = "virt"
+	FeatureRook = "rook"
+)
+
+// FeatureEnabled says whether the ClusterConfig turns on the feature gate; an
+// unknown gate is off.
+func FeatureEnabled(gate string, config k4allv1alpha1.ClusterConfigSpec) bool {
+	switch gate {
+	case FeatureVirt:
+		return config.Features.Virt.Enabled
+	case "argocd":
+		return config.Features.ArgoCD.Enabled
+	case "ovsCni":
+		return config.Features.OVSCNI.Enabled
+	case FeatureRook:
+		return rookEnabled(config)
+	}
+	return false
+}
+
+// rookEnabled says whether k4all runs Rook. The ClusterConfig has no Rook
+// field yet (that API awaits approval), so Rook and what needs it (Cairn and
+// its Headlamp plugin) stay off; once the field exists this returns it.
+func rookEnabled(_ k4allv1alpha1.ClusterConfigSpec) bool {
+	return false
+}
+
 // CNI types accepted by ClusterConfig.spec.networking.cni.type.
 const (
 	cniCalico = "calico"
@@ -149,15 +179,7 @@ func shouldInstall(name string, spec k4allv1alpha1.ComponentSpec, config k4allv1
 
 	// Feature-gated components
 	if spec.FeatureGate != "" {
-		switch spec.FeatureGate {
-		case "virt":
-			return config.Features.Virt.Enabled
-		case "argocd":
-			return config.Features.ArgoCD.Enabled
-		case "ovsCni":
-			return config.Features.OVSCNI.Enabled
-		}
-		return false
+		return FeatureEnabled(spec.FeatureGate, config)
 	}
 
 	// Virtualization components without explicit featureGate

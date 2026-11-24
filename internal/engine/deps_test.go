@@ -144,3 +144,43 @@ func TestFilterActiveComponents(t *testing.T) {
 		t.Error("argocd should NOT be active (argocd disabled)")
 	}
 }
+
+// The ClusterConfig cannot turn Rook on yet (its API awaits approval): a
+// component behind the rook gate (Cairn) stays out, whatever else is on.
+func TestFeatureEnabled_RookStaysOffUntilTheClusterConfigHasRook(t *testing.T) {
+	config := k4allv1alpha1.ClusterConfigSpec{Features: k4allv1alpha1.FeaturesConfig{
+		Virt:   k4allv1alpha1.VirtConfig{Enabled: true},
+		ArgoCD: k4allv1alpha1.ArgoCDConfig{Enabled: true},
+		OVSCNI: k4allv1alpha1.OVSCNIConfig{Enabled: true},
+	}}
+
+	if FeatureEnabled(FeatureRook, config) {
+		t.Error("rook is on, but no ClusterConfig field can turn it on yet")
+	}
+	active := FilterActiveComponents(map[string]k4allv1alpha1.ComponentSpec{
+		"cairn": {Type: k4allv1alpha1.ComponentTypeManifest, Version: "v0.1.0", FeatureGate: FeatureRook},
+	}, config)
+	if _, ok := active["cairn"]; ok {
+		t.Error("cairn is active behind the rook gate")
+	}
+}
+
+// The gates the ReleaseManifest names follow their ClusterConfig switch.
+func TestFeatureEnabled_FollowsTheClusterConfig(t *testing.T) {
+	for _, gate := range []string{FeatureVirt, "argocd", "ovsCni"} {
+		on := k4allv1alpha1.ClusterConfigSpec{Features: k4allv1alpha1.FeaturesConfig{
+			Virt:   k4allv1alpha1.VirtConfig{Enabled: true},
+			ArgoCD: k4allv1alpha1.ArgoCDConfig{Enabled: true},
+			OVSCNI: k4allv1alpha1.OVSCNIConfig{Enabled: true},
+		}}
+		if !FeatureEnabled(gate, on) {
+			t.Errorf("%s: off with its switch on", gate)
+		}
+		if FeatureEnabled(gate, k4allv1alpha1.ClusterConfigSpec{}) {
+			t.Errorf("%s: on with its switch off", gate)
+		}
+	}
+	if FeatureEnabled("unknown", k4allv1alpha1.ClusterConfigSpec{}) {
+		t.Error("an unknown gate is on")
+	}
+}

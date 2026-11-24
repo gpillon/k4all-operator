@@ -875,17 +875,25 @@ func (r *ReleaseReconciler) prepareUninstall(
 }
 
 // uninstallWithCleanup uninstalls a component and runs its Cleanup hook (if any),
-// returning the collected error messages. Both steps always run.
+// returning the collected error messages. Both steps always run. A hook that
+// is a Remover uninstalls the component in place of the engine.
 func (r *ReleaseReconciler) uninstallWithCleanup(
 	ctx context.Context, log logr.Logger, name string, spec k4allv1alpha1.ComponentSpec,
 	installedVersion string, config k4allv1alpha1.ClusterConfigSpec,
 ) []string {
 	var uninstallErrs []string
-	if err := r.engine.UninstallComponent(ctx, name, spec, installedVersion); err != nil {
+	hook := r.hookReg.Get(name)
+	var err error
+	if remover, ok := hook.(hooks.Remover); ok {
+		err = remover.Remove(ctx, spec, config)
+	} else {
+		err = r.engine.UninstallComponent(ctx, name, spec, installedVersion)
+	}
+	if err != nil {
 		log.Error(err, "uninstall failed", "name", name)
 		uninstallErrs = append(uninstallErrs, fmt.Sprintf("uninstall: %v", err))
 	}
-	if hook := r.hookReg.Get(name); hook != nil {
+	if hook != nil {
 		if err := hook.Cleanup(ctx, name, config); err != nil {
 			log.Error(err, "cleanup hook failed", "name", name)
 			uninstallErrs = append(uninstallErrs, fmt.Sprintf("cleanup hook: %v", err))
@@ -1089,18 +1097,23 @@ func (r *ReleaseReconciler) appliedHash(
 // componentValues returns the values the engine layers on top of the
 // ReleaseManifest values of one component: the PreInstall hook's values
 // first, then the ClusterConfig componentOverrides, so the user always wins.
-// The PreInstall hook, if any, may also prepare the cluster.
+// The PreInstall hook, if any, may also prepare the cluster. A hook that is
+// an OverrideMerger layers the override itself.
 func (r *ReleaseReconciler) componentValues(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
 ) (map[string]interface{}, error) {
 	values := make(map[string]interface{})
-	if hook := r.hookReg.Get(name); hook != nil {
+	hook := r.hookReg.Get(name)
+	if hook != nil {
 		var err error
 		if values, err = hook.PreInstall(ctx, name, spec, config, values); err != nil {
 			return nil, err
 		}
 	}
 	override, ok := config.ComponentOverrides[name]
+	if merger, isMerger := hook.(hooks.OverrideMerger); isMerger {
+		return merger.MergeOverride(spec, config, values, override)
+	}
 	if !ok {
 		return values, nil
 	}

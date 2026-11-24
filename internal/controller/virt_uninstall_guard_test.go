@@ -8,6 +8,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -69,7 +71,7 @@ func virtWorkloadAPIs(t *testing.T) {
 }
 
 // virtOnEnvtest is a cluster with the virt feature off where the component
-// name (kubevirt, cdi or kubevirt-manager, with its built-in hook) is still
+// name (kubevirt or cdi, with its built-in hook) is still
 // installed: the ConfigMap it returns stands for the component's objects.
 func virtOnEnvtest(t *testing.T, name string) (client.Client, *ReleaseReconciler, *corev1.ConfigMap) {
 	t.Helper()
@@ -183,24 +185,51 @@ func TestReconcile_KubeVirtStaysWhileVMsExist(t *testing.T) {
 	}
 }
 
-// Turning virt off keeps kubevirt-manager while VMs exist too: its
-// uninstall deletes the PriorityClasses vm-standard and vm-preemptible, and
-// a VM made with its form names vm-standard: it could not start again.
-func TestReconcile_KubevirtManagerStaysWhileVMsExist(t *testing.T) {
+// k4all v2.7.0 removes kubevirt-manager (management Removed) on every
+// cluster, VMs or not: Hangar replaces it. Its hook removes it in place of
+// the engine, and keeps what VMs need: with a VM that names vm-standard, the
+// console's roles go, vm-standard and the VM stay, and the unused
+// vm-preemptible goes. Nothing listed by the component's manifests is
+// deleted (the ConfigMap stands for them). A guard refusing while VMs exist
+// would keep kubevirt-manager forever on such clusters.
+func TestReconcile_KubevirtManagerRemovedWithVMsGoesThroughItsHook(t *testing.T) {
 	virtWorkloadAPIs(t)
-	c, r, objects := virtOnEnvtest(t, "kubevirt-manager")
+	spec := k4allv1alpha1.ComponentSpec{
+		Type: k4allv1alpha1.ComponentTypeManifest, Version: "v1.5.4", InlineManifests: []string{guardedConfigMap},
+		Management: k4allv1alpha1.ComponentManagementRemoved, FeatureGate: "virt",
+	}
+	c, r := componentOnEnvtest(t, "kubevirt-manager", spec, k4allv1alpha1.ComponentStatus{
+		State: k4allv1alpha1.ComponentStateInstalled, InstalledVersion: "v1.5.4", LastTransitionTime: metav1.Now(),
+	})
+	manifests := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "guarded", Namespace: "default"}}
+	role := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "kubevirt-manager"}}
+	standard := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "vm-standard"}, Value: 999999999}
+	preemptible := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "vm-preemptible"}, Value: 1000000}
 	vm := kubevirtObject("VirtualMachine", "vm1")
-	createAll(t, c, vm)
-
-	reconcileProbe(t, r)
-	assertUninstallRefused(t, c, "kubevirt-manager", objects,
-		"uninstall refused: 1 VirtualMachine (default/vm1) exists: delete it or set kubevirt-manager Unmanaged first")
-
-	if err := deleteNow(c, vm); err != nil {
+	if err := unstructured.SetNestedField(vm.Object, "vm-standard", "spec", "template", "spec", "priorityClassName"); err != nil {
 		t.Fatal(err)
 	}
+	createAll(t, c, manifests, role, standard, preemptible, vm)
+
 	reconcileProbe(t, r)
-	assertUninstalled(t, c, "kubevirt-manager", objects)
+
+	if st := componentStatus(t, c, "kubevirt-manager"); st.State != k4allv1alpha1.ComponentStateRemoved {
+		t.Fatalf("kubevirt-manager: %s (%s), want Removed", st.State, st.Message)
+	}
+	gone := func(obj client.Object) bool {
+		return apierrors.IsNotFound(c.Get(context.Background(), client.ObjectKeyFromObject(obj), obj))
+	}
+	if !gone(role) {
+		t.Error("ClusterRole kubevirt-manager kept")
+	}
+	if !gone(preemptible) {
+		t.Error("PriorityClass vm-preemptible kept with nothing using it")
+	}
+	for _, kept := range []client.Object{vm, standard, manifests} {
+		if gone(kept) {
+			t.Errorf("%s %s deleted", kept.GetObjectKind().GroupVersionKind().Kind, kept.GetName())
+		}
+	}
 }
 
 // pvc is a PersistentVolumeClaim in the default namespace.
@@ -261,7 +290,7 @@ func TestReconcile_CDIStaysWhileItsVolumesExist(t *testing.T) {
 // (their operators never ran, or the CRDs are gone), turning virt off
 // uninstalls them: nothing can need them.
 func TestReconcile_VirtUninstallsWhereTheWorkloadKindsAreNotServed(t *testing.T) {
-	for _, component := range []string{"kubevirt", "cdi", "kubevirt-manager"} {
+	for _, component := range []string{"kubevirt", "cdi"} {
 		t.Run(component, func(t *testing.T) {
 			c, r, objects := virtOnEnvtest(t, component)
 			crd := &unstructured.Unstructured{}

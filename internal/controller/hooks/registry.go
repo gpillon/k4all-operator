@@ -90,6 +90,26 @@ type UninstallPreparer interface {
 	PrepareUninstall(ctx context.Context, name string) (pending string, err error)
 }
 
+// Remover is implemented by a hook that removes its component itself: once
+// the UninstallGuard and the UninstallPreparer (if any) let the uninstall go
+// on, the reconciler calls Remove instead of deleting every object the
+// component's manifests list (kubevirt-manager: VMs name its
+// PriorityClasses, and its CRD holds the user's objects). Cleanup still runs
+// after it.
+type Remover interface {
+	Remove(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error
+}
+
+// OverrideMerger is implemented by a hook that layers its component's
+// ClusterConfig componentOverride on the PreInstall values itself, instead
+// of the plain deep merge, where a list of the override replaces the
+// release's list (headlamp: plugin lists merge by name). The reconciler calls
+// it on every apply, with an empty override when the ClusterConfig has none.
+type OverrideMerger interface {
+	MergeOverride(spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+		values map[string]interface{}, override k4allv1alpha1.ComponentOverride) (map[string]interface{}, error)
+}
+
 // Registry maps component names to their hooks.
 type Registry struct {
 	hooks map[string]Hook
@@ -126,7 +146,9 @@ func NewRegistry(c client.Client, log logr.Logger, opts ...Option) *Registry {
 	r.hooks["topolvm"] = NewTopolvmHook(c, log.WithName("hook-topolvm"))
 	r.hooks["calico"] = NewCalicoHook(c, log.WithName("hook-calico"))
 	r.hooks["nmstate"] = NewNMStateHook(c, log.WithName("hook-nmstate"))
-	r.hooks["kubevirt-manager"] = NewKubevirtManagerHook(c)
+	kvm := NewKubevirtManagerHook(c, log.WithName("hook-kubevirt-manager"))
+	kvm.restConfig = o.restConfig
+	r.hooks["kubevirt-manager"] = kvm
 	return r
 }
 
