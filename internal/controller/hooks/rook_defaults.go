@@ -85,7 +85,9 @@ func planRook(nodes int, settings RookSettings) (rookPlan, error) {
 	if nodes < cephMinNodes && settings.SmallCluster != k4allv1alpha1.RookSmallClusterAllow {
 		return rookPlan{}, rookRefusal{fmt.Sprintf(
 			"Ceph needs %d nodes for 3 monitors and 3 replicas on separate hosts, this cluster has %d: "+
-				"k4all creates the CephCluster once it has %d", cephMinNodes, nodes, cephMinNodes)}
+				"k4all creates the CephCluster once it has %d "+
+				"(features.rook.smallCluster: Allow creates it now, without redundancy)",
+			cephMinNodes, nodes, cephMinNodes)}
 	}
 	plan := rookPlan{Mons: 1, Mgrs: 1, PoolSize: min(nodes, 3)}
 	switch {
