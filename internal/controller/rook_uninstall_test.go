@@ -50,8 +50,8 @@ func rookCephStatus(t *testing.T, c client.Client) (k4allv1alpha1.ComponentStatu
 	return rm.Status.Components["rook-ceph"], meta.FindStatusCondition(rm.Status.Conditions, "Ready")
 }
 
-// rookOffSpec is rook-ceph with its feature off (the rook gate has no
-// ClusterConfig switch yet), as an inline manifest so it applies offline.
+// rookOffSpec is rook-ceph with its feature off (the test ClusterConfig has
+// no features.rook), as an inline manifest so it applies offline.
 var rookOffSpec = k4allv1alpha1.ComponentSpec{
 	Type: k4allv1alpha1.ComponentTypeManifest, Version: "v1", InlineManifests: []string{guardedConfigMap},
 	FeatureGate: "rook",

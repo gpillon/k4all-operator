@@ -269,6 +269,34 @@ func TestRookHook_CreatesNothingBelowThreeNodes(t *testing.T) {
 	}
 }
 
+// smallCluster Allow in the ClusterConfig (D5): on 2 nodes k4all creates
+// the CephCluster with 1 mon and the OSDs of the ClusterConfig's filter.
+func TestRookHook_ReadsTheClusterConfig(t *testing.T) {
+	c := rookEnvtest(t)
+	rookNodes(t, c, 2)
+	forgetRook(t, c)
+	config := k4allv1alpha1.ClusterConfigSpec{Features: k4allv1alpha1.FeaturesConfig{Rook: &k4allv1alpha1.RookConfig{
+		Enabled:      true,
+		SmallCluster: k4allv1alpha1.RookSmallClusterAllow,
+		Storage:      &k4allv1alpha1.RookStorage{DeviceFilter: "^sdb$"},
+	}}}
+
+	if _, err := NewRookHook(c, logr.Discard()).Sync(context.Background(), rookSpec, config); err != nil {
+		t.Fatalf("Sync with smallCluster Allow on 2 nodes: %v", err)
+	}
+
+	cluster := getCephCluster(t, c)
+	for path, want := range map[string]interface{}{
+		"spec.mon.count":             int64(1),
+		"spec.storage.useAllDevices": false,
+		"spec.storage.deviceFilter":  "^sdb$",
+	} {
+		if got := fieldAt(t, cluster.Object, path); got != want {
+			t.Errorf("%s = %#v, want %#v", path, got, want)
+		}
+	}
+}
+
 // What VMs need on Ceph: vm-pool with 3 replicas, the shared (RWX Block)
 // StorageClass ceph-rbd for live migration, its VolumeSnapshotClass, and
 // CDI's StorageProfile, all as seeds.

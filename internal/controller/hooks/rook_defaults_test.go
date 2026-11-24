@@ -8,6 +8,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 )
 
 // Rook's pods tolerate no taint by default: a node whose taints keep pods
@@ -52,8 +54,8 @@ func TestCephNodes(t *testing.T) {
 // places one mon per node (allowMultiplePerNode false) and vm-pool one
 // replica per host, so the counts never exceed the nodes.
 func TestPlanRook(t *testing.T) {
-	refuse := RookSettings{SmallCluster: SmallClusterRefuse}
-	allow := RookSettings{SmallCluster: SmallClusterAllow}
+	refuse := RookSettings{SmallCluster: k4allv1alpha1.RookSmallClusterRefuse}
+	allow := RookSettings{SmallCluster: k4allv1alpha1.RookSmallClusterAllow}
 	for _, tc := range []struct {
 		name     string
 		nodes    int
@@ -72,9 +74,9 @@ func TestPlanRook(t *testing.T) {
 		{name: "2 nodes, allowed: 2 mons would need both for quorum", nodes: 2, settings: allow,
 			want: rookPlan{Mons: 1, Mgrs: 2, PoolSize: 2}, warns: true},
 		{name: "3 nodes, allowed", nodes: 3, settings: allow, want: rookPlan{Mons: 3, Mgrs: 2, PoolSize: 3}},
-		{name: "pool size override", nodes: 5, settings: RookSettings{SmallCluster: SmallClusterRefuse, PoolSize: 2},
+		{name: "pool size override", nodes: 5, settings: RookSettings{SmallCluster: k4allv1alpha1.RookSmallClusterRefuse, PoolSize: 2},
 			want: rookPlan{Mons: 5, Mgrs: 2, PoolSize: 2}, warns: true},
-		{name: "pool size above the node count", nodes: 3, settings: RookSettings{SmallCluster: SmallClusterRefuse, PoolSize: 4},
+		{name: "pool size above the node count", nodes: 3, settings: RookSettings{SmallCluster: k4allv1alpha1.RookSmallClusterRefuse, PoolSize: 4},
 			refused: true},
 		{name: "no node", nodes: 0, settings: allow, refused: true},
 	} {
@@ -98,6 +100,36 @@ func TestPlanRook(t *testing.T) {
 				t.Errorf("planRook = %+v, want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+// The ClusterConfig's creation inputs: storage.deviceFilter and smallCluster
+// (empty is Refuse, D5). Without features.rook, or without the fields, the
+// defaults: every blank device, nothing below 3 nodes.
+func TestRookSettingsFrom(t *testing.T) {
+	rook := func(r *k4allv1alpha1.RookConfig) k4allv1alpha1.ClusterConfigSpec {
+		return k4allv1alpha1.ClusterConfigSpec{Features: k4allv1alpha1.FeaturesConfig{Rook: r}}
+	}
+	refuse := k4allv1alpha1.RookSmallClusterRefuse
+	for _, tc := range []struct {
+		name   string
+		config k4allv1alpha1.ClusterConfigSpec
+		want   RookSettings
+	}{
+		{"no rook field", rook(nil), RookSettings{SmallCluster: refuse}},
+		{"enabled only", rook(&k4allv1alpha1.RookConfig{Enabled: true}), RookSettings{SmallCluster: refuse}},
+		{"storage without a filter", rook(&k4allv1alpha1.RookConfig{Enabled: true, Storage: &k4allv1alpha1.RookStorage{}}),
+			RookSettings{SmallCluster: refuse}},
+		{"device filter", rook(&k4allv1alpha1.RookConfig{Enabled: true,
+			Storage: &k4allv1alpha1.RookStorage{DeviceFilter: "^nvme[01]n1$"}}),
+			RookSettings{DeviceFilter: "^nvme[01]n1$", SmallCluster: refuse}},
+		{"Refuse", rook(&k4allv1alpha1.RookConfig{Enabled: true, SmallCluster: refuse}), RookSettings{SmallCluster: refuse}},
+		{"Allow", rook(&k4allv1alpha1.RookConfig{Enabled: true, SmallCluster: k4allv1alpha1.RookSmallClusterAllow}),
+			RookSettings{SmallCluster: k4allv1alpha1.RookSmallClusterAllow}},
+	} {
+		if got := rookSettingsFrom(tc.config); got != tc.want {
+			t.Errorf("%s: %+v, want %+v", tc.name, got, tc.want)
+		}
 	}
 }
 
