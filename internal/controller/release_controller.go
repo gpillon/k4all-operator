@@ -139,10 +139,24 @@ const resyncInterval = 5 * time.Minute
 // PostInstall or Sync failed.
 const hookFailedPrefix = "installed but hook failed: "
 
+// hookWaitingPrefix starts the message of an installed component whose
+// PostInstall or Sync waits on the cluster (hooks.Waiting), not on a fault.
+const hookWaitingPrefix = "waiting: "
+
+// hookMessage is the message of an installed component whose hook returned
+// err: waiting, or failed.
+func hookMessage(err error) string {
+	var waiting hooks.Waiting
+	if goerrors.As(err, &waiting) {
+		return hookWaitingPrefix + waiting.Reason
+	}
+	return hookFailedPrefix + err.Error()
+}
+
 // hookUnfinished tells whether an installed component's message says that
-// its hook failed: the hook's PostInstall runs again.
+// its hook failed or waits: the hook's PostInstall runs again.
 func hookUnfinished(message string) bool {
-	return strings.HasPrefix(message, hookFailedPrefix)
+	return strings.HasPrefix(message, hookFailedPrefix) || strings.HasPrefix(message, hookWaitingPrefix)
 }
 
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -473,7 +487,7 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 				strings.HasPrefix(currentStatus.Message, uninstallQueuedPrefix) {
 				currentStatus.Message = engine.InstalledMessage
 			}
-			// A PostInstall that failed runs again until it succeeds.
+			// A PostInstall that failed or waited runs again until it is done.
 			postInstall := hookUnfinished(currentStatus.Message)
 			hookRequeue = sooner(hookRequeue, r.runHooks(ctx, log, name, spec, config, &currentStatus, postInstall))
 			rm.Status.Components[name] = currentStatus
@@ -575,9 +589,9 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 // runHooks runs the component's hook after an apply, or on an installed
 // component that is up to date: its PostInstall when postInstall is set, then
 // its Sync, when the hook is a Syncer. It returns how soon Sync wants to run
-// again (0: at the periodic reconcile). The first failure goes into st's
-// message; when neither fails, an installed component's earlier hook failure
-// is cleared.
+// again (0: at the periodic reconcile). The first failure, or wait
+// (hooks.Waiting), goes into st's message; when neither fails nor waits, an
+// installed component's earlier hook failure or wait is cleared.
 func (r *ReleaseReconciler) runHooks(
 	ctx context.Context, log logr.Logger, name string, spec k4allv1alpha1.ComponentSpec,
 	config k4allv1alpha1.ClusterConfigSpec, st *k4allv1alpha1.ComponentStatus, postInstall bool,
@@ -591,7 +605,12 @@ func (r *ReleaseReconciler) runHooks(
 		if err == nil {
 			return
 		}
-		log.Error(err, "hook failed", "name", name, "step", step)
+		var waiting hooks.Waiting
+		if goerrors.As(err, &waiting) {
+			log.Info("hook waits", "name", name, "step", step, "reason", waiting.Reason)
+		} else {
+			log.Error(err, "hook failed", "name", name, "step", step)
+		}
 		if unfinished == nil {
 			unfinished = err
 		}
@@ -607,7 +626,7 @@ func (r *ReleaseReconciler) runHooks(
 	}
 	switch {
 	case unfinished != nil:
-		st.Message = hookFailedPrefix + unfinished.Error()
+		st.Message = hookMessage(unfinished)
 	case st.State == k4allv1alpha1.ComponentStateInstalled && hookUnfinished(st.Message):
 		st.Message = engine.InstalledMessage
 	}
@@ -959,7 +978,8 @@ func (r *ReleaseReconciler) uninstallWithCleanup(
 // Components still on their upgrade path (Upgrading, or Pending on a step),
 // being uninstalled (Uninstalling: their operator removes what it created;
 // or queued behind another) or kept installed by a refused uninstall keep it
-// False.
+// False. A hook that waits (hooks.Waiting) does not: its component is
+// installed as asked.
 func setReadySummary(rm *k4allv1alpha1.ReleaseManifest, allOK bool, activeCount int) {
 	installed, failed := 0, false
 	var waiting, uninstalling, refused []string
