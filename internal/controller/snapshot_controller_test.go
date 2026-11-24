@@ -119,7 +119,7 @@ func TestReconcile_SnapshotControllerStaysWhileSnapshotsExist(t *testing.T) {
 
 	st := componentStatus(t, c, "snapshot-controller")
 	if st.State != k4allv1alpha1.ComponentStateInstalled ||
-		!strings.HasPrefix(st.Message, "uninstall refused: VolumeSnapshot default/rootdisk-snap exist") {
+		!strings.HasPrefix(st.Message, "uninstall refused: snapshot-controller: VolumeSnapshot default/rootdisk-snap exist") {
 		t.Fatalf("snapshot-controller %s (%s), want Installed with the refusal", st.State, st.Message)
 	}
 	deployment := types.NamespacedName{Namespace: "kube-system", Name: "snapshot-controller"}
