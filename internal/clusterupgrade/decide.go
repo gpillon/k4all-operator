@@ -11,6 +11,7 @@ import (
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	drainpkg "github.com/gpillon/k4all-operator/internal/drain"
+	"github.com/gpillon/k4all-operator/internal/nodesettings"
 	"github.com/gpillon/k4all-operator/internal/upgradegraph"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -385,7 +386,9 @@ func askedHop(node Node, hop string) string {
 }
 
 // waitFor says what keeps the next node from starting, and which node: one
-// not Ready, or one running a hop of its own.
+// not Ready, one running a hop of its own, or one in a node-settings step
+// (a ClusterUpgrade and the node-settings rollout never change two nodes at
+// once).
 func waitFor(nodes []Node) (string, int) {
 	for i, n := range nodes {
 		if !n.Ready {
@@ -393,6 +396,9 @@ func waitFor(nodes []Node) (string, int) {
 		}
 		if hop := n.Annotations[upgradeInProgressAnnotation]; hop != "" {
 			return fmt.Sprintf("waiting for the hop %s runs on its own (%s)", n.Name, hop), i
+		}
+		if nodesettings.StepRunning(n.Annotations) {
+			return "waiting for the node-settings step on " + n.Name, i
 		}
 	}
 	return "", -1

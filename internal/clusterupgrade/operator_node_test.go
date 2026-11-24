@@ -7,8 +7,8 @@ import (
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 )
 
-// opNode runs the operator in most cases here.
-const opNode = "cp-0"
+// opNode runs the operator in most cases here; stepHash is a settings hash.
+const opNode, stepHash = "cp-0", "abc"
 
 // The node that runs the operator goes last among the nodes of its type:
 // the operator moves once, onto a node already done (k4all#97). The type
@@ -93,6 +93,33 @@ func TestDecide_SingleNodeKeepsTheOperator(t *testing.T) {
 	}
 	_, actions := Decide(in)
 	expectActions(t, actions, Action{Kind: Cordon, Node: opNode}, Action{Kind: SetTarget, Node: opNode, Release: firstHop})
+}
+
+// Node settings and upgrades never change two nodes at once: no node is
+// cordoned while a node-settings step runs (k4all#60, ADR-0006).
+func TestDecide_WaitsForANodeSettingsStep(t *testing.T) {
+	t.Run("a node in its step", func(t *testing.T) {
+		nodes := threeNodes("v2.5.0")
+		nodes[0].Annotations["k4all.magesgate.com/node-settings-step"] = `{"hash":"abc","class":"drain-reboot","cordon":"true"}`
+		status, actions := Decide(Input{Spec: target("v2.7.0"), Nodes: nodes, Graph: graph(t), Now: now})
+
+		expectActions(t, actions)
+		expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, "v2.6.0: waiting for the node-settings step on w-0")
+	})
+	t.Run("a node applying its settings", func(t *testing.T) {
+		nodes := threeNodes("v2.5.0")
+		nodes[1].Annotations["k4all.magesgate.com/node-settings-target"] = stepHash
+		nodes[1].Annotations["k4all.magesgate.com/node-settings-applied"] = "old"
+		_, actions := Decide(Input{Spec: target("v2.7.0"), Nodes: nodes, Graph: graph(t), Now: now})
+		expectActions(t, actions)
+	})
+	t.Run("settings applied", func(t *testing.T) {
+		nodes := threeNodes("v2.5.0")
+		nodes[1].Annotations["k4all.magesgate.com/node-settings-target"] = stepHash
+		nodes[1].Annotations["k4all.magesgate.com/node-settings-applied"] = stepHash
+		_, actions := Decide(Input{Spec: target("v2.7.0"), Nodes: nodes, Graph: graph(t), Now: now})
+		expectActions(t, actions, Action{Kind: Cordon, Node: opNode})
+	})
 }
 
 func join(s []string) string {

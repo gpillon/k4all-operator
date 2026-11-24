@@ -177,7 +177,8 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "NodeConfig")
 		os.Exit(1)
 	}
-	// The controllers that change nodes do it one node at a time between them.
+	// The ClusterUpgrade and the node-settings rollout change one node at a
+	// time between them.
 	nodeLock := &controller.NodeLock{}
 	self := types.NamespacedName{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("POD_NAME")}
 	if err := (&controller.ClusterUpgradeReconciler{
@@ -189,6 +190,16 @@ func main() {
 		Lock:      nodeLock,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterUpgrade")
+		os.Exit(1)
+	}
+	if err := (&controller.NodeSettingsReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		APIReader: mgr.GetAPIReader(),
+		Self:      self,
+		Lock:      nodeLock,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NodeSettings")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
