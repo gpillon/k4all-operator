@@ -810,3 +810,113 @@ func TestDecide_BlockersDoNotStopADrainInProgress(t *testing.T) {
 		t.Errorf("actions = %+v, want the drain to go on", actions)
 	}
 }
+
+// A pod that declares no controller (`kubectl run`, a `kubectl debug
+// node/...` pod left running): a drain would delete it and nothing recreates
+// it. Up to v0.5.7 the drain evicted it without a word; now the node is not
+// cordoned while it runs one, as `kubectl drain` without --force refuses it
+// (k4all#99).
+func TestDecide_DoesNotCordonANodeThatRunsABarePod(t *testing.T) {
+	in := Input{Spec: target("v2.7.0"), Nodes: threeNodes("v2.5.0"), Graph: graph(t), Now: now,
+		BarePods: map[string][]string{"cp-0": {"default/debug-x"}}}
+
+	status, actions := Decide(in)
+
+	expectActions(t, actions)
+	want := "v2.6.0: cp-0 runs pods that declare no controller: default/debug-x (a drain would delete them, " +
+		"and nothing recreates them: delete them, or recreate them under a controller; see docs/upgrades.md, " +
+		"Drains that never end); the node is not cordoned"
+	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, want)
+	for _, n := range status.Nodes {
+		if n.Name == "cp-0" && (n.Phase != k4allv1alpha1.NodeUpgradePending || !strings.Contains(n.Message, "default/debug-x")) {
+			t.Errorf("cp-0 = %s %q, want Pending with the pod named", n.Phase, n.Message)
+		}
+	}
+
+	t.Run("goes on once the pod is gone", func(t *testing.T) {
+		in.BarePods = nil
+		_, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Cordon, Node: "cp-0"})
+	})
+
+	t.Run("a bare pod on another node waits for its turn", func(t *testing.T) {
+		in.BarePods = map[string][]string{"w-0": {"default/debug-x"}}
+		_, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Cordon, Node: "cp-0"})
+	})
+
+	t.Run("names three pods and counts the rest", func(t *testing.T) {
+		in.BarePods = map[string][]string{"cp-0": {"a/p1", "a/p2", "b/p3", "c/p4"}}
+		status, _ := Decide(in)
+		if !strings.Contains(status.Message, "declare no controller: a/p1, a/p2, b/p3, and 1 more (") {
+			t.Errorf("message = %q, want three pods named and one counted", status.Message)
+		}
+	})
+
+	t.Run("with a budget that never allows a disruption, names both", func(t *testing.T) {
+		in.BarePods = map[string][]string{"cp-0": {"default/debug-x"}}
+		in.Blockers = map[string][]Blocker{"cp-0": {cnpgPrimary}}
+		status, _ := Decide(in)
+		want := "v2.6.0: cp-0 cannot be drained: PDB kubone-data/kubone-pg-primary allows no disruption " +
+			"of pod kubone-data/kubone-pg-1 (a single-instance CloudNativePG cluster? see docs/upgrades.md, " +
+			"Drains that never end); runs pods that declare no controller: default/debug-x (a drain would delete " +
+			"them, and nothing recreates them: delete them, or recreate them under a controller; see " +
+			"docs/upgrades.md, Drains that never end); the node is not cordoned"
+		if status.Message != want {
+			t.Errorf("message = %q, want %q", status.Message, want)
+		}
+	})
+}
+
+// A single node is not drained: kubelet starts its bare pods again after
+// the reboot.
+func TestDecide_SingleNodeIgnoresBarePods(t *testing.T) {
+	_, actions := Decide(Input{
+		Spec:     k4allv1alpha1.ClusterUpgradeSpec{TargetRelease: firstHop},
+		Nodes:    []Node{node("k4all", "bootstrap", "v2.5.0")},
+		BarePods: map[string][]string{"k4all": {"default/debug-x"}},
+		Graph:    graph(t),
+		Now:      now,
+	})
+
+	expectActions(t, actions, Action{Kind: Cordon, Node: "k4all"}, Action{Kind: SetTarget, Node: "k4all", Release: firstHop})
+}
+
+// A bare pod on a node already being drained (cordoned before the check, by
+// an older operator or in a race with it) is not evicted either: the drain
+// waits for it, names it, and times out as for any pod left.
+func TestDecide_DrainDoesNotEvictABarePod(t *testing.T) {
+	drainStart := now.Add(-time.Minute)
+	bare := Pod{Namespace: "default", Name: "debug-x", Created: drainStart.Add(-time.Hour), NoController: true}
+
+	t.Run("evicts the others and names it", func(t *testing.T) {
+		in := draining(t, drainStart, 1)
+		in.Pods["cp-0"] = append(in.Pods["cp-0"], bare)
+		status, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Evict, Node: "cp-0", Pods: []string{"default/app-0"}})
+		want := "2 pods left: default/app-0, default/debug-x; not evicted, they declare no controller: " +
+			"default/debug-x (delete them, or recreate them under a controller)"
+		if got := status.Nodes[0].Message; got != want {
+			t.Errorf("cp-0 message = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("waits for it alone", func(t *testing.T) {
+		in := draining(t, drainStart, 0)
+		in.Pods["cp-0"] = []Pod{bare}
+		status, actions := Decide(in)
+		expectActions(t, actions, Action{Kind: Evict, Node: "cp-0"})
+		if got := status.Nodes[0].Phase; got != k4allv1alpha1.NodeUpgradeDraining {
+			t.Errorf("cp-0 phase = %s, want Draining", got)
+		}
+	})
+
+	t.Run("times out like any pod left", func(t *testing.T) {
+		in := draining(t, now.Add(-31*time.Minute), 0)
+		in.Pods["cp-0"] = []Pod{bare}
+		status, _ := Decide(in)
+		if got := status.Nodes[0]; got.Phase != k4allv1alpha1.NodeUpgradeFailed || got.Reason != k4allv1alpha1.NodeReasonDrainTimeout {
+			t.Errorf("cp-0 = %s %s, want Failed on the drain timeout", got.Phase, got.Reason)
+		}
+	})
+}

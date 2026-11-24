@@ -56,6 +56,10 @@ type Pod struct {
 	Namespace, Name string
 	Created         time.Time
 	Terminating     bool
+	// NoController: no ownerReference is its controller, so nothing
+	// recreates it once evicted. The drain leaves it to the admin, as
+	// `kubectl drain` without --force does (k4all#99).
+	NoController bool
 }
 
 func (p Pod) String() string { return p.Namespace + "/" + p.Name }
@@ -85,6 +89,10 @@ type Input struct {
 	// Blockers holds, for each node, the pods on it that its drain could
 	// never evict, sorted.
 	Blockers map[string][]Blocker
+	// BarePods holds, for each node not cordoned by the operator, the pods
+	// on it the drain would move that declare no controller
+	// (namespace/name, sorted): a drain would delete them for good.
+	BarePods map[string][]string
 	// Graph is nil when it could not be read (GraphErr).
 	Graph    *upgradegraph.Graph
 	GraphErr error
@@ -159,30 +167,47 @@ func decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action, string) {
 }
 
 // blockedNext says why the next node is not cordoned: pods on it that its
-// drain could never evict (k4all#87). The upgrade waits, without a cordon,
-// until the admin lets them go; changing a budget is the admin's call. A
-// single node is not drained, so nothing blocks it.
+// drain could never evict (k4all#87), or would delete for good because they
+// declare no controller (k4all#99). The upgrade waits, without a cordon,
+// until the admin lets them go; changing a budget or deleting a pod is the
+// admin's call. A single node is not drained, so nothing blocks it.
 func blockedNext(in Input, status *k4allv1alpha1.ClusterUpgradeStatus) string {
 	i := nextPending(*status)
 	if i < 0 || len(in.Nodes) <= 1 {
 		return ""
 	}
 	n := &status.Nodes[i]
-	blockers := in.Blockers[n.Name]
-	if len(blockers) == 0 {
+	var why []string
+	if blockers := in.Blockers[n.Name]; len(blockers) > 0 {
+		named := make([]string, 0, 4)
+		for j, b := range blockers {
+			if j == 3 {
+				named = append(named, fmt.Sprintf("and %d more", len(blockers)-3))
+				break
+			}
+			named = append(named, fmt.Sprintf("PDB %s allows no disruption of pod %s", b.PDB, b.Pod))
+		}
+		why = append(why, "cannot be drained: "+strings.Join(named, "; ")+
+			" (a single-instance CloudNativePG cluster? see docs/upgrades.md, Drains that never end)")
+	}
+	if bare := in.BarePods[n.Name]; len(bare) > 0 {
+		why = append(why, "runs pods that declare no controller: "+nameSome(bare)+
+			" (a drain would delete them, and nothing recreates them: delete them, or recreate them under a"+
+			" controller; see docs/upgrades.md, Drains that never end)")
+	}
+	if len(why) == 0 {
 		return ""
 	}
-	named := make([]string, 0, 4)
-	for j, b := range blockers {
-		if j == 3 {
-			named = append(named, fmt.Sprintf("and %d more", len(blockers)-3))
-			break
-		}
-		named = append(named, fmt.Sprintf("PDB %s allows no disruption of pod %s", b.PDB, b.Pod))
-	}
-	n.Message = "cannot be drained: " + strings.Join(named, "; ") +
-		" (a single-instance CloudNativePG cluster? see docs/upgrades.md, Drains that never end); the node is not cordoned"
+	n.Message = strings.Join(why, "; ") + "; the node is not cordoned"
 	return n.Name + " " + n.Message
+}
+
+// nameSome names up to three of names and counts the rest.
+func nameSome(names []string) string {
+	if len(names) <= 3 {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(names[:3], ", "), len(names)-3)
 }
 
 // waitForPDBs names the PodDisruptionBudget the next node waits for. After a
@@ -561,11 +586,18 @@ func drain(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) 
 		case in.Now.Sub(n.DrainStartedAt.Time) < timeout:
 			n.Phase = k4allv1alpha1.NodeUpgradeDraining
 			n.Message = fmt.Sprintf("%d pods left: %s", len(left), podList(left))
-			var evict []string
+			var evict, bare []string
 			for _, p := range left {
-				if !p.Terminating {
+				switch {
+				case p.NoController:
+					bare = append(bare, p.String())
+				case !p.Terminating:
 					evict = append(evict, p.String())
 				}
+			}
+			if len(bare) > 0 {
+				n.Message += "; not evicted, they declare no controller: " + nameSome(bare) +
+					" (delete them, or recreate them under a controller)"
 			}
 			return []Action{{Kind: Evict, Node: n.Name, Pods: evict}}
 		case !in.Spec.Drain.ContinueOnTimeout:
