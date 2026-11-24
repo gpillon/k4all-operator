@@ -44,8 +44,10 @@ type ClusterConfigSpec struct {
 	// Node settings k4all owns, the same on every node: kubelet settings,
 	// hugepages, IOMMU. The operator rolls a change out one node at a time.
 	// Absent, or a field of it absent: k4all does not own that setting and
-	// leaves what kubeadm or the admin set. Clearing a field removes what
-	// k4all had written for it, and only that.
+	// leaves what kubeadm or the admin set. Clearing a field undoes what
+	// k4all had written for it, and only that: a kubelet field gets back the
+	// value kube-system/kubelet-config had before k4all first wrote it (or
+	// goes, if it had none), and the kernel arguments k4all added are removed.
 	// +optional
 	Nodes *NodesConfig `json:"nodes,omitempty"`
 }
@@ -78,8 +80,9 @@ type NodesConfig struct {
 }
 
 // KubeletSettings is the part of the KubeletConfiguration k4all owns. A field
-// left out is not owned: k4all does not write it, and removes it from
-// kubelet-config only if k4all had written it.
+// left out is not owned: k4all does not write it. Once k4all has written a
+// field, clearing it puts back the value kubelet-config had before k4all first
+// wrote it, or removes the field if it had none.
 // +kubebuilder:validation:XValidation:rule="!has(self.cpuManagerPolicy) || self.cpuManagerPolicy != 'static' || (has(self.reservedSystemCPUs) && size(self.reservedSystemCPUs) > 0)",message="the static CPU manager needs reservedSystemCPUs"
 type KubeletSettings struct {
 	// Maximum number of pods per node. It must fit the pod CIDR of each node
