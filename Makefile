@@ -52,6 +52,10 @@ OPERATOR_SDK_VERSION ?= v1.42.3
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
 
+# METADATA_IMG is the image of the metadata server (cmd/metadata-server),
+# released with the operator's tag as ghcr.io/gpillon/k4all-metadata.
+METADATA_IMG ?= localhost/k4all-metadata:latest
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -205,6 +209,14 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
+
+.PHONY: metadata-build
+metadata-build: ## Build the image of the metadata server (cmd/metadata-server).
+	$(CONTAINER_TOOL) build -t ${METADATA_IMG} -f cmd/metadata-server/Dockerfile .
+
+.PHONY: metadata-push
+metadata-push: ## Push the image of the metadata server.
+	$(CONTAINER_TOOL) push ${METADATA_IMG}
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
