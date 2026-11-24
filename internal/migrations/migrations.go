@@ -60,6 +60,22 @@ func RunWith(ctx context.Context, env Env, rm *k4allv1alpha1.ReleaseManifest, co
 	return apply(ctx, env, All, rm, config)
 }
 
+// AheadError says the ClusterConfig counts more migrations than this
+// operator knows: an older operator runs after a newer one ran them. The
+// count names migrations by position, so nothing may run, and the
+// components may need what those migrations did.
+type AheadError struct {
+	Config         string
+	Applied, Known int
+}
+
+func (e *AheadError) Error() string {
+	return fmt.Sprintf("ClusterConfig %s: %s is %d, but this operator knows %d migrations: "+
+		"it is older than the operator that ran them. Run that operator (or a newer one), "+
+		"or set the annotation to %d once you know the cluster does not need the others",
+		e.Config, AppliedAnnotation, e.Applied, e.Known, e.Known)
+}
+
 func apply(ctx context.Context, env Env, list []Migration, rm *k4allv1alpha1.ReleaseManifest, config *k4allv1alpha1.ClusterConfig) (bool, error) {
 	c := env.Client
 	applied := 0
@@ -69,6 +85,9 @@ func apply(ctx context.Context, env Env, list []Migration, rm *k4allv1alpha1.Rel
 			return false, fmt.Errorf("ClusterConfig %s: %s is %q, not a count", config.Name, AppliedAnnotation, v)
 		}
 		applied = n
+	}
+	if applied > len(list) {
+		return false, &AheadError{Config: config.Name, Applied: applied, Known: len(list)}
 	}
 	done := applied
 	for done < len(list) && list[done].Due(rm) {

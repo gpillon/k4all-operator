@@ -78,6 +78,13 @@ type ReleaseReconciler struct {
 
 const ForceResyncAnnotation = "k4all.magesgate.com/force-resync"
 
+// AllowDowngradeAnnotation on the ReleaseManifest names the downgrades a
+// person allows, as "component=version" entries separated by commas.
+// Without one the operator never applies a version lower than the one a
+// component has installed (k4all ADR-0010): the entry allows exactly that
+// version, so a stale annotation allows nothing else.
+const AllowDowngradeAnnotation = "k4all.magesgate.com/allow-downgrade"
+
 // UpgradeInProgressAnnotation is set by the host tool k4all-upgrade on its own
 // Node while an OS/Kubernetes hop is running (value "<from>-><to>"). While any
 // Node carries it, components are not reconciled: no installs, no upgrades, no
@@ -170,7 +177,24 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// The release may need the ClusterConfig in a new shape before its
 	// components are applied from it.
 	env := migrations.Env{Client: r.Client, RestConfig: r.RestConfig, Log: log.WithName("migrations")}
-	if migrated, err := migrations.RunWith(ctx, env, rm, config); err != nil {
+	migrated, err := migrations.RunWith(ctx, env, rm, config)
+	var ahead *migrations.AheadError
+	if goerrors.As(err, &ahead) {
+		// An older operator after a newer one: no component until a person
+		// looks. They may need what the unknown migrations did.
+		log.Error(err, "component reconcile stopped")
+		setMigrationsAhead(&rm.Status.Conditions, rm.Generation, err.Error())
+		engine.SetReadyCondition(rm, metav1.ConditionFalse, migrationsAheadCondition, err.Error())
+		if err := r.patchStatus(ctx, rm); err != nil {
+			return ctrl.Result{}, err
+		}
+		setMigrationsAhead(&config.Status.Conditions, config.Generation, err.Error())
+		r.patchClusterConfigStatus(ctx, config)
+		return ctrl.Result{RequeueAfter: resyncInterval}, nil
+	}
+	meta.RemoveStatusCondition(&rm.Status.Conditions, migrationsAheadCondition)
+	meta.RemoveStatusCondition(&config.Status.Conditions, migrationsAheadCondition)
+	if err != nil {
 		log.Error(err, "ClusterConfig migration failed")
 		engine.SetReadyCondition(rm, metav1.ConditionFalse, "MigrationFailed", err.Error())
 		_ = r.patchStatus(ctx, rm)
@@ -207,6 +231,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	inactiveOK := r.reconcileInactiveComponents(ctx, log, rm, active, config.Spec)
 	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
+	setDowngradeRefused(rm, active)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
 
 	if err := r.patchStatus(ctx, rm); err != nil {
@@ -325,8 +350,10 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 		}
 
 		prevStatus := rm.Status.Components[name]
+		// A refused downgrade is Failed but still runs its installedVersion.
 		wasInstalled := prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
-			uninstallUnfinished(prevStatus) || r.engine.IsInstalled(ctx, name, spec, &prevStatus)
+			uninstallUnfinished(prevStatus) || strings.HasPrefix(prevStatus.Message, downgradeRefusedPrefix) ||
+			r.engine.IsInstalled(ctx, name, spec, &prevStatus)
 
 		if wasInstalled {
 			if !uninstallStarted(prevStatus) {
@@ -415,6 +442,17 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 				currentStatus.Message = engine.InstalledMessage
 			}
 			hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, &currentStatus))
+			rm.Status.Components[name] = currentStatus
+			continue
+		}
+
+		if why := downgradeRefused(rm, name, spec, currentStatus); why != "" {
+			allOK = false
+			if currentStatus.State != k4allv1alpha1.ComponentStateFailed {
+				currentStatus.State = k4allv1alpha1.ComponentStateFailed
+				currentStatus.LastTransitionTime = metav1.Now()
+			}
+			currentStatus.Message = why
 			rm.Status.Components[name] = currentStatus
 			continue
 		}
@@ -596,6 +634,71 @@ func (r *ReleaseReconciler) versionReporter(name string, spec k4allv1alpha1.Comp
 		return reporter
 	}
 	return r.engine.HelmReleaseReporter(name, spec)
+}
+
+// downgradeRefused says why the operator does not move a component from the
+// version it has installed down to the release's, or "" when it may go: the
+// release pins nothing lower, or AllowDowngradeAnnotation names this
+// downgrade. Versions compare as semver; a pin that is not semver ("latest")
+// is never refused.
+func downgradeRefused(rm *k4allv1alpha1.ReleaseManifest, name string, spec k4allv1alpha1.ComponentSpec,
+	st k4allv1alpha1.ComponentStatus) string {
+	if st.InstalledVersion == "" || !newerVersion(st.InstalledVersion, spec.Version) ||
+		downgradeAllowed(rm.GetAnnotations()[AllowDowngradeAnnotation], name, spec.Version) {
+		return ""
+	}
+	return fmt.Sprintf("%sthe release pins %s, older than the installed %s "+
+		"(to allow it, annotate the ReleaseManifest with %s: %s=%s)",
+		downgradeRefusedPrefix, spec.Version, st.InstalledVersion, AllowDowngradeAnnotation, name, spec.Version)
+}
+
+// downgradeAllowed tells whether the AllowDowngradeAnnotation value has the
+// entry name=version (semver equality, else the same text).
+func downgradeAllowed(value, name, version string) bool {
+	for _, entry := range strings.Split(value, ",") {
+		n, v, ok := strings.Cut(entry, "=")
+		if !ok || strings.TrimSpace(n) != name {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if c, ok := engine.CompareVersions(v, version); (ok && c == 0) || v == version {
+			return true
+		}
+	}
+	return false
+}
+
+// downgradeRefusedCondition lists, on the ReleaseManifest, the components
+// left at a version newer than the release pins (downgradeRefused).
+const downgradeRefusedCondition = "DowngradeRefused"
+
+// downgradeRefusedPrefix starts the message of a component the reconcile
+// did not downgrade.
+const downgradeRefusedPrefix = "not downgrading: "
+
+// setDowngradeRefused sets downgradeRefusedCondition from what this
+// reconcile did: a component that waits for its operator's uninstall, say,
+// was not refused, whatever its installedVersion.
+func setDowngradeRefused(rm *k4allv1alpha1.ReleaseManifest, active map[string]k4allv1alpha1.ComponentSpec) {
+	var refused []string
+	for name := range active {
+		if strings.HasPrefix(rm.Status.Components[name].Message, downgradeRefusedPrefix) {
+			refused = append(refused, name)
+		}
+	}
+	if len(refused) == 0 {
+		meta.RemoveStatusCondition(&rm.Status.Conditions, downgradeRefusedCondition)
+		return
+	}
+	sort.Strings(refused)
+	meta.SetStatusCondition(&rm.Status.Conditions, metav1.Condition{
+		Type:               downgradeRefusedCondition,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: rm.Generation,
+		Reason:             downgradeRefusedCondition,
+		Message: "the release pins these components lower than they are installed, and " +
+			AllowDowngradeAnnotation + " does not allow it: " + strings.Join(refused, ", "),
+	})
 }
 
 // newerVersion tells whether a is a later semver than b.
@@ -858,7 +961,26 @@ func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, confi
 		Reason:             "Synced",
 		Message:            fmt.Sprintf("CNI=%s, reconciled at %s", config.Status.ActiveCNI, config.Status.LastReconcileTime.Format(time.RFC3339)),
 	})
+	r.patchClusterConfigStatus(ctx, config)
+}
 
+// migrationsAheadCondition is set, on the ClusterConfig and the
+// ReleaseManifest, while the ClusterConfig counts more migrations than this
+// operator knows (migrations.AheadError); components are not reconciled.
+const migrationsAheadCondition = "MigrationsAhead"
+
+func setMigrationsAhead(conditions *[]metav1.Condition, generation int64, message string) {
+	meta.SetStatusCondition(conditions, metav1.Condition{
+		Type:               migrationsAheadCondition,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: generation,
+		Reason:             migrationsAheadCondition,
+		Message:            message,
+	})
+}
+
+// patchClusterConfigStatus writes config's status as it is in memory.
+func (r *ReleaseReconciler) patchClusterConfigStatus(ctx context.Context, config *k4allv1alpha1.ClusterConfig) {
 	statusPayload := map[string]interface{}{
 		"status": config.Status,
 	}
