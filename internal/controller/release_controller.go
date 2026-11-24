@@ -101,10 +101,11 @@ const upgradePollInterval = 30 * time.Second
 // operator uninstalls what it created (an Uninstalling component).
 const uninstallPollInterval = 15 * time.Second
 
-// anyUninstalling tells whether a component is Uninstalling.
+// anyUninstalling tells whether a component is Uninstalling, or queued to
+// be once another is gone.
 func anyUninstalling(rm *k4allv1alpha1.ReleaseManifest) bool {
 	for _, st := range rm.Status.Components {
-		if st.State == k4allv1alpha1.ComponentStateUninstalling {
+		if st.State == k4allv1alpha1.ComponentStateUninstalling || strings.HasPrefix(st.Message, uninstallQueuedPrefix) {
 			return true
 		}
 	}
@@ -334,33 +335,49 @@ func markUnmanagedComponents(rm *k4allv1alpha1.ReleaseManifest) {
 
 // reconcileInactiveComponents handles components disabled by feature gates or
 // a CNI switch (but still Managed): if they were previously installed they are
-// uninstalled first, then marked Skipped. It returns false if any uninstall failed.
+// uninstalled first, then marked Skipped. They go as removalPlan says: the
+// components of one feature gate as one, all kept while one refuses, and in
+// reverse dependency order. It returns false if any uninstall failed or was
+// refused.
 func (r *ReleaseReconciler) reconcileInactiveComponents(
 	ctx context.Context, log logr.Logger, rm *k4allv1alpha1.ReleaseManifest,
 	active map[string]k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
 ) bool {
-	allOK := true
+	inactive := make(map[string]k4allv1alpha1.ComponentSpec)
 	for name, spec := range rm.Spec.Components {
 		mgmt := spec.Management
 		if mgmt == k4allv1alpha1.ComponentManagementUnmanaged || mgmt == k4allv1alpha1.ComponentManagementRemoved {
 			continue
 		}
-		if _, isActive := active[name]; isActive {
-			continue
+		if _, isActive := active[name]; !isActive {
+			inactive[name] = spec
 		}
-
+	}
+	installed := make(map[string]bool, len(inactive))
+	for name, spec := range inactive {
 		prevStatus := rm.Status.Components[name]
 		// A refused downgrade is Failed but still runs its installedVersion.
-		wasInstalled := prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
+		installed[name] = prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
 			uninstallUnfinished(prevStatus) || strings.HasPrefix(prevStatus.Message, downgradeRefusedPrefix) ||
 			r.engine.IsInstalled(ctx, name, spec, &prevStatus)
+	}
+	plan := planRemoval(inactive)
+	refused := r.uninstallRefusals(ctx, log, rm, plan, installed)
 
-		if wasInstalled {
+	allOK := true
+	gone := make(map[string]bool, len(inactive))
+	for _, name := range plan.order {
+		spec := inactive[name]
+		prevStatus := rm.Status.Components[name]
+		if installed[name] {
 			if !uninstallStarted(prevStatus) {
-				if reason := r.uninstallRefusal(ctx, name); reason != "" {
-					log.Info("uninstall refused by the component's hook", "name", name, "reason", reason)
+				if reason, ok := refused[name]; ok {
 					rm.Status.Components[name] = refusedUninstall(prevStatus, reason)
 					allOK = false
+					continue
+				}
+				if first := plan.waitsFor(name, gone); first != "" {
+					rm.Status.Components[name] = queuedUninstall(prevStatus, first)
 					continue
 				}
 			}
@@ -383,6 +400,7 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 				continue
 			}
 		}
+		gone[name] = true
 
 		if prevStatus.State == k4allv1alpha1.ComponentStateSkipped && prevStatus.Message == skippedMessage {
 			continue
@@ -437,8 +455,10 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			// No hash: installed by an operator that did not record hashes.
 			// Adopt it instead of reinstalling every component on operator upgrade.
 			currentStatus.AppliedHash = hash
-			// Back in the release after a refused uninstall: nothing is refused now.
-			if strings.HasPrefix(currentStatus.Message, uninstallRefusedPrefix) {
+			// Back in the release after a refused or queued uninstall:
+			// nothing is being uninstalled now.
+			if strings.HasPrefix(currentStatus.Message, uninstallRefusedPrefix) ||
+				strings.HasPrefix(currentStatus.Message, uninstallQueuedPrefix) {
 				currentStatus.Message = engine.InstalledMessage
 			}
 			hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, &currentStatus))
@@ -793,12 +813,19 @@ func (r *ReleaseReconciler) uninstallRefusal(ctx context.Context, name string) s
 // hook refuses the uninstall: still Installed at its version, so the next
 // reconcile asks the hook again, with the reason in its message.
 func refusedUninstall(prev k4allv1alpha1.ComponentStatus, reason string) k4allv1alpha1.ComponentStatus {
+	st := keptInstalled(prev)
+	st.Message = uninstallRefusedPrefix + reason
+	return st
+}
+
+// keptInstalled is prev, Installed: a component kept at the version it runs
+// though it is out of the release.
+func keptInstalled(prev k4allv1alpha1.ComponentStatus) k4allv1alpha1.ComponentStatus {
 	st := prev
 	if st.State != k4allv1alpha1.ComponentStateInstalled {
 		st.State = k4allv1alpha1.ComponentStateInstalled
 		st.LastTransitionTime = metav1.Now()
 	}
-	st.Message = uninstallRefusedPrefix + reason
 	return st
 }
 
@@ -904,8 +931,9 @@ func (r *ReleaseReconciler) uninstallWithCleanup(
 
 // setReadySummary sets the Ready condition from the outcome of a full reconcile.
 // Components still on their upgrade path (Upgrading, or Pending on a step),
-// being uninstalled (Uninstalling: their operator removes what it created)
-// or kept installed by a refused uninstall keep it False.
+// being uninstalled (Uninstalling: their operator removes what it created;
+// or queued behind another) or kept installed by a refused uninstall keep it
+// False.
 func setReadySummary(rm *k4allv1alpha1.ReleaseManifest, allOK bool, activeCount int) {
 	installed, failed := 0, false
 	var waiting, uninstalling, refused []string
@@ -918,7 +946,7 @@ func setReadySummary(rm *k4allv1alpha1.ReleaseManifest, allOK bool, activeCount 
 			refused = append(refused, name)
 		case st.State == k4allv1alpha1.ComponentStateFailed:
 			failed = true
-		case st.State == k4allv1alpha1.ComponentStateUninstalling:
+		case st.State == k4allv1alpha1.ComponentStateUninstalling, strings.HasPrefix(st.Message, uninstallQueuedPrefix):
 			uninstalling = append(uninstalling, name)
 		case st.State == k4allv1alpha1.ComponentStateUpgrading, st.State == k4allv1alpha1.ComponentStatePending:
 			waiting = append(waiting, name)
