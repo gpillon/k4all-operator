@@ -8,8 +8,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -161,28 +159,47 @@ func TestClusterConfigStatus_OnlyTheReleaseReconcilersOwnPartsAreCopied(t *testi
 }
 
 // A condition type the release reconcile sets but releaseConditionTypes
-// does not list is never written (copyReleaseStatus copies only those): the
-// reconcile fails loudly instead, naming it, so a branch that adds a
-// condition and forgets the list fails its own tests through Reconcile
-// (those of PodNetworkOverlap and MigrationsAhead are such tests). Shown
-// with a list that leaves out Reconciled, which every reconcile sets.
+// does not list is never written (copyReleaseStatus copies only those). The
+// operator logs it at error level and carries on; the package's tests fail on
+// it: TestMain sets unlistedConditionsHook, so every Reconcile of the suite
+// that reaches the code setting such a condition trips (those of
+// PodNetworkOverlap and MigrationsAhead are such tests). Shown with a list
+// that leaves out Reconciled, which every reconcile sets.
 func TestReconcile_AConditionTypeTheReleaseReconcileSetsMustBeListed(t *testing.T) {
 	cl := newCluster(t,
 		map[string]k4allv1alpha1.ComponentSpec{"probe": {Type: "unsupported", Version: "1"}},
 		map[string]k4allv1alpha1.ComponentStatus{"probe": {State: k4allv1alpha1.ComponentStateInstalled, InstalledVersion: "1"}},
 	)
+	var found []error
+	suiteHook := unlistedConditionsHook
+	unlistedConditionsHook = func(err error) { found = append(found, err) }
 	full := releaseConditionTypes
-	t.Cleanup(func() { releaseConditionTypes = full })
+	t.Cleanup(func() { releaseConditionTypes, unlistedConditionsHook = full, suiteHook })
 	releaseConditionTypes = slices.DeleteFunc(slices.Clone(full), func(c string) bool { return c == "Reconciled" })
 
-	_, err := cl.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "k4all"}})
+	res := cl.reconcile() // the operator carries on: no error
 
-	if err == nil || !strings.Contains(err.Error(), "Reconciled") || !strings.Contains(err.Error(), "releaseConditionTypes") {
-		t.Fatalf("Reconcile = %v, want an error naming Reconciled and releaseConditionTypes", err)
+	if len(found) != 1 || !strings.Contains(found[0].Error(), "Reconciled") ||
+		!strings.Contains(found[0].Error(), "releaseConditionTypes") {
+		t.Fatalf("unlisted conditions reported %v, want one naming Reconciled and releaseConditionTypes", found)
+	}
+	if res.RequeueAfter != resyncInterval {
+		t.Errorf("RequeueAfter %v, want the normal %v: an unlisted condition changes nothing else", res.RequeueAfter, resyncInterval)
 	}
 
+	found = nil
 	releaseConditionTypes = full
-	cl.reconcile() // fails the test on an error
+	cl.reconcile()
+	if len(found) != 0 {
+		t.Errorf("unlisted conditions reported %v with the full list, want none", found)
+	}
+}
+
+// The suite trips on an unlisted condition only while TestMain sets the hook.
+func TestUnlistedConditionsHook_IsSetForTheSuite(t *testing.T) {
+	if unlistedConditionsHook == nil {
+		t.Fatal("unlistedConditionsHook is nil: the package's Reconcile tests would not fail on an unlisted condition")
+	}
 }
 
 // The node-settings controller's condition is not the release

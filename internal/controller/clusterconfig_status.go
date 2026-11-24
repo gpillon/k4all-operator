@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,7 +19,7 @@ import (
 // them on every write of the status, and leaves every other type (the
 // node-settings controller's NodeSettingsRollout) as the API server has it.
 // A new condition the release reconcile sets goes here: unlisted, it is
-// never written, and the reconcile fails (unlistedConditions). Another
+// never written (reportUnlistedConditions logs it, the tests fail on it). Another
 // controller's condition (NodeSettingsRollout) must not: every release
 // reconcile would remove it, or write back a stale copy.
 var releaseConditionTypes = []string{
@@ -55,9 +56,7 @@ func copyReleaseStatus(own k4allv1alpha1.ClusterConfigStatus, latest *k4allv1alp
 // unlistedConditions is an error naming the condition types the release
 // reconcile set, changed or removed on its copy of the ClusterConfig status,
 // from read (the status before it did) to now, that releaseConditionTypes
-// does not list: copyReleaseStatus never writes them. Nil when none. A
-// programming error, made loud: the reconcile returns it, and every test
-// through Reconcile that reaches the code setting such a condition fails.
+// does not list: copyReleaseStatus never writes them. Nil when none.
 func unlistedConditions(read, now []metav1.Condition) error {
 	var unlisted []string
 	for _, conds := range [][]metav1.Condition{read, now} {
@@ -77,4 +76,25 @@ func unlistedConditions(read, now []metav1.Condition) error {
 	sort.Strings(unlisted)
 	return fmt.Errorf("the release reconcile sets ClusterConfig condition types that releaseConditionTypes "+
 		"does not list, so they are never written: %s (add them to releaseConditionTypes)", strings.Join(unlisted, ", "))
+}
+
+// unlistedConditionsHook, when set, is called with every unlistedConditions
+// error a reconcile finds. The package's tests set it (TestMain) to fail, so
+// every test through Reconcile that reaches the code setting an unlisted
+// condition trips; the operator leaves it nil.
+var unlistedConditionsHook func(error)
+
+// reportUnlistedConditions logs, at error level, the condition types the
+// release reconcile set without listing them (unlistedConditions), and
+// hands them to unlistedConditionsHook. A programming error the tests catch:
+// the reconcile carries on as it would without them.
+func reportUnlistedConditions(log logr.Logger, read, now []metav1.Condition) {
+	err := unlistedConditions(read, now)
+	if err == nil {
+		return
+	}
+	log.Error(err, "ClusterConfig conditions not written")
+	if unlistedConditionsHook != nil {
+		unlistedConditionsHook(err)
+	}
 }

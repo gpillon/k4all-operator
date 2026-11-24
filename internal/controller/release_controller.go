@@ -208,7 +208,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	env := migrations.Env{Client: r.Client, RestConfig: r.RestConfig, Log: log.WithName("migrations")}
 	migrated, err := migrations.RunWith(ctx, env, rm, config)
 	// The ClusterConfig status before the reconcile changes it: what it
-	// changes must be its own (unlistedConditions).
+	// changes must be its own (reportUnlistedConditions).
 	statusRead := config.Status.DeepCopy()
 	var ahead *migrations.AheadError
 	if goerrors.As(err, &ahead) {
@@ -222,9 +222,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		setMigrationsAhead(&config.Status.Conditions, config.Generation, err.Error())
 		r.patchClusterConfigStatus(ctx, config)
-		if err := unlistedConditions(statusRead.Conditions, config.Status.Conditions); err != nil {
-			return ctrl.Result{}, err
-		}
+		reportUnlistedConditions(log, statusRead.Conditions, config.Status.Conditions)
 		return ctrl.Result{RequeueAfter: resyncInterval}, nil
 	}
 	meta.RemoveStatusCondition(&rm.Status.Conditions, migrationsAheadCondition)
@@ -278,9 +276,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Update ClusterConfig status
 	r.updateClusterConfigStatus(ctx, config, rm)
-	if err := unlistedConditions(statusRead.Conditions, config.Status.Conditions); err != nil {
-		return ctrl.Result{}, err
-	}
+	reportUnlistedConditions(log, statusRead.Conditions, config.Status.Conditions)
 
 	requeue := resyncInterval
 	if stepsLeft {

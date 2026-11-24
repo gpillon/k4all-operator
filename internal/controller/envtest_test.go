@@ -44,6 +44,12 @@ func envtestConfig(t *testing.T) *rest.Config {
 }
 
 func TestMain(m *testing.M) {
+	// Every Reconcile of the package's tests fails on a ClusterConfig
+	// condition the release reconcile sets without listing it in
+	// releaseConditionTypes (the operator only logs it).
+	unlistedConditionsHook = func(err error) {
+		panic("a test's release reconcile: " + err.Error())
+	}
 	code := m.Run()
 	if testEnv != nil {
 		_ = testEnv.Stop()
