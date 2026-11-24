@@ -213,3 +213,71 @@ func TestRookReady_SingleNodeAllowed(t *testing.T) {
 
 	expectRookReady(t, cond, set, metav1.ConditionTrue, "CephHealthWarn", "POOL_NO_REDUNDANCY")
 }
+
+// The reconciler writes the ClusterConfig's status as one merge patch, its
+// conditions as a whole list: RookReady is computed at each reconcile, so a
+// reconcile in which another condition changes (the CNI moves to Cilium:
+// PodNetworkOverlap appears) keeps it, transition time included.
+func TestReconcile_RookReadySurvivesAnotherConditionsChange(t *testing.T) {
+	config := rookOn("")
+	config.Generation = 0
+	config.Spec.Networking.CNI.Type = "calico"
+	rm := &k4allv1alpha1.ReleaseManifest{
+		ObjectMeta: metav1.ObjectMeta{Name: "k4all"},
+		Spec: k4allv1alpha1.ReleaseManifestSpec{Components: map[string]k4allv1alpha1.ComponentSpec{
+			"probe": {Type: "unsupported", Version: "1"},
+		}},
+	}
+	objects := append(cephNodeObjects(3), &config, rm, seedRecord("created"),
+		cephCluster("Ready", "", "HEALTH_OK", nil))
+	s := gateScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objects...).
+		WithStatusSubresource(&k4allv1alpha1.ReleaseManifest{}, &k4allv1alpha1.ClusterConfig{}).
+		Build()
+	cl := &cluster{t: t, c: c, r: &ReleaseReconciler{Client: c, Scheme: s, Log: logr.Discard()}}
+
+	cl.reconcile()
+	before := cl.condition(k4allv1alpha1.ConditionRookReady)
+	if before == nil || before.Status != metav1.ConditionTrue || before.Reason != "CephHealthOK" {
+		t.Fatalf("after the first reconcile: RookReady %+v, want True (CephHealthOK)", before)
+	}
+	if cl.condition(k4allv1alpha1.ConditionPodNetworkOverlap) != nil {
+		t.Fatal("PodNetworkOverlap with Calico")
+	}
+
+	cc := &k4allv1alpha1.ClusterConfig{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(&config), cc); err != nil {
+		t.Fatal(err)
+	}
+	cc.Spec.Networking.CNI.Type = ciliumCNI
+	if err := c.Update(context.Background(), cc); err != nil {
+		t.Fatal(err)
+	}
+	cl.reconcile()
+
+	if cl.condition(k4allv1alpha1.ConditionPodNetworkOverlap) == nil {
+		t.Fatal("no PodNetworkOverlap after the move to Cilium: the test changes no other condition")
+	}
+	after := cl.condition(k4allv1alpha1.ConditionRookReady)
+	if after == nil {
+		t.Fatal("RookReady is gone after a reconcile that changed another condition")
+	}
+	if after.Status != before.Status || after.Reason != before.Reason ||
+		!after.LastTransitionTime.Equal(&before.LastTransitionTime) {
+		t.Errorf("RookReady %s (%s) since %s, want it unchanged: %s (%s) since %s",
+			after.Status, after.Reason, after.LastTransitionTime, before.Status, before.Reason, before.LastTransitionTime)
+	}
+
+	cc = &k4allv1alpha1.ClusterConfig{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(&config), cc); err != nil {
+		t.Fatal(err)
+	}
+	cc.Spec.Features.Rook.Enabled = false
+	if err := c.Update(context.Background(), cc); err != nil {
+		t.Fatal(err)
+	}
+	cl.reconcile()
+	if cond := cl.condition(k4allv1alpha1.ConditionRookReady); cond != nil {
+		t.Errorf("Rook off: RookReady %s (%s), want it removed", cond.Status, cond.Reason)
+	}
+}
