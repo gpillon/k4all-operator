@@ -446,3 +446,22 @@ func TestReconcile_AQueuedComponentBackInTheReleaseDropsTheQueue(t *testing.T) {
 		t.Fatalf("base: %s (%s), want Installed without the queue message", st.State, st.Message)
 	}
 }
+
+// k4all-metadata's gate is virtMetadata (virt and metadata.enabled), not
+// virt: it is not in the virt group. With virt off and a VM, it goes (it
+// has no guard: it holds no data) while the virt group is held; KubeVirt,
+// which it depends on, stays.
+func TestReconcile_TheMetadataServiceIsNotHeldWithVirt(t *testing.T) {
+	virtWorkloadAPIs(t)
+	components := virtGroup()
+	// An unknown gate is off here: it stands for virtMetadata off with virt.
+	components["k4all-metadata"] = gatedComponent("k4all-metadata", "virtMetadata", "kubevirt")
+	c, r := groupsOnEnvtest(t, components)
+	createAll(t, c, kubevirtObject("VirtualMachine", "vm1"))
+
+	reconcileProbe(t, r)
+
+	assertGone(t, c, "k4all-metadata")
+	assertKept(t, c, "uninstall refused: kubevirt: 1 VirtualMachine (default/vm1) exists: "+
+		"delete it or set kubevirt Unmanaged first", "kubevirt", "cdi", "virtctl", "hangar", "hangar-node-agent")
+}
