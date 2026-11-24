@@ -125,6 +125,10 @@ func TestReconcile_KubeVirtGateMerge(t *testing.T) {
 	assertList(t, c, "fresh install", kvGatesPath, []string{"Sidecar"})
 	assertList(t, c, "fresh install", kvDisabledPath, nil)
 	assertAnnotation(t, c, "fresh install", hooks.FeatureGatesAnnotation, "Sidecar")
+	if !owns(managedFieldsOf(t, kubeVirtCR.get(t, c), metav1.ManagedFieldsOperationApply),
+		"metadata", "annotations", hooks.FeatureGatesAnnotation) {
+		t.Errorf("the annotation is not k4all-operator's; managers: %v", managers(kubeVirtCR.get(t, c)))
+	}
 
 	// Hangar turns on HostDevices and turns off DownwardMetrics in the CR.
 	kubeVirtCR.patchByHand(t, c, `{"spec":{"configuration":{"developerConfiguration":{
@@ -224,6 +228,10 @@ func TestReconcile_KubeVirtVMStateStorageClass(t *testing.T) {
 		t.Fatalf("vmStateStorageClass = %q, want vm-state-test though no such StorageClass exists", got)
 	}
 	assertKubeVirtSettings(t, c, "no StorageClass", metav1.ConditionFalse, "StorageClassNotFound")
+	// Hangar shows the field read-only when its manager is exactly k4all-operator.
+	if !owns(managedFieldsOf(t, kubeVirtCR.get(t, c), metav1.ManagedFieldsOperationApply), kvVMStatePath...) {
+		t.Errorf("vmStateStorageClass is not k4all-operator's; managers: %v", managers(kubeVirtCR.get(t, c)))
+	}
 
 	createAll(t, c, &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: "vm-state-test"}, Provisioner: "example.com/csi"})
 	reconcileKubeVirt(t, c, r)
