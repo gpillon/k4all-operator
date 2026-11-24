@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
@@ -23,12 +24,17 @@ import (
 // consoles show the fields of that manager read-only, as owned by k4all.
 const seedFieldManager = "k4all-operator-seed"
 
+// ownedFieldManager is the field manager of what k4all owns and puts back
+// at every reconcile; the consoles show its fields read-only.
+const ownedFieldManager = "k4all-operator"
+
 // defaultCephImage is the Ceph image of a rook-ceph component without one.
 const defaultCephImage = "quay.io/ceph/ceph:v20.2.4"
 
 // RookHook creates the Ceph cluster of the rook-ceph component with k4all's
-// defaults, once: the CephCluster, then left to its admins (Cairn, kubectl).
-// k4all never writes it again, so their day-2 changes stay.
+// defaults, once: the CephCluster, then left to its admins (Cairn, kubectl),
+// so their day-2 changes stay. Of the CephCluster it created k4all keeps one
+// field, the Ceph image (D18).
 type RookHook struct {
 	BaseHook
 	client client.Client
@@ -45,8 +51,10 @@ func NewRookHook(c client.Client, log logr.Logger) *RookHook {
 // cluster has now. Once means: an object k4all created, or found there
 // before it, is never created again, so an admin's delete stays (the
 // CephCluster deleted before turning Rook off). The seed record in the
-// rook-ceph namespace says which; Cleanup drops it. The reconciler runs Sync
-// after every apply of rook-ceph and at every reconcile.
+// rook-ceph namespace says which; Cleanup drops it. Then it puts the
+// component's image in the CephCluster it created (keepCephImage). The
+// reconciler runs Sync after every apply of rook-ceph and at every
+// reconcile.
 func (h *RookHook) Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) (time.Duration, error) {
 	settings := rookSettingsFrom(config)
 	image := spec.Image
@@ -95,7 +103,59 @@ func (h *RookHook) Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, c
 			return 0, err
 		}
 	}
-	return 0, nil
+	return 0, h.keepCephImage(ctx, record, image)
+}
+
+// keepCephImage keeps spec.cephVersion.image of the CephCluster k4all
+// created at the component's image, so Ceph moves with the Rook chart the
+// release pins: create-only, Ceph would never be upgraded (D18). It is the
+// only field k4all owns there (server-side apply of that field alone, as
+// k4all-operator: Cairn shows it read-only); every other one stays the
+// console's. A CephCluster k4all found is its admin's, image included, and
+// one deleted is not created again.
+func (h *RookHook) keepCephImage(ctx context.Context, record *corev1.ConfigMap, image string) error {
+	if !strings.HasPrefix(record.Data[seedKey(cephClusterKind, cephClusterName)], "created") {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		live := &unstructured.Unstructured{}
+		live.SetAPIVersion(cephAPIVersion)
+		live.SetKind(cephClusterKind)
+		err := h.client.Get(ctx, types.NamespacedName{Namespace: rookNamespace, Name: cephClusterName}, live)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("get CephCluster %s/%s: %w", rookNamespace, cephClusterName, err)
+		}
+		return h.applyCephImage(ctx, live, image)
+	})
+}
+
+// applyCephImage applies image as spec.cephVersion.image of live, on the
+// condition that the cluster still has that object (its uid: the API server
+// answers Conflict otherwise). An apply would otherwise create a CephCluster
+// deleted in between, with the image alone and Rook's defaults; a
+// resourceVersion does not stop that. Unchanged, it writes nothing.
+func (h *RookHook) applyCephImage(ctx context.Context, live *unstructured.Unstructured, image string) error {
+	apply := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": cephAPIVersion,
+		"kind":       cephClusterKind,
+		"metadata": map[string]interface{}{
+			"name":      live.GetName(),
+			"namespace": live.GetNamespace(),
+			"uid":       string(live.GetUID()),
+		},
+		"spec": map[string]interface{}{
+			"cephVersion": map[string]interface{}{"image": image},
+		},
+	}}
+	if err := h.client.Patch(ctx, apply, client.Apply,
+		client.FieldOwner(ownedFieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("apply the Ceph image %s to CephCluster %s/%s: %w",
+			image, live.GetNamespace(), live.GetName(), err)
+	}
+	return nil
 }
 
 // Cleanup forgets the seed record when rook-ceph is uninstalled, so turning
