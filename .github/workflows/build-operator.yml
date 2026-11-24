@@ -161,7 +161,10 @@ jobs:
               "${IMAGE}:${VERSION}-arm64"
             docker manifest push "${IMAGE}:${VERSION}"
 
-            if [ "${{ needs.build-image.outputs.is_tag }}" = "true" ]; then
+            # :latest moves with release tags only, not with a prerelease
+            # tag (-alpha, -beta, -rc).
+            if [ "${{ needs.build-image.outputs.is_tag }}" = "true" ] &&
+              [ "${{ needs.build-image.outputs.prerelease }}" = "false" ]; then
               docker manifest create "${IMAGE}:latest" \
                 "${IMAGE}:${VERSION}-amd64" \
                 "${IMAGE}:${VERSION}-arm64"
