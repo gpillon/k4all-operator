@@ -107,6 +107,7 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	_, in.Retry = cu.Annotations[k4allv1alpha1.ClusterUpgradeRetryAnnotation]
 	in.Graph, in.GraphErr = r.Graphs.Get(ctx, in.GraphURL)
+	inFlight := false
 	for i := range nodeList.Items {
 		n := &nodeList.Items[i]
 		in.Nodes = append(in.Nodes, clusterupgrade.Node{
@@ -120,9 +121,10 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			for _, p := range pods {
 				in.Pods[n.Name] = append(in.Pods[n.Name], clusterupgrade.Pod{
 					Namespace: p.Namespace, Name: p.Name, Created: p.CreationTimestamp.Time,
-					Terminating: p.DeletionTimestamp != nil,
+					Terminating: p.DeletionTimestamp != nil, NoController: declaresNoController(p),
 				})
 			}
+			inFlight = true
 		}
 	}
 
@@ -135,6 +137,12 @@ func (r *ClusterUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if cu.Spec.TargetRelease != "" && len(nodeList.Items) > 1 {
 		if in.Blockers, err = r.drainBlockers(ctx); err != nil {
 			return ctrl.Result{}, err
+		}
+		// Read before the next cordon only: a node in flight moves first.
+		if !inFlight {
+			if in.BarePods, err = r.barePods(ctx); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
@@ -232,6 +240,46 @@ func drainMoves(p corev1.Pod, self types.NamespacedName) bool {
 		return false
 	}
 	return !ownedByDaemonSet(p)
+}
+
+// declaresNoController tells whether no ownerReference of p is its
+// controller, so nothing recreates it once evicted: `kubectl drain` refuses
+// it without --force (unreplicatedFilter, k8s.io/kubectl pkg/drain). A
+// finished, static (mirror) or terminating pod does not count.
+func declaresNoController(p corev1.Pod) bool {
+	if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
+		return false
+	}
+	if _, mirror := p.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
+		return false
+	}
+	return metav1.GetControllerOf(&p) == nil
+}
+
+// barePods lists, by node, the pods a drain would delete for good
+// (findBarePods). It reads every pod once, uncached.
+func (r *ClusterUpgradeReconciler) barePods(ctx context.Context) (map[string][]string, error) {
+	pods := &corev1.PodList{}
+	if err := r.APIReader.List(ctx, pods); err != nil {
+		return nil, fmt.Errorf("list pods: %w", err)
+	}
+	return findBarePods(pods.Items, r.Self), nil
+}
+
+// findBarePods lists, by node and sorted (namespace/name), the pods the
+// drain would move that declare no controller.
+func findBarePods(pods []corev1.Pod, self types.NamespacedName) map[string][]string {
+	out := map[string][]string{}
+	for _, p := range pods {
+		if p.Spec.NodeName == "" || !drainMoves(p, self) || !declaresNoController(p) {
+			continue
+		}
+		out[p.Spec.NodeName] = append(out[p.Spec.NodeName], p.Namespace+"/"+p.Name)
+	}
+	for _, names := range out {
+		sort.Strings(names)
+	}
+	return out
 }
 
 func ownedByDaemonSet(p corev1.Pod) bool {
