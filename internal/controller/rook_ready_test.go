@@ -142,10 +142,12 @@ func TestRookReady_BelowThreeNodesWithRefuse(t *testing.T) {
 
 // Rook on, its chart still installing: nothing to report of Ceph yet.
 func TestRookReady_WhileRookInstalls(t *testing.T) {
-	cond, set := rookReady(t, rookOn(""), rookCephInstalled(k4allv1alpha1.ComponentStateInstalling, ""),
+	cond, set := rookReady(t, rookOn(""),
+		rookCephInstalled(k4allv1alpha1.ComponentStateInstalling, "helm release pending-install"),
 		cephNodeObjects(3)...)
 
-	expectRookReady(t, cond, set, metav1.ConditionFalse, "RookInstalling", "rook-ceph is Installing")
+	expectRookReady(t, cond, set, metav1.ConditionFalse, "RookInstalling",
+		"rook-ceph is Installing: helm release pending-install")
 }
 
 // Rook installed, 3 nodes, no CephCluster yet: the hook creates it at the
@@ -157,13 +159,16 @@ func TestRookReady_CephClusterNotCreatedYet(t *testing.T) {
 	expectRookReady(t, cond, set, metav1.ConditionFalse, "CephClusterPending", "rook-ceph/rook-ceph")
 }
 
-// The admin deleted the CephCluster k4all created (to turn Rook off):
-// k4all does not create it again, and says so.
+// The admin deleted the CephCluster k4all created, or found (to turn Rook
+// off): k4all does not create it again, and says so.
 func TestRookReady_CephClusterDeleted(t *testing.T) {
-	cond, set := rookReady(t, rookOn(""), rookCephInstalled(k4allv1alpha1.ComponentStateInstalled, ""),
-		append(cephNodeObjects(3), seedRecord("created"))...)
+	for _, how := range []string{"created", "found"} {
+		cond, set := rookReady(t, rookOn(""), rookCephInstalled(k4allv1alpha1.ComponentStateInstalled, ""),
+			append(cephNodeObjects(3), seedRecord(how))...)
 
-	expectRookReady(t, cond, set, metav1.ConditionFalse, "CephClusterDeleted", "does not create it again")
+		expectRookReady(t, cond, set, metav1.ConditionFalse, "CephClusterDeleted",
+			"which k4all "+how+", is gone", "does not create it again")
+	}
 }
 
 // The CephCluster as Rook reports it: its phase, then Ceph's health. A
