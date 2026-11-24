@@ -825,7 +825,7 @@ func TestDecide_DoesNotCordonANodeThatRunsABarePod(t *testing.T) {
 	expectActions(t, actions)
 	want := "v2.6.0: cp-0 runs pods that declare no controller: default/debug-x (a drain would delete them, " +
 		"and nothing recreates them: delete them, or recreate them under a controller; see docs/upgrades.md, " +
-		"Drains that never end); the node is not cordoned"
+		"Pods that declare no controller); the node is not cordoned"
 	expectPhase(t, status, k4allv1alpha1.ClusterUpgradeProgressing, want)
 	for _, n := range status.Nodes {
 		if n.Name == "cp-0" && (n.Phase != k4allv1alpha1.NodeUpgradePending || !strings.Contains(n.Message, "default/debug-x")) {
@@ -861,7 +861,7 @@ func TestDecide_DoesNotCordonANodeThatRunsABarePod(t *testing.T) {
 			"of pod kubone-data/kubone-pg-1 (a single-instance CloudNativePG cluster? see docs/upgrades.md, " +
 			"Drains that never end); runs pods that declare no controller: default/debug-x (a drain would delete " +
 			"them, and nothing recreates them: delete them, or recreate them under a controller; see " +
-			"docs/upgrades.md, Drains that never end); the node is not cordoned"
+			"docs/upgrades.md, Pods that declare no controller); the node is not cordoned"
 		if status.Message != want {
 			t.Errorf("message = %q, want %q", status.Message, want)
 		}

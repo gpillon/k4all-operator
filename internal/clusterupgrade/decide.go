@@ -193,7 +193,7 @@ func blockedNext(in Input, status *k4allv1alpha1.ClusterUpgradeStatus) string {
 	if bare := in.BarePods[n.Name]; len(bare) > 0 {
 		why = append(why, "runs pods that declare no controller: "+nameSome(bare)+
 			" (a drain would delete them, and nothing recreates them: delete them, or recreate them under a"+
-			" controller; see docs/upgrades.md, Drains that never end)")
+			" controller; see docs/upgrades.md, Pods that declare no controller)")
 	}
 	if len(why) == 0 {
 		return ""
