@@ -79,14 +79,6 @@ var openstackVersions = []string{
 
 var version = regexp.MustCompile(`^(latest|\d{4}-\d{2}-\d{2})$`)
 
-// networkEveryBoot lets cloud-init write the network config again at every
-// boot, not only at the first: KubeVirt gives a VM's NIC a new MAC at each
-// start (unless the VM sets one, or KubeMacPool runs), and the config of
-// the first boot names the first MAC, so the NIC stays down at the next
-// one. The new config comes from network_data.json, which describes the
-// NIC that asks. A user-data "updates" replaces it.
-const networkEveryBoot = "#cloud-config\nupdates:\n  network:\n    when: [boot-new-instance, boot]\n"
-
 // ServeHTTP answers the guest.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &recorder{ResponseWriter: w, code: http.StatusOK}
@@ -203,9 +195,8 @@ func (s *Server) openstack(w http.ResponseWriter, r *http.Request, rest string) 
 		s.networkData(w, r)
 		return
 	case "vendor_data2.json":
-		// k4all's own vendor-data, beside the admin's vendor_data.json.
-		// cloud-init takes the top-level "cloud-init" key.
-		jsonOut(w, map[string]string{"cloud-init": networkEveryBoot})
+		// No dynamic vendor-data: cloud-init would apply ours twice.
+		jsonOut(w, struct{}{})
 		return
 	}
 	vm, ok := s.instance(w)
