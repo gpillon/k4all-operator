@@ -380,8 +380,10 @@ spec:
                   Node settings k4all owns, the same on every node: kubelet settings,
                   hugepages, IOMMU. The operator rolls a change out one node at a time.
                   Absent, or a field of it absent: k4all does not own that setting and
-                  leaves what kubeadm or the admin set. Clearing a field removes what
-                  k4all had written for it, and only that.
+                  leaves what kubeadm or the admin set. Clearing a field undoes what
+                  k4all had written for it, and only that: a kubelet field gets back the
+                  value kube-system/kubelet-config had before k4all first wrote it (or
+                  goes, if it had none), and the kernel arguments k4all added are removed.
                 properties:
                   hugepages:
                     additionalProperties:
