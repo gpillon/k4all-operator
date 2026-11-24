@@ -127,6 +127,10 @@ type Input struct {
 	UnhealthyPDBs []drain.PDB
 	// Blockers holds, by node, the pods its drain could never evict.
 	Blockers map[string][]drain.Blocker
+	// BarePods holds, by node, the pods its drain would move that declare
+	// no controller (namespace/name, sorted): a drain would delete them for
+	// good (k4all#99). Read only while no node is in its step.
+	BarePods map[string][]string
 	// Drain is ClusterUpgrade k4all's spec.drain.
 	Drain drain.Settings
 	// UpgradeBusy says what of a ClusterUpgrade keeps a step from starting;
@@ -348,8 +352,8 @@ func (d *decision) startStep(i int, write *Action) {
 	class := d.classOf(n)
 	single := len(d.nodes) == 1
 	if class.Drains() && !single {
-		if blockers := d.in.Blockers[n.Name]; len(blockers) > 0 {
-			ps.Message = drain.BlockedMessage(blockers, nil)
+		if why := drain.BlockedMessage(d.in.Blockers[n.Name], d.in.BarePods[n.Name]); why != "" {
+			ps.Message = why
 			d.block("DrainBlocked", n.Name+" "+ps.Message)
 			return
 		}
@@ -415,7 +419,7 @@ func (d *decision) moveStep(i int, step Step) {
 	case drain.TimedOut:
 		var evict []string
 		for _, pod := range p.Left {
-			if !pod.Terminating {
+			if !pod.Terminating && !pod.NoController {
 				evict = append(evict, pod.String())
 			}
 		}

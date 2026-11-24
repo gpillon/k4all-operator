@@ -474,6 +474,67 @@ func TestDecide_DoesNotCordonANodeItCouldNeverDrain(t *testing.T) {
 	}
 }
 
+// k4all#99 in the rollout: a step that drains does not start on a node that
+// runs a pod that declares no controller, as a ClusterUpgrade hop does not;
+// a kubelet restart needs no drain, so it starts.
+func TestDecide_DoesNotCordonANodeThatRunsABarePod(t *testing.T) {
+	in := input(hugepagesSpec(4), cluster()...)
+	in.BarePods = map[string][]string{w0: {"default/debug-x"}}
+	r := Decide(in)
+	expectKinds(t, r.Actions)
+	expectRollout(t, r, k4allv1alpha1.NodeRolloutBlocked, "DrainBlocked")
+	if !strings.Contains(r.Status.Rollout.Message, "w-0 runs pods that declare no controller: default/debug-x (a drain would delete them") {
+		t.Errorf("message = %q", r.Status.Rollout.Message)
+	}
+
+	in = input(maxPodsSpec(200), cluster()...)
+	in.BarePods = map[string][]string{w0: {"default/debug-x"}}
+	expectKinds(t, Decide(in).Actions, "WriteConfig ", "Start w-0", "SetTarget w-0")
+}
+
+// A bare pod on a node already in its step (cordoned before the check, or
+// in a race with it) is never evicted: the drain names it and waits, and
+// leaves it also once it timed out.
+func TestDecide_DrainNeverEvictsABarePod(t *testing.T) {
+	spec := hugepagesSpec(4)
+	bare := drain.Pod{Namespace: "default", Name: "debug-x", Created: now.Add(-time.Hour), NoController: true}
+	web := drain.Pod{Namespace: "app", Name: "web", Created: now.Add(-time.Hour)}
+	inputAt := func(started time.Time, pods ...drain.Pod) Input {
+		nodes := cluster()
+		nodes[2] = inStep(nodes[2], spec, CordonByK4all, started)
+		in := input(spec, nodes...)
+		in.Record = rolled(spec)
+		in.Pods = map[string][]drain.Pod{w0: pods}
+		return in
+	}
+
+	r := Decide(inputAt(now.Add(-time.Minute), web, bare))
+	expectKinds(t, r.Actions, "Evict w-0")
+	if got := r.Actions[0].Pods; !reflect.DeepEqual(got, []string{"app/web"}) {
+		t.Errorf("evict %v, want only app/web", got)
+	}
+	if !strings.Contains(r.Status.Rollout.Message, "not evicted, they declare no controller: default/debug-x") {
+		t.Errorf("message = %q, want debug-x named", r.Status.Rollout.Message)
+	}
+
+	r = Decide(inputAt(now.Add(-time.Minute), bare))
+	expectKinds(t, r.Actions, "Evict w-0")
+	if got := r.Actions[0].Pods; len(got) > 0 || perNode(r)[w0] != PhaseDraining {
+		t.Errorf("evict %v, phase %s, want nothing evicted and the drain waiting", got, perNode(r)[w0])
+	}
+
+	r = Decide(inputAt(now.Add(-31*time.Minute), web, bare))
+	expectKinds(t, r.Actions, "Evict w-0")
+	if got := r.Actions[0].Pods; !reflect.DeepEqual(got, []string{"app/web"}) {
+		t.Errorf("evict %v after the timeout, want only app/web", got)
+	}
+	expectRollout(t, r, k4allv1alpha1.NodeRolloutBlocked, "DrainTimeout")
+
+	r = Decide(inputAt(now.Add(-31*time.Minute), bare))
+	expectKinds(t, r.Actions)
+	expectRollout(t, r, k4allv1alpha1.NodeRolloutBlocked, "DrainTimeout")
+}
+
 func TestDecide_DrainTimeoutBlocksAndKeepsEvicting(t *testing.T) {
 	spec := hugepagesSpec(4)
 	nodes := cluster()

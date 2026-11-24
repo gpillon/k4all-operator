@@ -315,6 +315,44 @@ func TestNodeSettings_OperatorsNodeGoesLastAndTheOperatorMoves(t *testing.T) {
 
 func ptrTo[T any](v T) *T { return &v }
 
+// k4all#99 in the rollout: a step that drains does not cordon a node that
+// runs a pod that declares no controller, and names it; once the admin
+// deletes the pod, the step starts.
+func TestNodeSettings_DoesNotCordonANodeThatRunsABarePod(t *testing.T) {
+	b := newSettingsTestbed(t, settingsNode("ns-cp", "bootstrap"), settingsNode("ns-w", "worker"))
+	ctx := context.Background()
+	debug := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "debug-x"},
+		Spec:       corev1.PodSpec{NodeName: "ns-w", Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+	}
+	if err := b.c.Create(ctx, debug); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.c.Delete(context.Background(), debug, client.GracePeriodSeconds(0)) })
+	b.setNodes(&k4allv1alpha1.NodesConfig{Hugepages: map[string]int32{"1Gi": 2}})
+
+	cc := b.reconcile()
+	if w := b.node("ns-w"); w.Spec.Unschedulable || w.Annotations[nodesettings.StepAnnotation] != "" {
+		t.Fatalf("ns-w unschedulable=%v annotations=%v, want it left alone", w.Spec.Unschedulable, w.Annotations)
+	}
+	if b.node("ns-cp").Spec.Unschedulable {
+		t.Fatalf("ns-cp cordoned while the rollout is blocked")
+	}
+	cond := meta.FindStatusCondition(cc.Status.Conditions, k4allv1alpha1.ConditionNodeSettingsRollout)
+	want := "ns-w runs pods that declare no controller: default/debug-x (a drain would delete them"
+	if cond == nil || cond.Reason != "DrainBlocked" || !strings.Contains(cc.Status.Nodes.Rollout.Message, want) {
+		t.Errorf("condition %+v, rollout %+v, want DrainBlocked naming debug-x", cond, cc.Status.Nodes.Rollout)
+	}
+
+	if err := b.c.Delete(ctx, debug, client.GracePeriodSeconds(0)); err != nil {
+		t.Fatal(err)
+	}
+	b.reconcile()
+	if !b.node("ns-w").Spec.Unschedulable {
+		t.Errorf("ns-w not cordoned once the bare pod is gone")
+	}
+}
+
 func TestNodePatch_UncordonsOnlyWhatK4allCordoned(t *testing.T) {
 	step := &nodesettings.Step{Hash: "h", Class: nodesettings.DrainReboot, Cordon: nodesettings.CordonAlready}
 	patch := nodePatch(nodesettings.Action{Kind: nodesettings.Finish, Node: "n", Step: step})

@@ -215,6 +215,12 @@ func (r *NodeSettingsReconciler) input(ctx context.Context, config *k4allv1alpha
 		if in.Blockers, err = d.drainBlockers(ctx); err != nil {
 			return in, nil, err
 		}
+		// Read before the next step only: a node in its step moves first.
+		if inStep == "" {
+			if in.BarePods, err = d.barePods(ctx); err != nil {
+				return in, nil, err
+			}
+		}
 	}
 	in.Self = d.self(ctx)
 	if r.selfEvictTried != inStep {
