@@ -508,19 +508,19 @@ func elsewhere(nodes []Node, name string) bool {
 // configWrite is the WriteConfig that brings kubelet-config to the desired
 // settings, nil when it has them already.
 func (d *decision) configWrite() (*Action, error) {
-	var wrote Kubelet
+	var prior Prior
 	var lastDone *time.Time
 	if d.in.Record != nil {
-		wrote, lastDone = d.in.Record.Kubelet, d.in.Record.LastDone
+		prior, lastDone = d.in.Record.Prior, d.in.Record.LastDone
 	}
-	doc, changed, err := MergeKubelet(d.in.KubeletConfig, d.desired.Kubelet, wrote)
+	doc, prior, changed, err := MergeKubelet(d.in.KubeletConfig, d.desired.Kubelet, prior)
 	if err != nil {
 		return nil, err
 	}
 	if !changed && d.in.Record != nil && d.in.Record.Hash == d.hash {
 		return nil, nil
 	}
-	rec := Record{Hash: d.hash, Settings: d.desired, History: d.history(), LastDone: lastDone}
+	rec := Record{Hash: d.hash, Settings: d.desired, Prior: prior, History: d.history(), LastDone: lastDone}
 	a := &Action{Kind: WriteConfig, Record: &rec}
 	if changed {
 		a.KubeletConfig = doc

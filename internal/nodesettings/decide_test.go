@@ -46,7 +46,8 @@ func input(spec *k4allv1alpha1.NodesConfig, nodes ...Node) Input {
 // writes it at the first step.
 func rolled(spec *k4allv1alpha1.NodesConfig) *Record {
 	s := FromSpec(spec)
-	return &Record{Hash: s.Hash(), Settings: s}
+	_, prior, _, _ := MergeKubelet(kubeadmKubelet, s.Kubelet, nil)
+	return &Record{Hash: s.Hash(), Settings: s, Prior: prior}
 }
 
 func kinds(actions []Action) []string {
@@ -395,7 +396,7 @@ func TestDecide_RefusesSettingsThatDoNotFit(t *testing.T) {
 
 func TestDecide_ClearingRemovesWhatK4allWrote(t *testing.T) {
 	old := &k4allv1alpha1.NodesConfig{Kubelet: &k4allv1alpha1.KubeletSettings{CPUManagerPolicy: "static", ReservedSystemCPUs: "0-1"}}
-	doc, _, _ := MergeKubelet(kubeadmKubelet, FromSpec(old).Kubelet, Kubelet{})
+	doc, _, _, _ := MergeKubelet(kubeadmKubelet, FromSpec(old).Kubelet, nil)
 	nodes := cluster()
 	for i := range nodes {
 		nodes[i].Annotations[TargetAnnotation] = FromSpec(old).Hash()
@@ -552,5 +553,41 @@ func TestDecide_KeepsTheAdminsCordon(t *testing.T) {
 	expectKinds(t, r.Actions, "Finish w-0", "WriteConfig ")
 	if r.Actions[0].Step.Cordon != CordonAlready {
 		t.Errorf("finish = %+v, want the admin's cordon kept", r.Actions[0].Step)
+	}
+}
+
+// The first write of a field records what kubelet-config had there.
+func TestDecide_FirstWriteRecordsThePriorValue(t *testing.T) {
+	r := Decide(input(maxPodsSpec(300), cluster()...))
+	rec := r.Actions[0].Record
+	if r.Actions[0].Kind != WriteConfig || rec.Prior["maxPods"] == nil || *rec.Prior["maxPods"] != "250" {
+		t.Errorf("record = %+v, want the prior maxPods 250", rec)
+	}
+}
+
+// Clearing maxPods puts kubeadm's 250 back, not the kubelet's 110, and the
+// nodes take it with a restart.
+func TestDecide_ClearingPutsBackThePriorValueWithARestart(t *testing.T) {
+	spec := maxPodsSpec(300)
+	doc, _, _, _ := MergeKubelet(kubeadmKubelet, FromSpec(spec).Kubelet, nil)
+	nodes := cluster()
+	for i := range nodes {
+		nodes[i].Annotations[TargetAnnotation] = FromSpec(spec).Hash()
+		nodes[i].Annotations[AppliedAnnotation] = FromSpec(spec).Hash()
+	}
+	in := input(nil, nodes...)
+	in.KubeletConfig = doc
+	in.Record = rolled(spec)
+
+	r := Decide(in)
+	expectKinds(t, r.Actions, "WriteConfig ", "Start w-0", "SetTarget w-0")
+	if cfg := r.Actions[0].KubeletConfig; !strings.Contains(cfg, "maxPods: 250") || strings.Contains(cfg, "300") {
+		t.Errorf("kubelet-config:\n%s", cfg)
+	}
+	if rec := r.Actions[0].Record; len(rec.Prior) != 0 || rec.Hash != (Settings{}).Hash() {
+		t.Errorf("record = %+v, want nothing owned", rec)
+	}
+	if s := r.Actions[1].Step; s.Class != Restart || s.Cordon != CordonNone {
+		t.Errorf("step = %+v, want a restart without a cordon", s)
 	}
 }

@@ -338,3 +338,29 @@ func TestNodePatch_UncordonsOnlyWhatK4allCordoned(t *testing.T) {
 		t.Errorf("let go = %v, want the target removed and the node uncordoned", letGo)
 	}
 }
+
+// Clearing a kubelet field puts back what kubelet-config had before k4all:
+// kubeadm's maxPods 250, not the kubelet's 110. The nodes take it with a
+// restart.
+func TestNodeSettings_ClearingPutsBackWhatKubeadmHad(t *testing.T) {
+	b := newSettingsTestbed(t, settingsNode("ns-only", "bootstrap"))
+	spec := &k4allv1alpha1.NodesConfig{Kubelet: &k4allv1alpha1.KubeletSettings{MaxPods: ptrTo(int32(300))}}
+	b.setNodes(spec)
+	b.reconcile()
+	if data := b.kubeletConfig().Data["kubelet"]; !strings.Contains(data, "maxPods: 300") {
+		t.Fatalf("kubelet-config:\n%s", data)
+	}
+	b.agentApplies("ns-only", nodesettings.FromSpec(spec).Hash())
+	b.reconcile()
+
+	b.setNodes(nil)
+	b.reconcile()
+	if data := b.kubeletConfig().Data["kubelet"]; !strings.Contains(data, "maxPods: 250") || strings.Contains(data, "300") {
+		t.Errorf("after clearing, kubelet-config:\n%s", data)
+	}
+	n := b.node("ns-only")
+	if n.Annotations[nodesettings.TargetAnnotation] != (nodesettings.Settings{}).Hash() || n.Spec.Unschedulable {
+		t.Errorf("node: target %q unschedulable %v, want the restart to the cleared settings, no cordon",
+			n.Annotations[nodesettings.TargetAnnotation], n.Spec.Unschedulable)
+	}
+}

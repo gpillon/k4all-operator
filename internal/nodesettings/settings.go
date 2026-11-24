@@ -156,50 +156,77 @@ func (k Kubelet) values() map[string]string {
 	return out
 }
 
+// Prior is what kubelet-config had in each field k4all owns before k4all
+// first wrote it: the value's text, nil when the field was not there. A
+// field is k4all's exactly when it has an entry.
+type Prior map[string]*string
+
 // MergeKubelet returns doc, kubeadm's KubeletConfiguration (data.kubelet of
-// kube-system/kubelet-config), with the fields of want set, and the fields
-// of wrote (what k4all wrote before) that want no longer sets removed. Every
-// other field keeps its value and place. changed is false when doc already
-// says that; doc is then returned as it is.
-func MergeKubelet(doc string, want, wrote Kubelet) (string, bool, error) {
+// kube-system/kubelet-config), with the fields of want set, and prior with
+// what each field had before k4all first wrote it. A field k4all owned
+// (in prior) that want no longer sets gets back its prior value, or goes
+// when it had none. Every other field keeps its value and place. changed is
+// false when doc already says that; doc is then returned as it is.
+func MergeKubelet(doc string, want Kubelet, prior Prior) (string, Prior, bool, error) {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(doc), &root); err != nil {
-		return "", false, fmt.Errorf("read the KubeletConfiguration: %w", err)
+		return "", nil, false, fmt.Errorf("read the KubeletConfiguration: %w", err)
 	}
 	if root.Kind != yaml.DocumentNode || len(root.Content) != 1 || root.Content[0].Kind != yaml.MappingNode {
-		return "", false, fmt.Errorf("the KubeletConfiguration is not a YAML mapping")
+		return "", nil, false, fmt.Errorf("the KubeletConfiguration is not a YAML mapping")
 	}
 	m := root.Content[0]
-	wantValues, wroteValues := want.values(), wrote.values()
+	wantValues := want.values()
+	next := Prior{}
 	changed := false
-	for _, field := range kubeletFields {
-		value, set := wantValues[field]
-		i := keyIndex(m, field)
+	set := func(i int, field, value string) {
 		switch {
-		case set && i < 0:
+		case i < 0:
 			m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: field}, scalar(field, value))
 			changed = true
-		case set && m.Content[i+1].Value != value:
+		case m.Content[i+1].Value != value:
 			m.Content[i+1] = scalar(field, value)
 			changed = true
-		case !set && i >= 0 && wroteValues[field] != "":
+		}
+	}
+	for _, field := range kubeletFields {
+		value, wanted := wantValues[field]
+		before, owned := prior[field]
+		i := keyIndex(m, field)
+		switch {
+		case wanted && owned:
+			next[field] = before
+			set(i, field, value)
+		case wanted:
+			next[field] = nil // the first write: keep what is there
+			if i >= 0 {
+				was := m.Content[i+1].Value
+				next[field] = &was
+			}
+			set(i, field, value)
+		case owned && before != nil:
+			set(i, field, *before)
+		case owned && i >= 0:
 			m.Content = append(m.Content[:i], m.Content[i+2:]...)
 			changed = true
 		}
 	}
+	if len(next) == 0 {
+		next = nil
+	}
 	if !changed {
-		return doc, false, nil
+		return doc, next, false, nil
 	}
 	var out strings.Builder
 	enc := yaml.NewEncoder(&out)
 	enc.SetIndent(2)
 	if err := enc.Encode(&root); err != nil {
-		return "", false, fmt.Errorf("write the KubeletConfiguration: %w", err)
+		return "", nil, false, fmt.Errorf("write the KubeletConfiguration: %w", err)
 	}
 	if err := enc.Close(); err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
-	return out.String(), true, nil
+	return out.String(), next, true, nil
 }
 
 func keyIndex(m *yaml.Node, key string) int {

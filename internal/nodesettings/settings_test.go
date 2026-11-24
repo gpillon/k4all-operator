@@ -1,6 +1,7 @@
 package nodesettings
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -97,7 +98,7 @@ rotateCertificates: true
 
 func TestMergeKubelet_WritesOnlyTheOwnedFields(t *testing.T) {
 	want := Kubelet{CPUManagerPolicy: "static", ReservedSystemCPUs: "0", TopologyManagerPolicy: "single-numa-node"}
-	got, changed, err := MergeKubelet(kubeadmKubelet, want, Kubelet{})
+	got, prior, changed, err := MergeKubelet(kubeadmKubelet, want, nil)
 	if err != nil || !changed {
 		t.Fatalf("MergeKubelet = changed %v, %v", changed, err)
 	}
@@ -114,48 +115,79 @@ func TestMergeKubelet_WritesOnlyTheOwnedFields(t *testing.T) {
 	if strings.Index(got, "apiVersion") > strings.Index(got, "cgroupDriver") || strings.Index(got, "kind:") > strings.Index(got, "maxPods") {
 		t.Errorf("fields reordered:\n%s", got)
 	}
+	// None of them was there before k4all.
+	if len(prior) != 3 || prior["cpuManagerPolicy"] != nil || prior["reservedSystemCPUs"] != nil || prior["topologyManagerPolicy"] != nil {
+		t.Errorf("prior = %v, want the three fields, absent before", prior)
+	}
 
-	again, changed, err := MergeKubelet(got, want, want)
-	if err != nil || changed || again != got {
-		t.Errorf("second merge changed %v (%v):\n%s", changed, err, again)
+	again, prior2, changed, err := MergeKubelet(got, want, prior)
+	if err != nil || changed || again != got || !reflect.DeepEqual(prior2, prior) {
+		t.Errorf("second merge changed %v (%v), prior %v:\n%s", changed, err, prior2, again)
 	}
 }
 
-// A field k4all set by hand before is not k4all's until the ClusterConfig
-// sets it: production's maxPods 250 stays. Setting it to the same value is
-// no change.
+// Production's hand-set maxPods 250: setting it to the same value is no
+// change to the config, and the 250 is what was there before k4all.
 func TestMergeKubelet_SameValueIsNoChange(t *testing.T) {
-	_, changed, err := MergeKubelet(kubeadmKubelet, Kubelet{MaxPods: ptr(int32(250))}, Kubelet{})
-	if err != nil || changed {
-		t.Errorf("maxPods 250 over 250: changed %v, %v", changed, err)
+	_, prior, changed, err := MergeKubelet(kubeadmKubelet, Kubelet{MaxPods: ptr(int32(250))}, nil)
+	if err != nil || changed || prior["maxPods"] == nil || *prior["maxPods"] != "250" {
+		t.Errorf("maxPods 250 over 250: changed %v, prior %v, %v", changed, prior, err)
 	}
-	got, changed, _ := MergeKubelet(kubeadmKubelet, Kubelet{MaxPods: ptr(int32(110))}, Kubelet{})
+	got, _, changed, _ := MergeKubelet(kubeadmKubelet, Kubelet{MaxPods: ptr(int32(110))}, nil)
 	if !changed || !strings.Contains(got, "maxPods: 110") || strings.Contains(got, "maxPods: 250") {
 		t.Errorf("maxPods 110: changed %v\n%s", changed, got)
 	}
 }
 
-func TestMergeKubelet_RemovesOnlyWhatK4allWrote(t *testing.T) {
-	doc, _, _ := MergeKubelet(kubeadmKubelet, Kubelet{CPUManagerPolicy: "static", ReservedSystemCPUs: "0-1"}, Kubelet{})
-	got, changed, err := MergeKubelet(doc, Kubelet{}, Kubelet{CPUManagerPolicy: "static", ReservedSystemCPUs: "0-1"})
+// Clearing a field puts back what kubelet-config had before k4all first wrote
+// it: kubeadm's maxPods 250, not the kubelet's 110.
+func TestMergeKubelet_ClearingPutsBackWhatWasThere(t *testing.T) {
+	doc, prior, _, err := MergeKubelet(kubeadmKubelet, Kubelet{MaxPods: ptr(int32(300))}, nil)
+	if err != nil || !strings.Contains(doc, "maxPods: 300") {
+		t.Fatalf("set 300: %v\n%s", err, doc)
+	}
+	got, prior, changed, err := MergeKubelet(doc, Kubelet{}, prior)
+	if err != nil || !changed || !strings.Contains(got, "maxPods: 250") || strings.Contains(got, "300") {
+		t.Errorf("cleared: changed %v, %v\n%s", changed, err, got)
+	}
+	if len(prior) != 0 {
+		t.Errorf("prior = %v after the clear, want nothing owned", prior)
+	}
+}
+
+// A field that was not there before k4all goes again when cleared.
+func TestMergeKubelet_ClearingAFieldThatWasNotThereRemovesIt(t *testing.T) {
+	doc, prior, _, _ := MergeKubelet(kubeadmKubelet, Kubelet{CPUManagerPolicy: "static", ReservedSystemCPUs: "0-1"}, nil)
+	got, _, changed, err := MergeKubelet(doc, Kubelet{}, prior)
 	if err != nil || !changed {
 		t.Fatalf("clearing: changed %v, %v", changed, err)
 	}
-	if strings.Contains(got, "cpuManagerPolicy") || strings.Contains(got, "reservedSystemCPUs") {
-		t.Errorf("cleared fields left:\n%s", got)
+	if strings.Contains(got, "cpuManagerPolicy") || strings.Contains(got, "reservedSystemCPUs") || !strings.Contains(got, "maxPods: 250") {
+		t.Errorf("after clearing:\n%s", got)
 	}
-	if !strings.Contains(got, "maxPods: 250") {
-		t.Errorf("maxPods, not k4all's, removed:\n%s", got)
-	}
-	// maxPods was never k4all's: clearing nothing leaves it.
-	if _, changed, _ := MergeKubelet(kubeadmKubelet, Kubelet{}, Kubelet{}); changed {
+	// Nothing owned, nothing written.
+	if _, _, changed, _ := MergeKubelet(kubeadmKubelet, Kubelet{}, nil); changed {
 		t.Errorf("nothing owned, nothing written: changed")
+	}
+}
+
+// Changing an owned field keeps what was there before k4all: the clear puts
+// back that, not the first value k4all wrote.
+func TestMergeKubelet_ThePriorValueIsTheOneBeforeK4all(t *testing.T) {
+	doc, prior, _, _ := MergeKubelet(kubeadmKubelet, Kubelet{MaxPods: ptr(int32(300))}, nil)
+	doc, prior, _, _ = MergeKubelet(doc, Kubelet{MaxPods: ptr(int32(200))}, prior)
+	if !strings.Contains(doc, "maxPods: 200") || *prior["maxPods"] != "250" {
+		t.Fatalf("200: prior %v\n%s", prior, doc)
+	}
+	got, _, _, _ := MergeKubelet(doc, Kubelet{}, prior)
+	if !strings.Contains(got, "maxPods: 250") {
+		t.Errorf("cleared after 300 then 200:\n%s", got)
 	}
 }
 
 func TestMergeKubelet_RefusesAConfigItCannotRead(t *testing.T) {
 	for _, doc := range []string{"", "- a list\n", "kind: [\n"} {
-		if _, _, err := MergeKubelet(doc, Kubelet{MaxPods: ptr(int32(200))}, Kubelet{}); err == nil {
+		if _, _, _, err := MergeKubelet(doc, Kubelet{MaxPods: ptr(int32(200))}, nil); err == nil {
 			t.Errorf("MergeKubelet(%q) = nil error", doc)
 		}
 	}

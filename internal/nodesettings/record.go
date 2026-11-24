@@ -7,16 +7,17 @@ import (
 )
 
 // Record is what the operator keeps on kube-system/kubelet-config, in
-// ConfigMapAnnotation: the settings the ConfigMap carries (their kubelet
-// fields are the ones k4all wrote into data.kubelet, and removes once
-// cleared), the settings of older hashes some node still has (to tell what
-// a node must do to move on), and when the last node finished its step.
+// ConfigMapAnnotation: the settings the ConfigMap carries, what each kubelet
+// field k4all owns had before k4all first wrote it (put back when the field
+// is cleared), the settings of older hashes some node still has (to tell
+// what a node must do to move on), and when the last node finished its step.
 //
 // The k4all-upgrade agent reads hash, hugepages and iommu: it applies a
 // target only when hash names it.
 type Record struct {
 	Hash string `json:"hash"`
 	Settings
+	Prior    Prior               `json:"prior,omitempty"`
 	History  map[string]Settings `json:"history,omitempty"`
 	LastDone *time.Time          `json:"lastDone,omitempty"`
 }

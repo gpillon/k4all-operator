@@ -182,8 +182,9 @@ func (r *NodeSettingsReconciler) input(ctx context.Context, config *k4allv1alpha
 		in.KubeletConfig = cm.Data[kubeletConfigKey]
 		if text, ok := cm.Annotations[nodesettings.ConfigMapAnnotation]; ok {
 			if in.Record, err = nodesettings.ParseRecord(text); err != nil {
-				// What k4all wrote is lost: nothing it wrote can be removed,
-				// every node is taken as having anything (drain-reboot).
+				// What k4all owned, and what was there before it, is lost:
+				// a cleared field is left as it is, and every node is taken
+				// as having anything (drain-reboot).
 				log.Error(err, "kubelet-config annotation unreadable: it is written again")
 				in.Record = nil
 			}
