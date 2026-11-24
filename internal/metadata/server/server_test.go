@@ -239,8 +239,19 @@ func TestOpenStack_VendorData(t *testing.T) {
 	f.write(f.vendor, metadata.KeyVendorData, "#cloud-config\npackages: [htop]\n")
 	wantBody(t, get(t, s, "/openstack/latest/vendor_data.json"),
 		`{"cloud-init":"#cloud-config\npackages: [htop]\n"}`+"\n")
-	// No dynamic vendor-data: cloud-init would apply it a second time.
-	wantBody(t, get(t, s, "/openstack/latest/vendor_data2.json"), "{}\n")
+}
+
+// KubeVirt gives a VM's NIC a new MAC at each start (unless the VM sets
+// one), and cloud-init pins the MAC in the network config of the first
+// boot: at the second boot the NIC is down (VM 970, Ubuntu 24.04 on a
+// DataVolume). k4all's own vendor-data (vendor_data2.json, beside the
+// admin's) lets cloud-init redo the network config at every boot, from
+// network_data.json, which describes the NIC that asks. cloud-init reads
+// the top-level "cloud-init" key of vendor_data2.json, not a provider's.
+func TestOpenStack_VendorData2RedoesTheNetworkAtEachBoot(t *testing.T) {
+	s := newFixture(t).server()
+	wantBody(t, get(t, s, "/openstack/latest/vendor_data2.json"),
+		`{"cloud-init":"#cloud-config\nupdates:\n  network:\n    when: [boot-new-instance, boot]\n"}`+"\n")
 }
 
 // network_data.json describes the NIC that asks (found by its address in
