@@ -2,11 +2,14 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -154,5 +157,48 @@ func TestClusterConfigStatus_OnlyTheReleaseReconcilersOwnPartsAreCopied(t *testi
 	}
 	if server.ActiveCNI != ciliumCNI {
 		t.Errorf("activeCNI %q, want the reconcile's", server.ActiveCNI)
+	}
+}
+
+// A condition type the release reconcile sets but releaseConditionTypes
+// does not list is never written (copyReleaseStatus copies only those): the
+// reconcile fails loudly instead, naming it, so a branch that adds a
+// condition and forgets the list fails its own tests through Reconcile
+// (those of PodNetworkOverlap and MigrationsAhead are such tests). Shown
+// with a list that leaves out Reconciled, which every reconcile sets.
+func TestReconcile_AConditionTypeTheReleaseReconcileSetsMustBeListed(t *testing.T) {
+	cl := newCluster(t,
+		map[string]k4allv1alpha1.ComponentSpec{"probe": {Type: "unsupported", Version: "1"}},
+		map[string]k4allv1alpha1.ComponentStatus{"probe": {State: k4allv1alpha1.ComponentStateInstalled, InstalledVersion: "1"}},
+	)
+	full := releaseConditionTypes
+	t.Cleanup(func() { releaseConditionTypes = full })
+	releaseConditionTypes = slices.DeleteFunc(slices.Clone(full), func(c string) bool { return c == "Reconciled" })
+
+	_, err := cl.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "k4all"}})
+
+	if err == nil || !strings.Contains(err.Error(), "Reconciled") || !strings.Contains(err.Error(), "releaseConditionTypes") {
+		t.Fatalf("Reconcile = %v, want an error naming Reconciled and releaseConditionTypes", err)
+	}
+
+	releaseConditionTypes = full
+	cl.reconcile() // fails the test on an error
+}
+
+// The node-settings controller's condition is not the release
+// reconciler's: listed, every release reconcile would remove it (its copy
+// has none of its own) or write back a stale one.
+func TestReleaseConditionTypes_LeaveOutOtherControllersConditions(t *testing.T) {
+	for _, foreign := range []string{k4allv1alpha1.ConditionNodeSettingsRollout} {
+		if slices.Contains(releaseConditionTypes, foreign) {
+			t.Errorf("releaseConditionTypes lists %s, another controller's condition", foreign)
+		}
+	}
+	seen := map[string]bool{}
+	for _, c := range releaseConditionTypes {
+		if seen[c] {
+			t.Errorf("releaseConditionTypes lists %s twice", c)
+		}
+		seen[c] = true
 	}
 }
