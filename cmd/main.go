@@ -158,6 +158,7 @@ func main() {
 		RestConfig: mgr.GetConfig(),
 		ToolsImage: toolsImage,
 		Log:        ctrl.Log.WithName("controllers").WithName("Release"),
+		APIReader:  mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Release")
 		os.Exit(1)

@@ -34,12 +34,14 @@ import (
 	"github.com/gpillon/k4all-operator/internal/engine"
 	"github.com/gpillon/k4all-operator/internal/migrations"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -56,6 +58,9 @@ type ReleaseReconciler struct {
 	RestConfig *rest.Config
 	ToolsImage string
 	Log        logr.Logger
+	// APIReader reads the ClusterConfig past the cache before its status is
+	// written; the Client when nil.
+	APIReader client.Reader
 
 	engine  *engine.Engine
 	hookReg *hooks.Registry
@@ -1068,20 +1073,37 @@ func setMigrationsAhead(conditions *[]metav1.Condition, generation int64, messag
 	})
 }
 
-// patchClusterConfigStatus writes config's status as it is in memory.
+// patchClusterConfigStatus writes what the ReleaseReconciler owns of
+// config's status (copyReleaseStatus) onto the ClusterConfig as the API
+// server has it now, under an optimistic lock, and reads it again on a
+// conflict. config was read at the start of the reconcile: patching its
+// whole status, conditions list and all, overwrote what another controller
+// (node settings) wrote in between.
 func (r *ReleaseReconciler) patchClusterConfigStatus(ctx context.Context, config *k4allv1alpha1.ClusterConfig) {
-	statusPayload := map[string]interface{}{
-		"status": config.Status,
-	}
-	raw, err := json.Marshal(statusPayload)
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest := &k4allv1alpha1.ClusterConfig{}
+		if err := r.reader().Get(ctx, client.ObjectKeyFromObject(config), latest); err != nil {
+			return err
+		}
+		base := latest.DeepCopy()
+		copyReleaseStatus(config.Status, &latest.Status)
+		if equality.Semantic.DeepEqual(base.Status, latest.Status) {
+			return nil
+		}
+		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
 	if err != nil {
-		r.Log.Error(err, "failed to marshal ClusterConfig status patch")
-		return
-	}
-	patch := client.RawPatch(types.MergePatchType, raw)
-	if err := r.Status().Patch(ctx, config, patch); err != nil {
 		r.Log.Error(err, "failed to update ClusterConfig status")
 	}
+}
+
+// reader reads past the manager's cache when the reconciler has an
+// APIReader: a write under an optimistic lock needs the latest version.
+func (r *ReleaseReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func isComponentInstalled(rm *k4allv1alpha1.ReleaseManifest, name string) bool {
