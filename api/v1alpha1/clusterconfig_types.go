@@ -229,7 +229,7 @@ type FeaturesConfig struct {
 	// Rook/Ceph storage, with the Cairn console. Optional: absent or not
 	// enabled, k4all installs no Rook.
 	// +optional
-	Rook RookConfig `json:"rook,omitempty"`
+	Rook *RookConfig `json:"rook,omitempty"` // a pointer: a Go client must not add rook: {} to a cluster without it
 	// ArgoCD GitOps feature
 	// +optional
 	ArgoCD ArgoCDConfig `json:"argocd,omitempty"`

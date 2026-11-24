@@ -515,7 +515,11 @@ func (in *DrainSpec) DeepCopy() *DrainSpec {
 func (in *FeaturesConfig) DeepCopyInto(out *FeaturesConfig) {
 	*out = *in
 	in.Virt.DeepCopyInto(&out.Virt)
-	in.Rook.DeepCopyInto(&out.Rook)
+	if in.Rook != nil {
+		in, out := &in.Rook, &out.Rook
+		*out = new(RookConfig)
+		(*in).DeepCopyInto(*out)
+	}
 	out.ArgoCD = in.ArgoCD
 	out.OVSCNI = in.OVSCNI
 	out.OVSBridge = in.OVSBridge
