@@ -3,6 +3,7 @@ package hooks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -392,7 +393,8 @@ func TestRookHook_KeepsTheCephClusterAsEdited(t *testing.T) {
 }
 
 // With the default small-cluster policy, 2 nodes get no Ceph cluster: Sync
-// says why, and the component's status shows it.
+// waits for a third node and says so, and the component's status shows it
+// as waiting, not as a hook failure.
 func TestRookHook_CreatesNothingBelowThreeNodes(t *testing.T) {
 	c := rookEnvtest(t)
 	rookNodes(t, c, 2)
@@ -400,8 +402,9 @@ func TestRookHook_CreatesNothingBelowThreeNodes(t *testing.T) {
 
 	err := syncRook(t, NewRookHook(c, logr.Discard()))
 
-	if err == nil || !strings.Contains(err.Error(), "this cluster has 2") {
-		t.Fatalf("Sync = %v, want the refusal for 2 nodes", err)
+	var waiting Waiting
+	if !errors.As(err, &waiting) || !strings.Contains(waiting.Reason, "this cluster has 2") {
+		t.Fatalf("Sync = %v, want it waiting for a third node", err)
 	}
 	cluster := newObject(cephAPIVersion, cephClusterKind, rookNamespace, cephClusterName)
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(cluster), cluster); !apierrors.IsNotFound(err) {

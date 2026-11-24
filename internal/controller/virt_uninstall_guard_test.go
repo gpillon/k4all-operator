@@ -165,8 +165,8 @@ func assertUninstalled(t *testing.T, c client.Client, name string, objects *core
 func TestReconcile_KubeVirtStaysWhileVMsExist(t *testing.T) {
 	virtWorkloadAPIs(t)
 	for _, tc := range []struct{ kind, want string }{
-		{"VirtualMachine", "uninstall refused: 1 VirtualMachine (default/vm1) exists: "},
-		{"VirtualMachineInstance", "uninstall refused: 1 VirtualMachineInstance (default/vm1) exists: "},
+		{"VirtualMachine", "uninstall refused: kubevirt: 1 VirtualMachine (default/vm1) exists: "},
+		{"VirtualMachineInstance", "uninstall refused: kubevirt: 1 VirtualMachineInstance (default/vm1) exists: "},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
 			c, r, objects := virtOnEnvtest(t, "kubevirt")
@@ -260,15 +260,15 @@ func TestReconcile_CDIStaysWhileItsVolumesExist(t *testing.T) {
 		obj  client.Object
 		want string
 	}{
-		{"a DataVolume", dv, "uninstall refused: 1 DataVolume (default/disk) exists: "},
+		{"a DataVolume", dv, "uninstall refused: cdi: 1 DataVolume (default/disk) exists: "},
 		// CDI v1.66 marks every PVC it makes for a DataVolume with this
 		// annotation; the DataVolume's own labels may replace its app label.
 		{"the PVC of a DataVolume", pvc("disk", map[string]string{"app": "web"},
 			map[string]string{"cdi.kubevirt.io/createdForDataVolume": "0c7e0d6a"}),
-			"uninstall refused: 1 PVC made by CDI (default/disk) exists: "},
+			"uninstall refused: cdi: 1 PVC made by CDI (default/disk) exists: "},
 		// The label of the PVCs CDI makes (scratch space of an import).
 		{"a PVC with CDI's label", pvc("disk-scratch", map[string]string{"app": "containerized-data-importer"}, nil),
-			"uninstall refused: 1 PVC made by CDI (default/disk-scratch) exists: "},
+			"uninstall refused: cdi: 1 PVC made by CDI (default/disk-scratch) exists: "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, r, objects := virtOnEnvtest(t, "cdi")
@@ -320,7 +320,7 @@ func TestReconcile_KubeVirtRefusalCountsTheVMsAndNamesAFew(t *testing.T) {
 
 	reconcileProbe(t, r)
 
-	assertUninstallRefused(t, c, "kubevirt", objects, "uninstall refused: "+
+	assertUninstallRefused(t, c, "kubevirt", objects, "uninstall refused: kubevirt: "+
 		"4 VirtualMachines (default/db, default/web-1, default/web-2, …) and "+
 		"2 VirtualMachineInstances (default/db, default/web-1) exist: delete them or set kubevirt Unmanaged first")
 }

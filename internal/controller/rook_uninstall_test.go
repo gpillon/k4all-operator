@@ -124,7 +124,7 @@ func TestReconcile_RookStaysWhileACephClusterExists(t *testing.T) {
 
 	st, ready := rookCephStatus(t, c)
 	if st.State != k4allv1alpha1.ComponentStateInstalled ||
-		!strings.HasPrefix(st.Message, "uninstall refused: CephCluster default/rook-ceph exists") {
+		!strings.HasPrefix(st.Message, "uninstall refused: rook-ceph: CephCluster default/rook-ceph exists") {
 		t.Fatalf("rook-ceph %s (%s), want Installed with the refusal", st.State, st.Message)
 	}
 	if ready == nil || ready.Status != "False" || ready.Reason != "UninstallRefused" {

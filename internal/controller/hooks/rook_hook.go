@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -238,13 +239,19 @@ func rookSeeds(settings RookSettings, image string) []rookSeed {
 	}
 }
 
-// plan is the Ceph plan for the nodes the cluster has now.
+// plan is the Ceph plan for the nodes the cluster has now. A refusal
+// (too few nodes) is Waiting: the CephCluster comes once the nodes do.
 func (h *RookHook) plan(ctx context.Context, settings RookSettings) (rookPlan, error) {
 	nodes := &corev1.NodeList{}
 	if err := h.client.List(ctx, nodes); err != nil {
 		return rookPlan{}, fmt.Errorf("list nodes: %w", err)
 	}
-	return planRook(cephNodes(nodes.Items), settings)
+	plan, err := planRook(cephNodes(nodes.Items), settings)
+	var refusal rookRefusal
+	if errors.As(err, &refusal) {
+		return rookPlan{}, Waiting{Reason: refusal.reason}
+	}
+	return plan, err
 }
 
 // UninstallBlocked refuses the uninstall of rook-ceph while a CephCluster
