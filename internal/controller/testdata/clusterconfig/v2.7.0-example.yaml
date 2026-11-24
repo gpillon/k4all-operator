@@ -1,0 +1,50 @@
+# The ClusterConfig of the k4all v2.7.0 spec (§3), every new field set, plus
+# the networking it leaves out ("unchanged") because spec.networking is required.
+apiVersion: k4all.magesgate.com/v1alpha1
+kind: ClusterConfig
+metadata:
+  name: k4all-cluster-config
+spec:
+  networking:
+    cni:
+      type: cilium
+  features:
+    virt:
+      enabled: true
+      emulation: auto
+      kubevirt:
+        featureGates: [Sidecar]
+        disabledFeatureGates: []
+        vmStateStorageClass: ceph-rbd
+      hangar:
+        nodeAgent: true
+      metadata:
+        enabled: true
+        scope: Labelled
+        tokens:
+          audiences: [k4all-metadata]
+          expirationSeconds: 3600
+        vendorDataConfigMap: k4all-vendor-data
+    rook:
+      enabled: false
+      storage:
+        deviceFilter: "^sdb$"
+      smallCluster: Refuse
+    argocd: {enabled: false}
+    ovsCni: {enabled: false}
+    ovsBridge: {enabled: true}
+  nodes:
+    kubelet:
+      maxPods: 250
+      cpuManagerPolicy: static
+      reservedSystemCPUs: "0-1"
+      topologyManagerPolicy: single-numa-node
+      topologyManagerScope: container
+    hugepages:
+      "1Gi": 4
+      "2Mi": 0
+    iommu: true
+    rollout:
+      paused: false
+  cluster:
+    podNetwork: "10.100.0.1/18"
