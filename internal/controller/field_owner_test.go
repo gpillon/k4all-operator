@@ -13,6 +13,7 @@ import (
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
+	"github.com/gpillon/k4all-operator/internal/engine"
 )
 
 // Every write of the operator is k4all-operator's in managedFields, not only
@@ -35,7 +36,7 @@ func operatorClient(t *testing.T) client.Client {
 func managedFieldsOf(t *testing.T, obj *unstructured.Unstructured, op metav1.ManagedFieldsOperationType) map[string]interface{} {
 	t.Helper()
 	for _, e := range obj.GetManagedFields() {
-		if e.Manager != "k4all-operator" || e.Operation != op || e.FieldsV1 == nil {
+		if e.Manager != engine.FieldManager || e.Operation != op || e.FieldsV1 == nil {
 			continue
 		}
 		fields := map[string]interface{}{}
