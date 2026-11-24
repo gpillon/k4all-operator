@@ -205,6 +205,15 @@ func TestClusterUpgrade_DrainsTheNodeThenAsksForTheHop(t *testing.T) {
 	if err := b.c.Delete(context.Background(), app, client.GracePeriodSeconds(0)); client.IgnoreNotFound(err) != nil {
 		t.Fatal(err)
 	}
+	// Only the operator is left: it evicts itself before the hop (k4all#97).
+	b.reconcile()
+	if !b.evicted(self) {
+		t.Errorf("the operator's own pod was not evicted once the rest had gone")
+	}
+	if _, asked := b.node("cu-cp").Annotations[k4allv1alpha1.NodeUpgradeTargetAnnotation]; asked {
+		t.Errorf("upgrade-target set in the reconcile that evicted the operator")
+	}
+	// Without a NodeLock (here) the reconciler goes on as if its pod stayed.
 	cu := b.reconcile()
 	if got := b.node("cu-cp").Annotations[k4allv1alpha1.NodeUpgradeTargetAnnotation]; got != nextRelease {
 		t.Errorf("cu-cp upgrade-target = %q, want v2.6.0", got)

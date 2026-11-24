@@ -147,6 +147,11 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "ebd8f187.magesgate.com",
+		// The operator evicts its own pod from a node it drains (k4all#97):
+		// the lease goes with the stopping pod, so the next one leads at once
+		// instead of after the lease expires. main returns as soon as the
+		// manager stops, which this needs.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -173,12 +178,17 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "NodeConfig")
 		os.Exit(1)
 	}
+	// The ClusterUpgrade and the node-settings rollout change one node at a
+	// time between them.
+	nodeLock := &controller.NodeLock{}
+	self := types.NamespacedName{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("POD_NAME")}
 	if err := (&controller.ClusterUpgradeReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		APIReader: mgr.GetAPIReader(),
 		Graphs:    &upgradegraph.Fetcher{},
-		Self:      types.NamespacedName{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("POD_NAME")},
+		Self:      self,
+		Lock:      nodeLock,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterUpgrade")
 		os.Exit(1)
@@ -191,6 +201,16 @@ func main() {
 		Log:       ctrl.Log.WithName("controllers").WithName("Metadata"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Metadata")
+		os.Exit(1)
+	}
+	if err := (&controller.NodeSettingsReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		APIReader: mgr.GetAPIReader(),
+		Self:      self,
+		Lock:      nodeLock,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NodeSettings")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
