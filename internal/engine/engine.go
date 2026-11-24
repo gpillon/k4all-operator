@@ -51,12 +51,19 @@ type ReconcileOption func(*reconcileOptions)
 
 type reconcileOptions struct {
 	waitUntilReady bool
+	mutator        ObjectMutator
 }
 
 // WaitUntilReady makes Helm components return only once their resources are
 // ready, so the next upgradePath step starts from a healthy release.
 func WaitUntilReady() ReconcileOption {
 	return func(o *reconcileOptions) { o.waitUntilReady = true }
+}
+
+// MutateObjects makes a manifest component's apply pass its objects through
+// m before applying them (ObjectMutator). nil changes nothing.
+func MutateObjects(m ObjectMutator) ReconcileOption {
+	return func(o *reconcileOptions) { o.mutator = m }
 }
 
 // ReconcileComponent installs or upgrades a single component.
@@ -96,7 +103,7 @@ func (e *Engine) ReconcileComponent(
 	case k4allv1alpha1.ComponentTypeHelm, k4allv1alpha1.ComponentTypeHelmOCI:
 		err = e.helm.Reconcile(ctx, name, spec, values, o.waitUntilReady)
 	case k4allv1alpha1.ComponentTypeManifest:
-		err = e.manifest.Apply(ctx, name, spec)
+		err = e.manifest.Apply(ctx, name, spec, o.mutator)
 	case k4allv1alpha1.ComponentTypeBinary:
 		err = e.binary.Install(ctx, name, spec)
 	case k4allv1alpha1.ComponentTypeStaticPod:

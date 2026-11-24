@@ -7,7 +7,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-func TestMergeAdditive(t *testing.T) {
+// With no ownership, the merge is the union v0.5.5 brought: the CR's entries,
+// then upstream's.
+func TestMergeShared_Union(t *testing.T) {
 	hotplug := [][2]string{{"HotplugVolumes", "DeclarativeHotplugVolumes"}}
 	for _, tc := range []struct {
 		name           string
@@ -45,8 +47,8 @@ func TestMergeAdditive(t *testing.T) {
 			want: []string{"Snapshot", "DeclarativeHotplugVolumes"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := mergeAdditive(tc.live, tc.upstream, tc.exclusive); !slices.Equal(got, tc.want) {
-				t.Errorf("mergeAdditive(%v, %v) = %v, want %v", tc.live, tc.upstream, got, tc.want)
+			if got := mergeShared(tc.live, tc.upstream, ListOwnership{}, tc.exclusive); !slices.Equal(got, tc.want) {
+				t.Errorf("mergeShared(%v, %v) = %v, want %v", tc.live, tc.upstream, got, tc.want)
 			}
 		})
 	}
@@ -183,5 +185,133 @@ func TestKeepLiveEntries_OnlyTheKnownLists(t *testing.T) {
 	}
 	if got, _, _ := unstructured.NestedStringSlice(other.Object, "spec", "configuration", "developerConfiguration", "featureGates"); len(got) != 0 {
 		t.Errorf("example.com/v1 KubeVirt: list = %v, want upstream's", got)
+	}
+}
+
+// The gate merge of spec §7.2, one row per rule:
+//
+//	featureGates         = ((L − (A − E)) ∪ E ∪ U) − D
+//	disabledFeatureGates = ((LD − (AD − D)) ∪ D) − E
+//
+// the second being the first with the roles of on and off swapped and no
+// upstream list.
+func TestMergeShared(t *testing.T) {
+	hotplug := [][2]string{{"HotplugVolumes", "DeclarativeHotplugVolumes"}}
+	for _, tc := range []struct {
+		name           string
+		live, upstream []string
+		own            ListOwnership
+		exclusive      [][2]string
+		want           []string
+	}{
+		{name: "a gate the ClusterConfig turns on is added after the CR's",
+			live: []string{"HostDevices"}, own: ListOwnership{On: []string{"Sidecar"}},
+			want: []string{"HostDevices", "Sidecar"}},
+		{name: "a gate k4all added and the ClusterConfig no longer lists is removed",
+			live: []string{"HostDevices", "Sidecar"}, own: ListOwnership{Added: []string{"Sidecar"}},
+			want: []string{"HostDevices"}},
+		{name: "a gate k4all did not add stays when the ClusterConfig drops it",
+			live: []string{"HostDevices", "Sidecar"},
+			own:  ListOwnership{Added: []string{"Sidecar"}, On: []string{"Sidecar"}},
+			want: []string{"HostDevices", "Sidecar"}},
+		{name: "a gate k4all added and still lists stays where it is",
+			live: []string{"Sidecar", "HostDevices"},
+			own:  ListOwnership{Added: []string{"Sidecar"}, On: []string{"Sidecar"}},
+			want: []string{"Sidecar", "HostDevices"}},
+		{name: "a gate turned off is removed, whoever set it",
+			live: []string{"HostDevices", "Snapshot"}, own: ListOwnership{Off: []string{"Snapshot"}},
+			want: []string{"HostDevices"}},
+		{name: "upgrade from an operator that wrote no annotation: nothing is removed",
+			live: []string{"HostDevices", "Sidecar", "Snapshot"}, own: ListOwnership{},
+			want: []string{"HostDevices", "Sidecar", "Snapshot"}},
+		{name: "upstream's entry stays though k4all had added it",
+			live: []string{"HonorWaitForFirstConsumer"}, upstream: []string{"HonorWaitForFirstConsumer"},
+			own:  ListOwnership{Added: []string{"HonorWaitForFirstConsumer"}},
+			want: []string{"HonorWaitForFirstConsumer"}},
+		{name: "upstream's entry turned off is left out",
+			upstream: []string{"HonorWaitForFirstConsumer"}, own: ListOwnership{Off: []string{"HonorWaitForFirstConsumer"}},
+			want: []string{}},
+		{name: "the ClusterConfig's gates come before upstream's",
+			live: []string{"A"}, upstream: []string{"U"}, own: ListOwnership{On: []string{"E"}},
+			want: []string{"A", "E", "U"}},
+		{name: "exclusive pair: the gate in the CR wins over the ClusterConfig's",
+			live: []string{"HotplugVolumes"}, own: ListOwnership{On: []string{"DeclarativeHotplugVolumes"}},
+			exclusive: hotplug, want: []string{"HotplugVolumes"}},
+		{name: "exclusive pair: k4all's own gate gives way to the one it now turns on",
+			live:      []string{"HotplugVolumes"},
+			own:       ListOwnership{Added: []string{"HotplugVolumes"}, On: []string{"DeclarativeHotplugVolumes"}},
+			exclusive: hotplug, want: []string{"DeclarativeHotplugVolumes"}},
+		{name: "exclusive pair: a partner turned off makes room",
+			live:      []string{"HotplugVolumes"},
+			own:       ListOwnership{On: []string{"DeclarativeHotplugVolumes"}, Off: []string{"HotplugVolumes"}},
+			exclusive: hotplug, want: []string{"DeclarativeHotplugVolumes"}},
+		{name: "exclusive pair: the ClusterConfig's gate wins over upstream's",
+			upstream: []string{"DeclarativeHotplugVolumes"}, own: ListOwnership{On: []string{"HotplugVolumes"}},
+			exclusive: hotplug, want: []string{"HotplugVolumes"}},
+		{name: "disabledFeatureGates: k4all's stale entry out, the ClusterConfig's in, a gate turned on out",
+			live: []string{"DownwardMetrics", "VSOCK", "Sidecar"},
+			own: ListOwnership{Added: []string{"VSOCK"}, On: []string{"Snapshot"},
+				Off: []string{"DownwardMetrics"}},
+			want: []string{"Sidecar", "Snapshot"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mergeShared(tc.live, tc.upstream, tc.own, tc.exclusive); !slices.Equal(got, tc.want) {
+				t.Errorf("mergeShared(%v, %v, %+v) = %v, want %v", tc.live, tc.upstream, tc.own, got, tc.want)
+			}
+		})
+	}
+}
+
+// MergeSharedList writes the merge into the object about to be applied. An
+// empty result is left out when the CR has nothing to clear (spec R5), and
+// written empty when it has: the entries are all k4all's to remove, and
+// leaving the list out of the apply removes it only while k4all-operator
+// owns it.
+func TestMergeSharedList(t *testing.T) {
+	kvGates := []string{"spec", "configuration", "developerConfiguration", "featureGates"}
+	stripped := decodeOne(t, upstreamKubeVirt)
+	unstructured.RemoveNestedField(stripped.Object, kvGates...)
+	for _, tc := range []struct {
+		name    string
+		desired *unstructured.Unstructured
+		live    *unstructured.Unstructured
+		own     ListOwnership
+		want    []string // nil: left out
+	}{
+		{name: "fresh install, nothing to turn on: left out",
+			desired: stripped, live: nil, want: nil},
+		{name: "fresh install: the ClusterConfig's gates",
+			desired: stripped, live: nil, own: ListOwnership{On: []string{"Sidecar"}}, want: []string{"Sidecar"}},
+		{name: "nothing on either side: left out",
+			desired: stripped, live: withList(t, stripped, []string{}, kvGates...), want: nil},
+		{name: "k4all removes the last gate: written empty",
+			desired: stripped, live: withList(t, stripped, []string{"Sidecar"}, kvGates...),
+			own: ListOwnership{Added: []string{"Sidecar"}}, want: []string{}},
+		{name: "a gate turned off was the only one: written empty",
+			desired: stripped, live: withList(t, stripped, []string{"Snapshot"}, kvGates...),
+			own: ListOwnership{Off: []string{"Snapshot"}}, want: []string{}},
+		{name: "the exclusive pair of the KubeVirt list applies",
+			desired: stripped, live: withList(t, stripped, []string{"HotplugVolumes"}, kvGates...),
+			own: ListOwnership{On: []string{"DeclarativeHotplugVolumes"}}, want: []string{"HotplugVolumes"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desired := tc.desired.DeepCopy()
+			if err := MergeSharedList(desired, tc.live, kvGates, tc.own); err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := unstructured.NestedStringSlice(desired.Object, kvGates...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == nil {
+				if found {
+					t.Errorf("list = %v, want it left out", got)
+				}
+				return
+			}
+			if !found || !slices.Equal(got, tc.want) {
+				t.Errorf("list = %v (set: %v), want %v", got, found, tc.want)
+			}
+		})
 	}
 }
