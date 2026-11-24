@@ -486,8 +486,17 @@ func TestRookHook_CreatesThePoolAndClassesForVMs(t *testing.T) {
 
 	profile := getObject(t, c, "cdi.kubevirt.io/v1beta1", "StorageProfile", "", "ceph-rbd")
 	isSeed(t, profile)
+	// VM disks default to the first set, shared block volumes (live
+	// migration). KubeVirt creates the persistent VM state (EFI, TPM) on
+	// vmStateStorageClass as a Filesystem volume and picks its access mode
+	// from the profile's Filesystem sets: without one, with ceph-rbd as
+	// vmStateStorageClass, those VMs would never start. RBD has no RWX
+	// Filesystem; on RWO KubeVirt copies the state when the VM migrates.
 	sets, _, _ := unstructured.NestedSlice(profile.Object, "spec", "claimPropertySets")
-	want := []interface{}{map[string]interface{}{"accessModes": []interface{}{"ReadWriteMany"}, "volumeMode": "Block"}}
+	want := []interface{}{
+		map[string]interface{}{"accessModes": []interface{}{"ReadWriteMany"}, "volumeMode": "Block"},
+		map[string]interface{}{"accessModes": []interface{}{"ReadWriteOnce"}, "volumeMode": "Filesystem"},
+	}
 	if !reflect.DeepEqual(sets, want) {
 		t.Errorf("StorageProfile claimPropertySets %v, want %v", sets, want)
 	}
