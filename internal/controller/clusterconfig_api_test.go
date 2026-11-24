@@ -23,6 +23,8 @@ import (
 var (
 	v270Example = filepath.Join("testdata", "clusterconfig", "v2.7.0-example.yaml")
 	v26Default  = filepath.Join("testdata", "clusterconfig", "v2.6-default.yaml")
+	// v26Default as the operator's Go types write it back.
+	v26DefaultGoUpdate = filepath.Join("testdata", "clusterconfig", "v2.6-default-go-update.yaml")
 )
 
 // clusterConfigFile reads a ClusterConfig manifest and renames it, so that
@@ -128,7 +130,7 @@ func TestClusterConfigAPI_V270ExampleDecodes(t *testing.T) {
 					VendorDataConfigMap: "k4all-vendor-data",
 				},
 			},
-			Rook: k4allv1alpha1.RookConfig{
+			Rook: &k4allv1alpha1.RookConfig{
 				Storage:      &k4allv1alpha1.RookStorage{DeviceFilter: "^sdb$"},
 				SmallCluster: k4allv1alpha1.RookSmallClusterRefuse,
 			},
@@ -176,21 +178,23 @@ func TestClusterConfigAPI_V26ConfigGrowsNoNewField(t *testing.T) {
 	if err := c.Update(ctx, typed); err != nil {
 		t.Fatal(err)
 	}
-	spec := readClusterConfig(t, c, sent.GetName()).Object["spec"].(map[string]interface{})
-	if _, ok := spec["nodes"]; ok {
-		t.Errorf("after a Go client update, spec.nodes = %v, want it absent", spec["nodes"])
+	// The Go types drop the zero values v2.6.x wrote (as v0.5.x did), and add
+	// no key of their own: not even features.rook: {}.
+	updated := asJSON(t, readClusterConfig(t, c, sent.GetName()).Object["spec"])
+	wantUpdated := asJSON(t, clusterConfigFile(t, v26DefaultGoUpdate, "").Object["spec"])
+	if updated != wantUpdated {
+		t.Errorf("v2.6.x spec after a Go client update:\n%s\nwant:\n%s", updated, wantUpdated)
 	}
-	virt, _, _ := unstructured.NestedMap(spec, "features", "virt")
-	for _, f := range []string{"kubevirt", "hangar", "metadata"} {
-		if v, ok := virt[f]; ok {
-			t.Errorf("after a Go client update, spec.features.virt.%s = %v, want it absent", f, v)
-		}
+}
+
+// asJSON is v as JSON with sorted keys, numbers as encoding/json decodes them.
+func asJSON(t *testing.T, v interface{}) string {
+	t.Helper()
+	b, err := json.Marshal(viaJSON(t, v))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// FeaturesConfig.Rook is a struct, which encoding/json does not omit: a
-	// Go client writes rook: {}, the same as absent. It must stay empty.
-	if rook, found, _ := unstructured.NestedMap(spec, "features", "rook"); found && len(rook) > 0 {
-		t.Errorf("after a Go client update, spec.features.rook = %v, want it absent or {}", rook)
-	}
+	return string(b)
 }
 
 // minimalClusterConfig is a ClusterConfig with only the required fields, for
