@@ -317,26 +317,63 @@ func podPatch(image string, s MetadataSettings) string {
 		metadata.PodLabels, metadata.PodAnnotations, metadata.PodNamespace, metadata.SecretPrefix)
 }
 
-// vmiPolicy defaults the SMBIOS chassis asset tag of the VMIs whose pod the
-// pod policy serves (same scope and namespaces, a masquerade interface):
-// without it cloud-init never asks an OpenStack metadata service, and with
-// it but no server, cloud-init would wait for one.
+// vmiPolicy prepares, at their CREATE, the VMIs whose pod the pod policy
+// serves (same scope and namespaces, a masquerade interface):
+//   - the SMBIOS chassis asset tag "OpenStack Nova", when the VM's spec
+//     has none: without it cloud-init never asks an OpenStack metadata
+//     service, and with it but no server cloud-init would wait for one. A
+//     tag set by the user stays (the metadata controller warns on the VM);
+//   - a MAC on the masquerade interface, when it has none and a VM
+//     controls the VMI: KubeVirt draws a new MAC at each start, and the
+//     guest's network config of its first boot names the MAC, so on a
+//     persistent disk the NIC would be down after a restart. The MAC comes
+//     from the VM's UID (the VMI's changes at each start): 02 (locally
+//     administered, unicast) and the UID's first 5 bytes, random in a
+//     UUID. A masquerade NIC is seen by its own pod only: no other host
+//     shares its segment. An explicit MAC (Hangar's, KubeMacPool's) is
+//     the VM's and stays.
 func vmiPolicy(s MetadataSettings) *unstructured.Unstructured {
 	spec := map[string]any{
 		"failurePolicy":      "Ignore",
 		"reinvocationPolicy": "Never",
 		"matchConstraints":   matchConstraints("kubevirt.io", "virtualmachineinstances", objectSelector(s, nil)),
+		"variables": []any{
+			map[string]any{"name": "masquerade",
+				"expression": "object.spec.domain.devices.interfaces.filter(i, has(i.masquerade))"},
+			map[string]any{"name": "vmUID", "expression": vmControllerUID},
+		},
 		"matchConditions": []any{
 			condition("masquerade-interface", masqueradeInterface),
-			condition("no-asset-tag",
-				"!has(object.spec.domain.chassis) || !has(object.spec.domain.chassis.asset) || object.spec.domain.chassis.asset == ''"),
 		},
-		"mutations": jsonPatch(fmt.Sprintf(`has(object.spec.domain.chassis)
+		"mutations": append(jsonPatch(fmt.Sprintf(`!has(object.spec.domain.chassis)
+  ? [JSONPatch{op: "add", path: "/spec/domain/chassis", value: {"asset": %[1]s}}]
+  : !has(object.spec.domain.chassis.asset) || object.spec.domain.chassis.asset == ""
   ? [JSONPatch{op: "add", path: "/spec/domain/chassis/asset", value: %[1]s}]
-  : [JSONPatch{op: "add", path: "/spec/domain/chassis", value: {"asset": %[1]s}}]`, celString(metadata.ChassisAsset))),
+  : []`, celString(metadata.ChassisAsset))), jsonPatch(stableMAC)...),
 	}
 	return admissionObject("MutatingAdmissionPolicy", MetadataVMIPolicy, spec)
 }
+
+// vmControllerUID is the UID of the VirtualMachine that controls the VMI,
+// as hex digits ("" for a VMI without one).
+const vmControllerUID = `has(object.metadata.ownerReferences) &&
+object.metadata.ownerReferences.exists_one(r, r.kind == "VirtualMachine" && r.apiVersion.startsWith("kubevirt.io/") &&
+  has(r.controller) && r.controller)
+? object.metadata.ownerReferences.filter(r, r.kind == "VirtualMachine" && r.apiVersion.startsWith("kubevirt.io/") &&
+    has(r.controller) && r.controller)[0].uid.replace("-", "").lowerAscii()
+: ""`
+
+// stableMAC sets the MAC of the VMI's (one) masquerade interface from its
+// VM's UID, when the interface has none.
+const stableMAC = `size(variables.vmUID) >= 10 &&
+(!has(variables.masquerade[0].macAddress) || variables.masquerade[0].macAddress == "")
+? [JSONPatch{
+    op: "add",
+    path: "/spec/domain/devices/interfaces/" +
+      string(object.spec.domain.devices.interfaces.indexOf(variables.masquerade[0])) + "/macAddress",
+    value: "02:" + [0, 2, 4, 6, 8].map(i, variables.vmUID.substring(i, i + 2)).join(":")
+  }]
+: []`
 
 // masqueradeInterface: an interface of the VMI has the masquerade binding.
 // A VMI that lists none gets KubeVirt's default interface (the binding of

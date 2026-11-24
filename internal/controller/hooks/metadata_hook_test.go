@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -497,11 +498,142 @@ func vmi(labels map[string]string, domain map[string]any) *unstructured.Unstruct
 
 func admitVMI(t *testing.T, md *k4allv1alpha1.MetadataSettings, obj *unstructured.Unstructured, ns *corev1.Namespace) string {
 	t.Helper()
+	asset, _, _ := unstructured.NestedString(admitVMIObject(t, md, obj, ns).Object, "spec", "domain", "chassis", "asset")
+	return asset
+}
+
+func admitVMIObject(t *testing.T, md *k4allv1alpha1.MetadataSettings, obj *unstructured.Unstructured,
+	ns *corev1.Namespace) *unstructured.Unstructured {
+	t.Helper()
 	objs := mdObjects(t, md)
 	out, _ := admit(t, objs["MutatingAdmissionPolicy/"+MetadataVMIPolicy], objs["MutatingAdmissionPolicyBinding/"+MetadataVMIPolicy],
 		obj, vmisGVR, ns)
-	asset, _, _ := unstructured.NestedString(out.(*unstructured.Unstructured).Object, "spec", "domain", "chassis", "asset")
-	return asset
+	return out.(*unstructured.Unstructured)
+}
+
+// vmOwned is a VMI the VM of UID vmUID started (its VMI UID: vmiUID), as
+// KubeVirt's VM controller creates it: a controller ownerReference.
+func vmOwned(vmUID, vmiUID string, domain map[string]any) *unstructured.Unstructured {
+	u := vmi(labelled, domain)
+	u.SetUID(types.UID(vmiUID))
+	u.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "kubevirt.io/v1", Kind: "VirtualMachine", Name: "web", UID: types.UID(vmUID),
+		Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true),
+	}})
+	return u
+}
+
+// macs are the macAddress of each interface of a VMI ("" without one).
+func macs(t *testing.T, u *unstructured.Unstructured) []string {
+	t.Helper()
+	ifaces, _, _ := unstructured.NestedSlice(u.Object, "spec", "domain", "devices", "interfaces")
+	out := make([]string, 0, len(ifaces))
+	for _, i := range ifaces {
+		mac, _ := i.(map[string]any)["macAddress"].(string)
+		out = append(out, mac)
+	}
+	return out
+}
+
+const (
+	vmA = "d4793485-2698-4d0d-a537-62431b51cc7e"
+	vmB = "7f570bd6-4deb-4be7-b03b-cfad6320d6b0"
+	// macA is vmA's NIC's MAC: 02 and the UID's first 5 bytes.
+	macA = "02:d4:79:34:85:26"
+)
+
+// KubeVirt gives a NIC without macAddress a new MAC at each start, and a
+// guest's network config (cloud-init's of the first boot) names the MAC:
+// on a persistent disk the NIC is down after a restart. A served VM's
+// masquerade NIC gets a MAC of its own VM's UID instead: locally
+// administered (02:), the UID's first 5 bytes, the same at every start
+// (the VMI's UID changes at each).
+func TestVMIPolicy_AStableMACFromTheVMsUID(t *testing.T) {
+	md := &k4allv1alpha1.MetadataSettings{Enabled: true}
+	ns := namespace(nil)
+	first := macs(t, admitVMIObject(t, md, vmOwned(vmA, "vmi-uid-1", nil), ns))
+	again := macs(t, admitVMIObject(t, md, vmOwned(vmA, "vmi-uid-2", nil), ns))
+	other := macs(t, admitVMIObject(t, md, vmOwned(vmB, "vmi-uid-3", nil), ns))
+	if first[0] != macA {
+		t.Fatalf("MAC %q, want %s", first[0], macA)
+	}
+	if again[0] != first[0] {
+		t.Fatalf("the same VM restarted got %q, then %q", first[0], again[0])
+	}
+	if other[0] != "02:7f:57:0b:d6:4d" || other[0] == first[0] {
+		t.Fatalf("another VM got %q", other[0])
+	}
+}
+
+// A MAC in the VM's spec (Hangar sets one at create and clone, or
+// KubeMacPool) is the VM's: never touched.
+func TestVMIPolicy_AnExplicitMACIsNeverTouched(t *testing.T) {
+	domain := map[string]any{"devices": map[string]any{"interfaces": []any{
+		map[string]any{"name": "default", "masquerade": map[string]any{}, "macAddress": "02:aa:bb:cc:dd:ee"},
+	}}}
+	if got := macs(t, admitVMIObject(t, &k4allv1alpha1.MetadataSettings{Enabled: true}, vmOwned(vmA, "v1", domain), namespace(nil))); got[0] != "02:aa:bb:cc:dd:ee" {
+		t.Fatalf("MAC %q", got[0])
+	}
+}
+
+// Only the masquerade NIC: a bridged one keeps KubeVirt's MAC.
+func TestVMIPolicy_TheMACOnlyOnTheMasqueradeNIC(t *testing.T) {
+	domain := map[string]any{"devices": map[string]any{"interfaces": []any{
+		map[string]any{"name": "vlan6", "bridge": map[string]any{}},
+		map[string]any{"name": "default", "masquerade": map[string]any{}},
+	}}}
+	got := macs(t, admitVMIObject(t, &k4allv1alpha1.MetadataSettings{Enabled: true}, vmOwned(vmA, "v1", domain), namespace(nil)))
+	if got[0] != "" || got[1] != macA {
+		t.Fatalf("MACs %q", got)
+	}
+}
+
+// A VMI without a VM has no UID that outlives it: KubeVirt's MAC stays.
+// So does one whose owner is not its controlling VM.
+func TestVMIPolicy_ABareVMIIsLeftAlone(t *testing.T) {
+	md := &k4allv1alpha1.MetadataSettings{Enabled: true}
+	bare := admitVMIObject(t, md, vmi(labelled, nil), namespace(nil))
+	if got := macs(t, bare); got[0] != "" {
+		t.Fatalf("a bare VMI got MAC %q", got[0])
+	}
+	if asset, _, _ := unstructured.NestedString(bare.Object, "spec", "domain", "chassis", "asset"); asset != metadata.ChassisAsset {
+		t.Fatalf("a bare VMI's asset %q: it is served, it needs the tag", asset)
+	}
+	notController := vmOwned(vmA, "v1", nil)
+	refs := notController.GetOwnerReferences()
+	refs[0].Controller = nil
+	notController.SetOwnerReferences(refs)
+	if got := macs(t, admitVMIObject(t, md, notController, namespace(nil))); got[0] != "" {
+		t.Fatalf("a VMI its VM does not control got MAC %q", got[0])
+	}
+}
+
+// The MAC goes where the policy serves, as the asset tag.
+func TestVMIPolicy_TheMACOnlyWhereThePodIsServed(t *testing.T) {
+	md := &k4allv1alpha1.MetadataSettings{Enabled: true}
+	unlabelled := vmOwned(vmA, "v1", nil)
+	unlabelled.SetLabels(nil)
+	if got := macs(t, admitVMIObject(t, md, unlabelled, namespace(nil))); got[0] != "" {
+		t.Fatalf("unlabelled VMI got MAC %q", got[0])
+	}
+	baseline := namespace(map[string]string{"pod-security.kubernetes.io/enforce": "baseline"})
+	if got := macs(t, admitVMIObject(t, md, vmOwned(vmA, "v1", nil), baseline)); got[0] != "" {
+		t.Fatalf("baseline namespace: MAC %q", got[0])
+	}
+}
+
+// The policy sets "OpenStack Nova" only where the VM's spec has no asset
+// tag; one set by the user stays (the metadata controller puts a Warning
+// Event on the VM), and the MAC is set all the same.
+func TestVMIPolicy_NeverReplacesTheUsersAssetTag(t *testing.T) {
+	out := admitVMIObject(t, &k4allv1alpha1.MetadataSettings{Enabled: true},
+		vmOwned(vmA, "v1", map[string]any{"chassis": map[string]any{"asset": "ACME-42"}}), namespace(nil))
+	if asset, _, _ := unstructured.NestedString(out.Object, "spec", "domain", "chassis", "asset"); asset != "ACME-42" {
+		t.Fatalf("the user's asset became %q", asset)
+	}
+	if got := macs(t, out); got[0] != macA {
+		t.Fatalf("MAC %q", got[0])
+	}
 }
 
 // Without the asset tag cloud-init's ds-identify never looks for an

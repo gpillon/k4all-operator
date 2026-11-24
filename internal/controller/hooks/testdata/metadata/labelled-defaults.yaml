@@ -149,9 +149,6 @@ spec:
       has(object.spec.domain.devices) && has(object.spec.domain.devices.interfaces) &&
       object.spec.domain.devices.interfaces.exists(i, has(i.masquerade))
     name: masquerade-interface
-  - expression: '!has(object.spec.domain.chassis) || !has(object.spec.domain.chassis.asset)
-      || object.spec.domain.chassis.asset == '''''
-    name: no-asset-tag
   matchConstraints:
     namespaceSelector:
       matchExpressions:
@@ -175,11 +172,36 @@ spec:
   mutations:
   - jsonPatch:
       expression: |-
-        has(object.spec.domain.chassis)
+        !has(object.spec.domain.chassis)
+          ? [JSONPatch{op: "add", path: "/spec/domain/chassis", value: {"asset": "OpenStack Nova"}}]
+          : !has(object.spec.domain.chassis.asset) || object.spec.domain.chassis.asset == ""
           ? [JSONPatch{op: "add", path: "/spec/domain/chassis/asset", value: "OpenStack Nova"}]
-          : [JSONPatch{op: "add", path: "/spec/domain/chassis", value: {"asset": "OpenStack Nova"}}]
+          : []
+    patchType: JSONPatch
+  - jsonPatch:
+      expression: |-
+        size(variables.vmUID) >= 10 &&
+        (!has(variables.masquerade[0].macAddress) || variables.masquerade[0].macAddress == "")
+        ? [JSONPatch{
+            op: "add",
+            path: "/spec/domain/devices/interfaces/" +
+              string(object.spec.domain.devices.interfaces.indexOf(variables.masquerade[0])) + "/macAddress",
+            value: "02:" + [0, 2, 4, 6, 8].map(i, variables.vmUID.substring(i, i + 2)).join(":")
+          }]
+        : []
     patchType: JSONPatch
   reinvocationPolicy: Never
+  variables:
+  - expression: object.spec.domain.devices.interfaces.filter(i, has(i.masquerade))
+    name: masquerade
+  - expression: |-
+      has(object.metadata.ownerReferences) &&
+      object.metadata.ownerReferences.exists_one(r, r.kind == "VirtualMachine" && r.apiVersion.startsWith("kubevirt.io/") &&
+        has(r.controller) && r.controller)
+      ? object.metadata.ownerReferences.filter(r, r.kind == "VirtualMachine" && r.apiVersion.startsWith("kubevirt.io/") &&
+          has(r.controller) && r.controller)[0].uid.replace("-", "").lowerAscii()
+      : ""
+    name: vmUID
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicyBinding
