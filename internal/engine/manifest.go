@@ -249,11 +249,16 @@ func (m *ManifestApplier) serverSideApply(ctx context.Context, obj *unstructured
 	})
 }
 
+// FieldManager is the field manager of every write of the operator: its
+// server-side applies, and its creates, updates and patches through the
+// manager's client (spec R3, §16.2). Consoles tell what k4all owns from it.
+const FieldManager = "k4all-operator"
+
 // apply server-side applies obj as the k4all-operator, taking over the fields
 // it sets from any other manager.
 func (m *ManifestApplier) apply(ctx context.Context, obj *unstructured.Unstructured) error {
 	return m.client.Patch(ctx, obj, client.Apply,
-		client.FieldOwner("k4all-operator"),
+		client.FieldOwner(FieldManager),
 		client.ForceOwnership,
 	)
 }
