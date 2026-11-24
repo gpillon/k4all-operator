@@ -973,7 +973,7 @@ func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, confi
 	if config.Spec.Networking.CNI.Type == ciliumCNI {
 		meta.SetStatusCondition(&config.Status.Conditions, r.podNetworkOverlap(ctx, config, rm))
 	} else {
-		meta.RemoveStatusCondition(&config.Status.Conditions, PodNetworkOverlapCondition)
+		meta.RemoveStatusCondition(&config.Status.Conditions, k4allv1alpha1.ConditionPodNetworkOverlap)
 	}
 	if cond, ok := r.rookReadyCondition(ctx, config, rm); ok {
 		meta.SetStatusCondition(&config.Status.Conditions, cond)
