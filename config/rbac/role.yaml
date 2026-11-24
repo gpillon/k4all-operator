@@ -23,6 +23,13 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
   - namespaces
   verbs:
   - create
@@ -45,6 +52,16 @@ rules:
   - pods/eviction
   verbs:
   - create
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - mutatingadmissionpolicies
+  - mutatingadmissionpolicybindings
+  verbs:
+  - create
+  - delete
+  - get
+  - patch
 - apiGroups:
   - admissionregistration.k8s.io
   resources:
@@ -145,6 +162,14 @@ rules:
   - releasemanifests/finalizers
   verbs:
   - update
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachines
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - networking.k8s.io
   resources:

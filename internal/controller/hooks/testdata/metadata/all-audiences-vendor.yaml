@@ -1,0 +1,207 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  labels:
+    app.kubernetes.io/component: metadata
+    app.kubernetes.io/managed-by: k4all-operator
+    app.kubernetes.io/part-of: k4all
+  name: k4all-metadata
+spec:
+  failurePolicy: Ignore
+  matchConditions:
+  - expression: |-
+      has(object.metadata.annotations) &&
+      (['istio.io/reroute-virtual-interfaces', 'traffic.sidecar.istio.io/kubevirtInterfaces'].exists(a,
+        a in object.metadata.annotations && object.metadata.annotations[a].contains('k6t-eth0')))
+    name: masquerade-binding
+  - expression: '!has(object.spec.initContainers) || !object.spec.initContainers.exists(c,
+      c.name.startsWith(''k4all-metadata''))'
+    name: not-injected-yet
+  - expression: '!has(object.spec.volumes) || !object.spec.volumes.exists(v, v.name.startsWith(''k4all-md-''))'
+    name: no-volume-name-clash
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+      - key: pod-security.kubernetes.io/enforce
+        operator: NotIn
+        values:
+        - baseline
+        - restricted
+    objectSelector:
+      matchExpressions:
+      - key: k4all.magesgate.com/metadata
+        operator: NotIn
+        values:
+        - disabled
+      matchLabels:
+        kubevirt.io: virt-launcher
+    resourceRules:
+    - apiGroups:
+      - ""
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      resources:
+      - pods
+  mutations:
+  - jsonPatch:
+      expression: |-
+        (has(object.spec.initContainers) ? [] : [JSONPatch{op: "add", path: "/spec/initContainers", value: []}]) +
+        [
+          JSONPatch{op: "add", path: "/spec/initContainers/-", value: Object.spec.initContainers{
+            name: "k4all-metadata-redirect",
+            image: "ghcr.io/gpillon/k4all-metadata:v0.6.0",
+            imagePullPolicy: "IfNotPresent",
+            command: ["/metadata-server", "-redirect"],
+            securityContext: Object.spec.initContainers.securityContext{
+              runAsUser: 0,
+              runAsNonRoot: false,
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: Object.spec.initContainers.securityContext.capabilities{add: ["NET_ADMIN"], drop: ["ALL"]},
+              seccompProfile: Object.spec.initContainers.securityContext.seccompProfile{type: "RuntimeDefault"}
+            },
+            resources: Object.spec.initContainers.resources{
+              requests: {"cpu": "100m", "memory": "32Mi"},
+              limits: {"cpu": "100m", "memory": "32Mi"}
+            }
+          }},
+          JSONPatch{op: "add", path: "/spec/initContainers/-", value: Object.spec.initContainers{
+            name: "k4all-metadata",
+            image: "ghcr.io/gpillon/k4all-metadata:v0.6.0",
+            imagePullPolicy: "IfNotPresent",
+            command: ["/metadata-server"],
+            restartPolicy: "Always",
+            securityContext: Object.spec.initContainers.securityContext{
+              runAsUser: 107,
+              runAsGroup: 107,
+              runAsNonRoot: true,
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: Object.spec.initContainers.securityContext.capabilities{drop: ["ALL"]},
+              seccompProfile: Object.spec.initContainers.securityContext.seccompProfile{type: "RuntimeDefault"}
+            },
+            resources: Object.spec.initContainers.resources{
+              requests: {"cpu": "10m", "memory": "32Mi"},
+              limits: {"cpu": "10m", "memory": "32Mi"}
+            },
+            livenessProbe: Object.spec.initContainers.livenessProbe{
+              exec: Object.spec.initContainers.livenessProbe.exec{command: ["/metadata-server", "-probe"]},
+              periodSeconds: 60,
+              timeoutSeconds: 5,
+              failureThreshold: 3
+            },
+            volumeMounts: [
+              Object.spec.initContainers.volumeMounts{name: "k4all-md-tokens", mountPath: "/var/run/k4all/metadata/tokens", readOnly: true},
+              Object.spec.initContainers.volumeMounts{name: "k4all-md-pod", mountPath: "/etc/k4all-md/pod", readOnly: true}
+            ] + (variables.vm != "" ? [
+              Object.spec.initContainers.volumeMounts{name: "k4all-md-vm", mountPath: "/etc/k4all-md/vm", readOnly: true}
+            ] : []) + [
+              Object.spec.initContainers.volumeMounts{name: "k4all-md-vendor", mountPath: "/etc/k4all-md/vendor", readOnly: true}
+            ]
+          }}
+        ] +
+        (has(object.spec.volumes) ? [] : [JSONPatch{op: "add", path: "/spec/volumes", value: []}]) +
+        ([
+          Object.spec.volumes{name: "k4all-md-tokens", projected: Object.spec.volumes.projected{sources: [
+              Object.spec.volumes.projected.sources{serviceAccountToken: Object.spec.volumes.projected.sources.serviceAccountToken{
+                audience: "k4all-metadata", expirationSeconds: 7200, path: "473020b97756c47575b6ad8fb08a499a1ac3597396b7d33d34b075d5bed2e828"
+              }},
+              Object.spec.volumes.projected.sources{serviceAccountToken: Object.spec.volumes.projected.sources.serviceAccountToken{
+                audience: "https://vault.example.com", expirationSeconds: 7200, path: "740fb1a54f2c48896751269cd2e2d140ffa2e81924e9aff17834ef7541c507dd"
+              }}
+          ]}},
+          Object.spec.volumes{name: "k4all-md-pod", downwardAPI: Object.spec.volumes.downwardAPI{items: [
+            Object.spec.volumes.downwardAPI.items{path: "labels", fieldRef: Object.spec.volumes.downwardAPI.items.fieldRef{fieldPath: "metadata.labels"}},
+            Object.spec.volumes.downwardAPI.items{path: "annotations", fieldRef: Object.spec.volumes.downwardAPI.items.fieldRef{fieldPath: "metadata.annotations"}},
+            Object.spec.volumes.downwardAPI.items{path: "namespace", fieldRef: Object.spec.volumes.downwardAPI.items.fieldRef{fieldPath: "metadata.namespace"}}
+          ]}}
+        ] + (variables.vm != "" ? [
+          Object.spec.volumes{name: "k4all-md-vm", secret: Object.spec.volumes.secret{secretName: "k4all-md-" + variables.vm, optional: true}}
+        ] : []) + [
+          Object.spec.volumes{name: "k4all-md-vendor", configMap: Object.spec.volumes.configMap{name: "k4all-vendor-data", optional: true}}
+        ]).map(v, JSONPatch{op: "add", path: "/spec/volumes/-", value: v}) +
+        (variables.serviceAccount != "" ? [JSONPatch{op: "add", path: "/spec/serviceAccountName", value: variables.serviceAccount}] : [])
+    patchType: JSONPatch
+  reinvocationPolicy: Never
+  variables:
+  - expression: 'has(object.metadata.labels) && "vm.kubevirt.io/name" in object.metadata.labels
+      ? object.metadata.labels["vm.kubevirt.io/name"] : '''''
+    name: vm
+  - expression: 'has(object.metadata.labels) && "k4all.magesgate.com/service-account"
+      in object.metadata.labels ? object.metadata.labels["k4all.magesgate.com/service-account"]
+      : '''''
+    name: serviceAccount
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  labels:
+    app.kubernetes.io/component: metadata
+    app.kubernetes.io/managed-by: k4all-operator
+    app.kubernetes.io/part-of: k4all
+  name: k4all-metadata
+spec:
+  policyName: k4all-metadata
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  labels:
+    app.kubernetes.io/component: metadata
+    app.kubernetes.io/managed-by: k4all-operator
+    app.kubernetes.io/part-of: k4all
+  name: k4all-metadata-vmi
+spec:
+  failurePolicy: Ignore
+  matchConditions:
+  - expression: |-
+      has(object.spec.domain.devices) && has(object.spec.domain.devices.interfaces) &&
+      object.spec.domain.devices.interfaces.exists(i, has(i.masquerade))
+    name: masquerade-interface
+  - expression: '!has(object.spec.domain.chassis) || !has(object.spec.domain.chassis.asset)
+      || object.spec.domain.chassis.asset == '''''
+    name: no-asset-tag
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+      - key: pod-security.kubernetes.io/enforce
+        operator: NotIn
+        values:
+        - baseline
+        - restricted
+    objectSelector:
+      matchExpressions:
+      - key: k4all.magesgate.com/metadata
+        operator: NotIn
+        values:
+        - disabled
+    resourceRules:
+    - apiGroups:
+      - kubevirt.io
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      resources:
+      - virtualmachineinstances
+  mutations:
+  - jsonPatch:
+      expression: |-
+        has(object.spec.domain.chassis)
+          ? [JSONPatch{op: "add", path: "/spec/domain/chassis/asset", value: "OpenStack Nova"}]
+          : [JSONPatch{op: "add", path: "/spec/domain/chassis", value: {"asset": "OpenStack Nova"}}]
+    patchType: JSONPatch
+  reinvocationPolicy: Never
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  labels:
+    app.kubernetes.io/component: metadata
+    app.kubernetes.io/managed-by: k4all-operator
+    app.kubernetes.io/part-of: k4all
+  name: k4all-metadata-vmi
+spec:
+  policyName: k4all-metadata-vmi

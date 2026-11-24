@@ -42,7 +42,9 @@ func (m *ManifestApplier) Apply(ctx context.Context, name string, spec k4allv1al
 	}
 
 	if len(urls) == 0 && len(spec.InlineManifests) == 0 {
-		return fmt.Errorf("component %s: no source URLs or inline manifests defined", name)
+		// Its hook renders its objects (k4all-metadata).
+		m.log.V(1).Info("no manifests to apply", "component", name)
+		return nil
 	}
 
 	// Apply URL-sourced manifests first

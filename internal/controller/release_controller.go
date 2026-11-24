@@ -975,6 +975,11 @@ func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, confi
 	} else {
 		meta.RemoveStatusCondition(&config.Status.Conditions, PodNetworkOverlapCondition)
 	}
+	if cond, ok := metadataServiceCondition(config, rm); ok {
+		meta.SetStatusCondition(&config.Status.Conditions, cond)
+	} else {
+		meta.RemoveStatusCondition(&config.Status.Conditions, k4allv1alpha1.ConditionMetadataService)
+	}
 
 	r.patchClusterConfigStatus(ctx, config)
 }
