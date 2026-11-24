@@ -173,6 +173,31 @@ func TestHangarNodeAgentRemoval_DeletesTheScriptsOfEarlierVersions(t *testing.T)
 	}
 }
 
+// An object the component adds as an inline manifest (a release's own
+// addition to Hangar's file) is the component's too: it goes with the rest.
+func TestHangarNodeAgentRemoval_DeletesItsInlineObjects(t *testing.T) {
+	c, _ := envtestClient(t)
+	ns := "hangar-agent-inline"
+	spec, bundle := hangarNodeAgentRelease(t, ns)
+	installHangarNodeAgent(t, c, bundle)
+	inline := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "k4all-agent-settings"}}
+	if err := c.Create(context.Background(), inline); err != nil {
+		t.Fatal(err)
+	}
+	spec.InlineManifests = []string{"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: k4all-agent-settings\n  namespace: " + ns + "\n"}
+
+	if err := hangarNodeAgentHook(t, c).Remove(context.Background(), spec, k4allv1alpha1.ClusterConfigSpec{}); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	if exists(t, c, inline) {
+		t.Error("the component's inline ConfigMap left")
+	}
+	if !deleting(t, c, ns) {
+		t.Errorf("namespace %s kept, holding only what the component left", ns)
+	}
+}
+
 // Without its manifest the hook cannot tell the agent's objects: nothing is
 // deleted, and the error keeps the component for the next reconcile.
 func TestHangarNodeAgentRemoval_KeepsEverythingWithoutItsManifest(t *testing.T) {
