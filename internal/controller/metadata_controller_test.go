@@ -486,3 +486,76 @@ func TestMetadataController_StartsWatchingWhenKubeVirtArrives(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// vmWithAsset is a VM template spec with a masquerade NIC and, unless
+// empty, the chassis asset tag.
+func vmWithAsset(asset string) map[string]any {
+	domain := map[string]any{"devices": map[string]any{
+		"interfaces": []any{map[string]any{"name": "default", "masquerade": map[string]any{}}},
+	}}
+	if asset != "" {
+		domain["chassis"] = map[string]any{"asset": asset}
+	}
+	return map[string]any{"domain": domain}
+}
+
+// An asset tag the user set other than "OpenStack Nova" keeps cloud-init
+// off the OpenStack metadata service: the policy leaves it (it is the
+// user's), and the VM is told why, once. EC2 clients are still served.
+func TestMetadataSecret_AUsersAssetTagIsSaid(t *testing.T) {
+	c, r, ns, rec := mdEnv(t, nil, mdOn)
+	createAll(t, c, testVM(ns, "acme", optIn(), vmWithAsset("ACME-42")),
+		testVM(ns, "nova", optIn(), vmWithAsset(metadata.ChassisAsset)),
+		testVM(ns, "none", optIn(), vmWithAsset("")))
+	for _, vm := range []string{"acme", "nova", "none", "acme"} {
+		reconcileVM(t, r, ns, vm)
+	}
+	ev := events(rec)
+	if len(ev) != 1 || !strings.HasPrefix(ev[0], "Warning MetadataChassisAsset") || !strings.Contains(ev[0], `"ACME-42"`) ||
+		!strings.Contains(ev[0], metadata.ChassisAsset) {
+		t.Fatalf("events %v", ev)
+	}
+	if mdSecret(t, c, ns, "acme") == nil {
+		t.Fatal("no Secret for the VM with its own asset tag")
+	}
+
+	// Removed: nothing more to say. Set again: said again.
+	setAsset := func(asset string) {
+		t.Helper()
+		vm := newVM()
+		if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "acme"}, vm); err != nil {
+			t.Fatal(err)
+		}
+		if err := unstructured.SetNestedMap(vm.Object, vmWithAsset(asset)["domain"].(map[string]any),
+			"spec", "template", "spec", "domain"); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Update(context.Background(), vm); err != nil {
+			t.Fatal(err)
+		}
+		reconcileVM(t, r, ns, "acme")
+	}
+	setAsset("")
+	if ev := events(rec); len(ev) != 0 {
+		t.Fatalf("events without the tag: %v", ev)
+	}
+	setAsset("Other")
+	if ev := events(rec); len(ev) != 1 || !strings.Contains(ev[0], `"Other"`) {
+		t.Fatalf("events %v", ev)
+	}
+}
+
+// Two things to say about one VM: each is said once.
+func TestMetadataSecret_EachWarningOnce(t *testing.T) {
+	c, r, ns, rec := mdEnv(t, nil, mdOn)
+	spec := vmWithAsset("ACME-42")
+	spec["volumes"] = []any{map[string]any{"name": "ci", "cloudInitNoCloud": map[string]any{"secretRef": map[string]any{"name": "gone"}}}}
+	createAll(t, c, testVM(ns, "web", optIn(), spec))
+	for i := 0; i < 3; i++ {
+		reconcileVM(t, r, ns, "web")
+	}
+	ev := strings.Join(events(rec), "\n")
+	if strings.Count(ev, "Warning MetadataChassisAsset") != 1 || strings.Count(ev, "Warning MetadataIncomplete") != 1 {
+		t.Fatalf("events:\n%s", ev)
+	}
+}

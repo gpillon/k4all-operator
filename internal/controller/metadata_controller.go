@@ -89,8 +89,9 @@ type MetadataReconciler struct {
 	settings atomic.Pointer[hooks.MetadataSettings]
 
 	mu sync.Mutex
-	// said is the last Event put on each VM, not to repeat it.
-	said map[types.UID]string
+	// said is what each VM was told (Warning reason -> message), so an
+	// Event is put once while it stays the same.
+	said map[types.UID]map[string]string
 }
 
 // SetupWithManager watches the ClusterConfig; VMs and Namespaces are
@@ -268,7 +269,7 @@ func inMetadataScope(s hooks.MetadataSettings, vm *unstructured.Unstructured) bo
 func (r *MetadataReconciler) reconcileVM(ctx context.Context, s hooks.MetadataSettings, vm *unstructured.Unstructured) (ctrl.Result, error) {
 	log := r.Log.WithValues("vm", client.ObjectKeyFromObject(vm))
 	if !s.Enabled || !inMetadataScope(s, vm) {
-		r.forget(vm)
+		r.warn(vm, nil)
 		return ctrl.Result{}, r.dropSecret(ctx, vm)
 	}
 	ns := &corev1.Namespace{}
@@ -277,13 +278,22 @@ func (r *MetadataReconciler) reconcileVM(ctx context.Context, s hooks.MetadataSe
 	}
 	if level := ns.Labels[psaEnforce]; level == "baseline" || level == "restricted" {
 		// D8: the policy does not inject here; one who asked is told.
+		warnings := map[string]string{}
 		if optInLabel(vm) == metadata.OptInEnabled {
-			r.say(vm, "MetadataNotServed", fmt.Sprintf(
+			warnings["MetadataNotServed"] = fmt.Sprintf(
 				"namespace %s enforces PodSecurity %q, which forbids the NET_ADMIN capability the metadata service "+
 					"needs in the VM's pod: 169.254.169.254 is not served to this VM; give it a cloud-init disk "+
-					"(cloudInitNoCloud or cloudInitConfigDrive) instead", vm.GetNamespace(), level))
+					"(cloudInitNoCloud or cloudInitConfigDrive) instead", vm.GetNamespace(), level)
 		}
+		r.warn(vm, warnings)
 		return ctrl.Result{}, r.dropSecret(ctx, vm)
+	}
+	warnings := map[string]string{}
+	if asset := userAssetTag(vm); asset != "" {
+		warnings["MetadataChassisAsset"] = fmt.Sprintf(
+			"the VM's chassis asset tag is %q: cloud-init looks for the OpenStack metadata service only with %q, "+
+				"so this VM's cloud-init does not use 169.254.169.254 (EC2 clients such as cirros do); set it to %q, "+
+				"or remove it and k4all sets it", asset, metadata.ChassisAsset, metadata.ChassisAsset)
 	}
 
 	data, problems, err := renderVMMetadata(ctx, r.APIReader, vm)
@@ -302,9 +312,10 @@ func (r *MetadataReconciler) reconcileVM(ctx context.Context, s hooks.MetadataSe
 		}
 		log.Info("metadata Secret created", "secret", desired.Name)
 	case !isK4allMetadataSecret(current):
-		r.say(vm, "MetadataSecretTaken", fmt.Sprintf(
+		warnings["MetadataSecretTaken"] = fmt.Sprintf(
 			"Secret %s exists and is not k4all's: the metadata service serves this VM no user-data, keys or "+
-				"instance-id until it is renamed or deleted", desired.Name))
+				"instance-id until it is renamed or deleted", desired.Name)
+		r.warn(vm, warnings)
 		return ctrl.Result{RequeueAfter: metadataResync}, nil
 	case !sameMetadataSecret(current, desired):
 		current.Data, current.OwnerReferences = desired.Data, desired.OwnerReferences
@@ -324,12 +335,30 @@ func (r *MetadataReconciler) reconcileVM(ctx context.Context, s hooks.MetadataSe
 		log.Info("metadata Secret updated", "secret", desired.Name)
 	}
 	if len(problems) > 0 {
-		r.say(vm, "MetadataIncomplete", "the metadata service serves this VM without what is missing: "+
-			desired.Annotations[metadataMessageAnnotation])
+		warnings["MetadataIncomplete"] = "the metadata service serves this VM without what is missing: " +
+			desired.Annotations[metadataMessageAnnotation]
+		r.warn(vm, warnings)
 		return ctrl.Result{RequeueAfter: metadataRetry}, nil
 	}
-	r.forget(vm)
+	r.warn(vm, warnings)
 	return ctrl.Result{RequeueAfter: metadataResync}, nil
+}
+
+// userAssetTag is the chassis asset tag of the VM's spec when it is set and
+// is not the one cloud-init needs; "" otherwise. Only for a VM with a
+// masquerade interface: the others are not served at all.
+func userAssetTag(vm *unstructured.Unstructured) string {
+	asset, _, _ := unstructured.NestedString(vm.Object, "spec", "template", "spec", "domain", "chassis", "asset")
+	if asset == "" || asset == metadata.ChassisAsset {
+		return ""
+	}
+	ifaces, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "interfaces")
+	for _, i := range ifaces {
+		if iface, ok := i.(map[string]any); ok && iface["masquerade"] != nil {
+			return asset
+		}
+	}
+	return ""
 }
 
 // metadataFieldOwner writes what k4all owns.
@@ -363,24 +392,24 @@ func (r *MetadataReconciler) dropSecret(ctx context.Context, vm *unstructured.Un
 	return nil
 }
 
-// say puts a Warning Event on the VM, unless it is the last one said.
-func (r *MetadataReconciler) say(vm *unstructured.Unstructured, reason, message string) {
+// warn puts on the VM a Warning Event for each of warnings (reason ->
+// message) it was not told yet, or told otherwise; what is no longer in
+// warnings is forgotten, to be said again if it comes back.
+func (r *MetadataReconciler) warn(vm *unstructured.Unstructured, warnings map[string]string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.said == nil {
-		r.said = map[types.UID]string{}
+		r.said = map[types.UID]map[string]string{}
 	}
-	if r.said[vm.GetUID()] == reason+message {
+	told := r.said[vm.GetUID()]
+	for reason, message := range warnings {
+		if told[reason] != message && r.Recorder != nil {
+			r.Recorder.Event(vm, corev1.EventTypeWarning, reason, message)
+		}
+	}
+	if len(warnings) == 0 {
+		delete(r.said, vm.GetUID())
 		return
 	}
-	r.said[vm.GetUID()] = reason + message
-	if r.Recorder != nil {
-		r.Recorder.Event(vm, corev1.EventTypeWarning, reason, message)
-	}
-}
-
-func (r *MetadataReconciler) forget(vm *unstructured.Unstructured) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.said, vm.GetUID())
+	r.said[vm.GetUID()] = warnings
 }
