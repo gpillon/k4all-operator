@@ -10,9 +10,7 @@ import (
 )
 
 // RookSettings is the Rook configuration of a cluster: what k4all creates
-// the CephCluster and vm-pool with. A ClusterConfig field will carry it once
-// its API is approved; until then every cluster gets defaultRookSettings
-// (see rookSettingsFrom).
+// the CephCluster and vm-pool with, from features.rook (rookSettingsFrom).
 type RookSettings struct {
 	// DeviceFilter selects the OSD devices: a regular expression on device
 	// names, e.g. "^sdb$". Empty: every device or partition of every node
@@ -20,39 +18,35 @@ type RookSettings struct {
 	// a filesystem or an LVM signature, so the OS disk and TopoLVM's volume
 	// group are safe; a blank spare disk or partition becomes an OSD.
 	DeviceFilter string
-	// SmallCluster is what k4all does on fewer than 3 nodes.
-	SmallCluster SmallClusterPolicy
+	// SmallCluster is what k4all does on fewer than 3 nodes, Ceph's
+	// minimum for 3 mons and 3 replicas on separate hosts:
+	// k4allv1alpha1.RookSmallClusterRefuse creates no CephCluster (the
+	// status says so; it is created once a third node has joined),
+	// RookSmallClusterAllow creates it with one replica per node (1 node: a
+	// single copy) and a warning in the StorageClass description and the
+	// RookReady condition.
+	SmallCluster string
 	// PoolSize is vm-pool's replica count; 0: from the node count.
 	PoolSize int
 }
 
-// defaultRookSettings are k4all's Rook defaults: every empty device becomes
-// an OSD, and no CephCluster below 3 nodes.
-func defaultRookSettings() RookSettings {
-	return RookSettings{SmallCluster: SmallClusterRefuse}
+// rookSettingsFrom reads the creation inputs of features.rook: the device
+// filter, and the small-cluster policy (empty means Refuse, D5). Without
+// features.rook, the defaults: every blank device, nothing below 3 nodes.
+func rookSettingsFrom(config k4allv1alpha1.ClusterConfigSpec) RookSettings {
+	settings := RookSettings{SmallCluster: k4allv1alpha1.RookSmallClusterRefuse}
+	rook := config.Features.Rook
+	if rook == nil {
+		return settings
+	}
+	if rook.Storage != nil {
+		settings.DeviceFilter = rook.Storage.DeviceFilter
+	}
+	if rook.SmallCluster == k4allv1alpha1.RookSmallClusterAllow {
+		settings.SmallCluster = k4allv1alpha1.RookSmallClusterAllow
+	}
+	return settings
 }
-
-// rookSettingsFrom reads the cluster's Rook settings from the ClusterConfig.
-// STUB until the ClusterConfig's Rook field is approved: every cluster gets
-// defaultRookSettings.
-func rookSettingsFrom(_ k4allv1alpha1.ClusterConfigSpec) RookSettings {
-	return defaultRookSettings()
-}
-
-// SmallClusterPolicy is what k4all does with Rook on fewer than 3 nodes,
-// where Ceph cannot keep its default 3 replicas on 3 hosts.
-type SmallClusterPolicy string
-
-const (
-	// SmallClusterRefuse creates no CephCluster below 3 nodes: the
-	// component's status says so, and the CephCluster is created once a
-	// third node has joined. The default.
-	SmallClusterRefuse SmallClusterPolicy = "Refuse"
-	// SmallClusterAllow creates the CephCluster on 1 or 2 nodes, with one
-	// replica per node (1 node: a single copy, no redundancy) and a warning
-	// in the StorageClass description and the operator's log.
-	SmallClusterAllow SmallClusterPolicy = "Allow"
-)
 
 // cephMinNodes is the node count Ceph's defaults need: 3 mons and 3
 // replicas, each on its own host.
@@ -82,16 +76,18 @@ func (r rookRefusal) Error() string { return r.reason }
 //   - vm-pool replicas: 3, or one per node below 3 nodes, or settings'
 //     PoolSize.
 //
-// Below 3 nodes SmallClusterRefuse refuses; so does a pool size larger than
+// Below 3 nodes Refuse refuses; so does a pool size larger than
 // the node count, since every replica needs its own host.
 func planRook(nodes int, settings RookSettings) (rookPlan, error) {
 	if nodes < 1 {
 		return rookPlan{}, rookRefusal{"no node can run Ceph"}
 	}
-	if nodes < cephMinNodes && settings.SmallCluster != SmallClusterAllow {
+	if nodes < cephMinNodes && settings.SmallCluster != k4allv1alpha1.RookSmallClusterAllow {
 		return rookPlan{}, rookRefusal{fmt.Sprintf(
 			"Ceph needs %d nodes for 3 monitors and 3 replicas on separate hosts, this cluster has %d: "+
-				"k4all creates the CephCluster once it has %d", cephMinNodes, nodes, cephMinNodes)}
+				"k4all creates the CephCluster once it has %d "+
+				"(features.rook.smallCluster: Allow creates it now, without redundancy)",
+			cephMinNodes, nodes, cephMinNodes)}
 	}
 	plan := rookPlan{Mons: 1, Mgrs: 1, PoolSize: min(nodes, 3)}
 	switch {

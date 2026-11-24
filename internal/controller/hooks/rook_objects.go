@@ -174,17 +174,28 @@ func cephSnapshotClass() *unstructured.Unstructured {
 }
 
 // cephStorageProfile is CDI's StorageProfile of ceph-rbd: VM disks default
-// to shared block volumes (RWX Block), which live migration needs.
+// to its first set, shared block volumes (RWX Block), which live migration
+// needs. The second, RWO Filesystem, is for KubeVirt's persistent VM state
+// (EFI, TPM) on a vmStateStorageClass ceph-rbd: KubeVirt creates it as a
+// Filesystem volume, with an access mode of the profile's Filesystem sets,
+// and without one the VM never starts. RBD has no RWX Filesystem; on RWO
+// KubeVirt copies the state when the VM migrates.
 func cephStorageProfile() *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": storageProfileAPIVersion,
 		"kind":       storageProfileKind,
 		"metadata":   map[string]interface{}{"name": cephStorageClassName},
 		"spec": map[string]interface{}{
-			"claimPropertySets": []interface{}{map[string]interface{}{
-				"accessModes": []interface{}{"ReadWriteMany"},
-				"volumeMode":  "Block",
-			}},
+			"claimPropertySets": []interface{}{
+				map[string]interface{}{
+					"accessModes": []interface{}{"ReadWriteMany"},
+					"volumeMode":  "Block",
+				},
+				map[string]interface{}{
+					"accessModes": []interface{}{"ReadWriteOnce"},
+					"volumeMode":  "Filesystem",
+				},
+			},
 		},
 	}}
 }

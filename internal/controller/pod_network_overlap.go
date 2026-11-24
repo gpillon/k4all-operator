@@ -22,11 +22,6 @@ import (
 // ciliumCNI is spec.networking.cni.type with Cilium.
 const ciliumCNI = "cilium"
 
-// PodNetworkOverlapCondition is the ClusterConfig condition that lists what
-// Cilium's pod addresses overlap (k4all#72). It only reports: the operator
-// changes nothing in the cluster for it.
-const PodNetworkOverlapCondition = "PodNetworkOverlap"
-
 // kubevirtMasqueradeNetwork is KubeVirt's default masquerade network inside
 // every virt-launcher pod: a VM whose node's pod CIDR overlaps it routes
 // that node's pods to its own interface.
@@ -54,7 +49,7 @@ const (
 func (r *ReleaseReconciler) podNetworkOverlap(
 	ctx context.Context, config *k4allv1alpha1.ClusterConfig, rm *k4allv1alpha1.ReleaseManifest,
 ) metav1.Condition {
-	cond := metav1.Condition{Type: PodNetworkOverlapCondition, ObservedGeneration: config.Generation}
+	cond := metav1.Condition{Type: k4allv1alpha1.ConditionPodNetworkOverlap, ObservedGeneration: config.Generation}
 	checkFailed := func(err error) metav1.Condition {
 		cond.Status, cond.Reason, cond.Message = metav1.ConditionUnknown, "CheckFailed", err.Error()
 		return cond

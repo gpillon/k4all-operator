@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -185,8 +187,9 @@ func syncRook(t *testing.T, h *RookHook) error {
 }
 
 // k4all creates the CephCluster with its defaults under its own field
-// manager for created objects, never "k4all-operator": the consoles (Cairn)
+// manager for created objects, not "k4all-operator": the consoles (Cairn)
 // show the fields of "k4all-operator" read-only, and these are day-2 fields.
+// The one exception is the Ceph image (D18, TestRookHook_OwnsOnlyTheCephImage).
 func TestRookHook_CreatesTheCephClusterAsASeed(t *testing.T) {
 	c := rookEnvtest(t)
 	rookNodes(t, c, 3)
@@ -204,9 +207,146 @@ func TestRookHook_CreatesTheCephClusterAsASeed(t *testing.T) {
 		t.Errorf("cephVersion.image %q, want the component's image %q", image, rookSpec.Image)
 	}
 	got := managers(cluster)
-	if len(got) != 1 || got[0] != seedFieldManager {
-		t.Errorf("field managers %v, want only %q", got, seedFieldManager)
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, []string{ownedFieldManager, seedFieldManager}) {
+		t.Errorf("field managers %v, want %q and, for the image, %q", got, seedFieldManager, ownedFieldManager)
 	}
+}
+
+// ownedFields are the fields the managedFields entry of manager owns, as
+// paths ("spec.cephVersion.image").
+func ownedFields(t *testing.T, obj client.Object, manager string) []string {
+	t.Helper()
+	var out []string
+	var walk func(prefix string, set map[string]interface{})
+	walk = func(prefix string, set map[string]interface{}) {
+		for key, sub := range set {
+			if key == "." {
+				continue
+			}
+			path := prefix + strings.TrimPrefix(key, "f:")
+			children, _ := sub.(map[string]interface{})
+			if len(children) == 0 {
+				out = append(out, path)
+				continue
+			}
+			walk(path+".", children)
+		}
+	}
+	for _, e := range obj.GetManagedFields() {
+		if e.Manager != manager || e.FieldsV1 == nil {
+			continue
+		}
+		set := map[string]interface{}{}
+		if err := json.Unmarshal(e.FieldsV1.Raw, &set); err != nil {
+			t.Fatal(err)
+		}
+		walk("", set)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func cephImage(t *testing.T, c client.Client) string {
+	t.Helper()
+	image, _, _ := unstructured.NestedString(getCephCluster(t, c).Object, "spec", "cephVersion", "image")
+	return image
+}
+
+// D18: of the CephCluster it created, k4all owns spec.cephVersion.image and
+// nothing else, so Ceph follows the Rook chart the release pins. The
+// "k4all-operator" entry covers that field alone (Cairn shows it
+// read-only); Cairn's edits of the rest stay, an image changed by hand is
+// put back, and a new image in the release reaches the cluster.
+func TestRookHook_OwnsOnlyTheCephImage(t *testing.T) {
+	c := rookEnvtest(t)
+	rookNodes(t, c, 3)
+	forgetRook(t, c)
+	h := NewRookHook(c, logr.Discard())
+	if err := syncRook(t, h); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if got := ownedFields(t, getCephCluster(t, c), ownedFieldManager); !reflect.DeepEqual(got, []string{"spec.cephVersion.image"}) {
+		t.Fatalf("%s owns %v, want only spec.cephVersion.image", ownedFieldManager, got)
+	}
+
+	// Cairn's edit (a JSON patch from Headlamp), and the image by hand.
+	edit := `[{"op":"replace","path":"/spec/mgr/count","value":1}]`
+	if err := c.Patch(context.Background(), getCephCluster(t, c), client.RawPatch(types.JSONPatchType, []byte(edit)),
+		client.FieldOwner("Headlamp")); err != nil {
+		t.Fatalf("Cairn's edit: %v", err)
+	}
+	byHand := `{"spec":{"cephVersion":{"image":"quay.io/ceph/ceph:v20.2.1"}}}`
+	if err := c.Patch(context.Background(), getCephCluster(t, c), client.RawPatch(types.MergePatchType, []byte(byHand)),
+		client.FieldOwner("kubectl-edit")); err != nil {
+		t.Fatalf("image by hand: %v", err)
+	}
+
+	if err := syncRook(t, h); err != nil {
+		t.Fatalf("Sync after the edits: %v", err)
+	}
+	cluster := getCephCluster(t, c)
+	if mgrs, _, _ := unstructured.NestedInt64(cluster.Object, "spec", "mgr", "count"); mgrs != 1 {
+		t.Errorf("mgr.count %d, want Cairn's 1", mgrs)
+	}
+	if image := cephImage(t, c); image != rookSpec.Image {
+		t.Errorf("cephVersion.image %q, want the release's %q back", image, rookSpec.Image)
+	}
+
+	newer := rookSpec
+	newer.Image = "quay.io/ceph/ceph:v20.2.5"
+	if _, err := h.Sync(context.Background(), newer, k4allv1alpha1.ClusterConfigSpec{}); err != nil {
+		t.Fatalf("Sync with a new image: %v", err)
+	}
+	if image := cephImage(t, c); image != newer.Image {
+		t.Errorf("cephVersion.image %q, want the new release's %q", image, newer.Image)
+	}
+	if mgrs, _, _ := unstructured.NestedInt64(getCephCluster(t, c).Object, "spec", "mgr", "count"); mgrs != 1 {
+		t.Errorf("after the image change: mgr.count %d, want Cairn's 1", mgrs)
+	}
+}
+
+// A CephCluster k4all found (made before k4all ran Rook: the lab's) is its
+// admin's, image included: k4all could otherwise move it to an older Ceph.
+func TestRookHook_LeavesTheImageOfAFoundCephCluster(t *testing.T) {
+	c := rookEnvtest(t)
+	rookNodes(t, c, 3)
+	forgetRook(t, c)
+	byHand := cephClusterObject(rookPlan{Mons: 3, Mgrs: 2}, RookSettings{}, "quay.io/ceph/ceph:v20.2.9")
+	if err := c.Create(context.Background(), byHand, client.FieldOwner("kubectl-client-side-apply")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syncRook(t, NewRookHook(c, logr.Discard())); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if image := cephImage(t, c); image != "quay.io/ceph/ceph:v20.2.9" {
+		t.Errorf("cephVersion.image %q, want the admin's v20.2.9", image)
+	}
+	if got := managers(getCephCluster(t, c)); slices.Contains(got, ownedFieldManager) {
+		t.Errorf("field managers %v: k4all wrote the admin's CephCluster", got)
+	}
+}
+
+// The image apply never creates a CephCluster: one deleted between the read
+// and the apply stays deleted (an apply of the image alone would create a
+// cluster with Rook's defaults).
+func TestRookHook_TheImageApplyCreatesNoCephCluster(t *testing.T) {
+	c := rookEnvtest(t)
+	rookNodes(t, c, 3)
+	forgetRook(t, c)
+	h := NewRookHook(c, logr.Discard())
+	if err := syncRook(t, h); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	live := getCephCluster(t, c)
+	deleteObject(t, c, newObject(cephAPIVersion, cephClusterKind, rookNamespace, cephClusterName))
+
+	if err := h.applyCephImage(context.Background(), live, "quay.io/ceph/ceph:v20.2.5"); err == nil || !apierrors.IsConflict(err) {
+		t.Errorf("the image apply of a deleted CephCluster: %v, want a conflict (its uid)", err)
+	}
+	isGone(t, c, newObject(cephAPIVersion, cephClusterKind, rookNamespace, cephClusterName))
 }
 
 // Create-only: the mgr and mon counts set from Cairn after k4all created the
@@ -269,6 +409,34 @@ func TestRookHook_CreatesNothingBelowThreeNodes(t *testing.T) {
 	}
 }
 
+// smallCluster Allow in the ClusterConfig (D5): on 2 nodes k4all creates
+// the CephCluster with 1 mon and the OSDs of the ClusterConfig's filter.
+func TestRookHook_ReadsTheClusterConfig(t *testing.T) {
+	c := rookEnvtest(t)
+	rookNodes(t, c, 2)
+	forgetRook(t, c)
+	config := k4allv1alpha1.ClusterConfigSpec{Features: k4allv1alpha1.FeaturesConfig{Rook: &k4allv1alpha1.RookConfig{
+		Enabled:      true,
+		SmallCluster: k4allv1alpha1.RookSmallClusterAllow,
+		Storage:      &k4allv1alpha1.RookStorage{DeviceFilter: "^sdb$"},
+	}}}
+
+	if _, err := NewRookHook(c, logr.Discard()).Sync(context.Background(), rookSpec, config); err != nil {
+		t.Fatalf("Sync with smallCluster Allow on 2 nodes: %v", err)
+	}
+
+	cluster := getCephCluster(t, c)
+	for path, want := range map[string]interface{}{
+		"spec.mon.count":             int64(1),
+		"spec.storage.useAllDevices": false,
+		"spec.storage.deviceFilter":  "^sdb$",
+	} {
+		if got := fieldAt(t, cluster.Object, path); got != want {
+			t.Errorf("%s = %#v, want %#v", path, got, want)
+		}
+	}
+}
+
 // What VMs need on Ceph: vm-pool with 3 replicas, the shared (RWX Block)
 // StorageClass ceph-rbd for live migration, its VolumeSnapshotClass, and
 // CDI's StorageProfile, all as seeds.
@@ -318,8 +486,17 @@ func TestRookHook_CreatesThePoolAndClassesForVMs(t *testing.T) {
 
 	profile := getObject(t, c, "cdi.kubevirt.io/v1beta1", "StorageProfile", "", "ceph-rbd")
 	isSeed(t, profile)
+	// VM disks default to the first set, shared block volumes (live
+	// migration). KubeVirt creates the persistent VM state (EFI, TPM) on
+	// vmStateStorageClass as a Filesystem volume and picks its access mode
+	// from the profile's Filesystem sets: without one, with ceph-rbd as
+	// vmStateStorageClass, those VMs would never start. RBD has no RWX
+	// Filesystem; on RWO KubeVirt copies the state when the VM migrates.
 	sets, _, _ := unstructured.NestedSlice(profile.Object, "spec", "claimPropertySets")
-	want := []interface{}{map[string]interface{}{"accessModes": []interface{}{"ReadWriteMany"}, "volumeMode": "Block"}}
+	want := []interface{}{
+		map[string]interface{}{"accessModes": []interface{}{"ReadWriteMany"}, "volumeMode": "Block"},
+		map[string]interface{}{"accessModes": []interface{}{"ReadWriteOnce"}, "volumeMode": "Filesystem"},
+	}
 	if !reflect.DeepEqual(sets, want) {
 		t.Errorf("StorageProfile claimPropertySets %v, want %v", sets, want)
 	}

@@ -1,0 +1,841 @@
+# Hangar's node agent, from distribution/node-agent (https://github.com/kalik1/hangar):
+# a privileged DaemonSet in hangar-system for host devices.
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/part-of: hangar
+    pod-security.kubernetes.io/enforce: privileged
+  name: hangar-system
+---
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/name: hangar-node-agent
+    app.kubernetes.io/part-of: hangar
+  name: hangar-node-agent
+  namespace: hangar-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/part-of: hangar
+  name: hangar-hardware-admin
+  namespace: hangar-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - pods/proxy
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+---
+apiVersion: v1
+data:
+  agent.sh: |
+    #!/bin/sh
+    # Hangar node agent.
+    #
+    # Prepares PCI devices for VMs (binds them to vfio-pci, which KubeVirt
+    # needs before it can pass them through) and publishes the host's
+    # hardware as JSON for Hangar: PCI devices, SR-IOV and mediated devices,
+    # USB devices, disks, which VM holds which device, and what the host
+    # itself needs. The JSON is served read-only by the pod's httpd container;
+    # Hangar reads it through the API server (pods/proxy).
+    #
+    # Desired state: the file /config/<node name> (ConfigMap
+    # hangar-system/hangar-passthrough, one key per host), one PCI address per
+    # line. Hangar writes it; this agent reconciles both ways, at start and
+    # when the file changes, and keeps a udev rule so the bindings survive a
+    # reboot. It only gives back to the host the devices it bound itself.
+    #
+    #   agent.sh run        reconcile and publish, forever (the DaemonSet)
+    #   agent.sh gather     print the inventory once (no changes to the host)
+    #   agent.sh reconcile  apply the desired state once
+    #
+    # busybox sh; paths can be overridden for tests (HOST_SYS, HOST_PROC...).
+    set -u
+
+    VERSION=1
+    NODE=${NODE_NAME:-$(hostname)}
+    SYS=${HOST_SYS:-/host/sys}
+    DEV=${HOST_DEV:-/host/dev}
+    PROC=${HOST_PROC:-/proc}
+    CONF=${CONF_DIR:-/config}
+    STATE=${STATE_DIR:-/host/var/lib/hangar}
+    RULES=${RULES_FILE:-/host/etc/udev/rules.d/60-hangar-vfio.rules}
+    OUT=${OUT_DIR:-/run/hangar}
+    IDS=${IDS_DIR:-/hwdata}
+    AWK=${RENDER_AWK:-/scripts/render.awk}
+    T=${WORK_DIR:-$OUT/.work}
+    US=$(printf '\037')
+
+    mkdir -p "$OUT" "$T" 2>/dev/null
+    [ "${1:-}" = gather ] || mkdir -p "$STATE" 2>/dev/null
+    touch "$STATE/managed" 2>/dev/null
+
+    log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+
+    # rd FILE: first line of FILE into $RV (empty if missing). No fork.
+    RV=
+    rd() {
+      RV=
+      [ -r "$1" ] && read -r RV <"$1" 2>/dev/null
+      return 0
+    }
+
+    # Name of the driver bound to a sysfs device dir, or empty.
+    drvname() {
+      l=$(readlink "$1/driver" 2>/dev/null) || l=
+      echo "${l##*/}"
+    }
+
+    # PCI addresses in a sysfs path, outermost first.
+    pci_in_path() {
+      _p=$1
+      _old=$IFS
+      IFS=/
+      set -f
+      for _c in $_p; do
+        case $_c in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f].[0-7]) echo "$_c" ;;
+        esac
+      done
+      set +f
+      IFS=$_old
+    }
+
+    rec() {
+      # rec FIELD... : one record line, fields joined by the unit separator.
+      _first=1
+      for _f in "$@"; do
+        if [ $_first = 1 ]; then printf '%s' "$_f"; _first=0; else printf '%s%s' "$US" "$_f"; fi
+      done
+      printf '\n'
+    }
+
+    # ------------------------------------------------------------ host needs
+
+    # What the host itself uses: controllers of disks in use, NICs that carry
+    # its addresses, and everything sharing an IOMMU group with those.
+    host_needs() {
+      open_disks
+      : >"$T/needs.raw"
+      # Disks in use (partitions, holders, mounts, swap): their controllers.
+      for b in "$SYS"/block/*; do
+        n=${b##*/}
+        case $n in loop* | ram* | zram* | dm-* | md* | nbd* | fd* | sr* | rbd* | drbd* | zd*) continue ;; esac
+        used=
+        for p in "$b"/"$n"*; do [ -f "$p/partition" ] && used=1 && break; done
+        [ -z "$used" ] && [ -n "$(ls "$b/holders" 2>/dev/null)" ] && used=1
+        [ -z "$used" ] && grep -q "^/dev/$n[ 0-9p]" "$PROC/1/mounts" 2>/dev/null && used=1
+        [ -z "$used" ] && grep -q "^/dev/$n[ 0-9p]" "$PROC/swaps" 2>/dev/null && used=1
+        [ -z "$used" ] && [ -n "$(signature "$n")" ] && used=1
+        [ -z "$used" ] && [ -n "$(openers "$n")" ] && used=1
+        [ -n "$used" ] || continue
+        for a in $(pci_in_path "$(readlink -f "$b")"); do rec "$a" "controls the host's disk $n" >>"$T/needs.raw"; done
+      done
+      # Interfaces with routes, then down to the physical ports.
+      {
+        awk 'NR>1 && $1!="lo" {print $1}' "$PROC/1/net/route" 2>/dev/null
+        awk '$NF!="lo" {print $NF}' "$PROC/1/net/ipv6_route" 2>/dev/null
+      } | sort -u >"$T/ifs.todo"
+      : >"$T/ifs.seen"
+      i=0
+      while [ -s "$T/ifs.todo" ] && [ $i -lt 6 ]; do
+        i=$((i + 1))
+        : >"$T/ifs.next"
+        while read -r ifc; do
+          grep -qx "$ifc" "$T/ifs.seen" && continue
+          echo "$ifc" >>"$T/ifs.seen"
+          nd="$SYS/class/net/$ifc"
+          [ -e "$nd" ] || continue
+          if [ -e "$nd/device" ]; then
+            for a in $(pci_in_path "$(readlink -f "$nd/device")"); do rec "$a" "carries the host's network ($ifc)" >>"$T/needs.raw"; done
+            continue
+          fi
+          lower=
+          for l in "$nd"/lower_*; do [ -e "$l" ] && echo "${l##*/lower_}" >>"$T/ifs.next" && lower=1; done
+          for l in "$nd"/brif/*; do [ -e "$l" ] && echo "${l##*/}" >>"$T/ifs.next" && lower=1; done
+          # An Open vSwitch port: the physical ports are those of ovs-system.
+          if [ -z "$lower" ] && [ -e "$SYS/class/net/ovs-system" ]; then
+            for m in "$SYS"/class/net/*/master; do
+              [ "$(readlink "$m" 2>/dev/null | sed 's#.*/##')" = ovs-system ] || continue
+              m=${m%/master}
+              echo "${m##*/}" >>"$T/ifs.next"
+            done
+          fi
+        done <"$T/ifs.todo"
+        sort -u "$T/ifs.next" >"$T/ifs.todo"
+      done
+      # Same IOMMU group as something the host needs: VFIO takes whole groups.
+      cut -d"$US" -f1 "$T/needs.raw" | sort -u >"$T/needs.addr"
+      while read -r a; do
+        g=$(readlink "$SYS/bus/pci/devices/$a/iommu_group" 2>/dev/null) || continue
+        g=${g##*/}
+        for m in "$SYS"/kernel/iommu_groups/"$g"/devices/*; do
+          [ -e "$m" ] || continue
+          m=${m##*/}
+          [ "$m" = "$a" ] || rec "$m" "shares IOMMU group $g with $a, which the host needs" >>"$T/needs.raw"
+        done
+      done <"$T/needs.addr"
+      # First reason per device.
+      awk -F"$US" '!seen[$1]++' "$T/needs.raw" >"$T/needs"
+    }
+
+    # ---------------------------------------------------------- device usage
+
+    # Which VM holds which VFIO group and USB device: the qemu processes'
+    # open files. VM names come from qemu's "-name guest=<namespace>_<name>".
+    # Block devices host processes hold open ("dev comm" lines), e.g. a Ceph OSD on its raw disk.
+    open_disks() {
+      ls -l "$PROC"/[0-9]*/fd 2>/dev/null | awk '
+        /\/fd:$/ { pid = $0; sub(/\/fd:$/, "", pid); sub(/.*\//, "", pid); next }
+        / -> \/dev\/(sd|vd|hd|xvd|nvme)[a-z0-9]*$/ { d = $NF; sub(/^\/dev\//, "", d); print pid, d }' | sort -u >"$T/open.raw"
+      : >"$T/open"
+      while read -r pid dv; do
+        rd "$PROC/$pid/comm"
+        [ -n "$RV" ] && echo "$dv $RV" >>"$T/open"
+      done <"$T/open.raw"
+    }
+
+    # Processes holding disk $1 or one of its partitions, comma separated.
+    openers() {
+      awk -v n="$1" '$1 == n || $1 ~ ("^" n "p?[0-9]+$") {print $2}' "$T/open" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//'
+    }
+
+    usage() {
+      open_disks
+      : >"$T/usage"
+      for p in "$PROC"/[0-9]*; do
+        rd "$p/comm"
+        case $RV in qemu* | *kvm*) ;; *) continue ;; esac
+        g=$(tr '\0' '\n' <"$p/cmdline" 2>/dev/null | awk 'f {print; exit} $0 == "-name" {f = 1}')
+        g=${g#guest=}
+        g=${g%%,*}
+        [ -n "$g" ] || continue
+        vm="${g%%_*}/${g#*_}"
+        ls -l "$p/fd" 2>/dev/null | sed -n 's#.* -> /dev/vfio/\([0-9][0-9]*\)$#\1#p' | sort -u | while read -r grp; do
+          rec G "$grp" "$vm" >>"$T/usage"
+        done
+        ls -l "$p/fd" 2>/dev/null | sed -n 's#.* -> /dev/bus/usb/\([0-9]*\)/\([0-9]*\)$#\1 \2#p' | sort -u | while read -r bus dn; do
+          rec V "$((1$bus - 1000))" "$((1$dn - 1000))" "$vm" >>"$T/usage"
+        done
+      done
+    }
+
+    group_holder() {
+      # VM holding VFIO group $1, if any.
+      awk -F"$US" -v g="$1" '$1 == "G" && $2 == g {print $3; exit}' "$T/usage"
+    }
+
+    # -------------------------------------------------------------- binding
+
+    desired_list() {
+      f="$CONF/$NODE"
+      [ -r "$f" ] || return 0
+      { cat "$f"; echo; } | sed 's/#.*//' | tr ', \t' '\n\n\n' | tr 'A-F' 'a-f' | while read -r a; do
+        case $a in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f].[0-7]) echo "$a" ;;
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f].[0-7]) echo "0000:$a" ;;
+        esac
+      done | sort -u
+    }
+
+    st() { rec "$1" "$2" "${3:-}" >>"$T/status.new"; }
+
+    managed_add() { grep -qx "$1" "$STATE/managed" || echo "$1" >>"$STATE/managed"; }
+    managed_del() { grep -vx "$1" "$STATE/managed" >"$STATE/managed.tmp"; mv "$STATE/managed.tmp" "$STATE/managed"; }
+
+    bind_vfio() {
+      a=$1
+      d="$SYS/bus/pci/devices/$a"
+      [ -e "$d" ] || { st "$a" missing "This device is not on the host."; return; }
+      reason=$(awk -F"$US" -v a="$a" '$1 == a {print $2; exit}' "$T/needs")
+      [ -z "$reason" ] || { st "$a" refused "Kept for the host: it $reason."; return; }
+      cur=$(drvname "$d")
+      if [ "$cur" != vfio-pci ]; then
+        [ -d "$SYS/bus/pci/drivers/vfio-pci" ] || nsenter -t 1 -m -- modprobe vfio-pci >/dev/null 2>&1 || true
+        [ -d "$SYS/bus/pci/drivers/vfio-pci" ] || { st "$a" failed "The vfio-pci driver is not available on this host."; return; }
+        echo vfio-pci >"$d/driver_override" 2>/dev/null || { st "$a" failed "The host refused the driver override."; return; }
+        [ -z "$cur" ] || echo "$a" >"$d/driver/unbind" 2>/dev/null
+        echo "$a" >"$SYS/bus/pci/drivers_probe" 2>/dev/null
+        now=$(drvname "$d")
+        if [ "$now" != vfio-pci ]; then
+          st "$a" failed "The kernel did not bind vfio-pci (driver now: ${now:-none})."
+          return
+        fi
+        date +%s >"$OUT/last-bind"
+        log "bound $a to vfio-pci (was ${cur:-no driver})"
+      else
+        rd "$d/driver_override"
+        [ "$RV" = vfio-pci ] || echo vfio-pci >"$d/driver_override" 2>/dev/null
+      fi
+      managed_add "$a"
+      st "$a" ready ""
+    }
+
+    release() {
+      a=$1
+      d="$SYS/bus/pci/devices/$a"
+      if [ ! -e "$d" ]; then managed_del "$a"; return; fi
+      g=$(readlink "$d/iommu_group" 2>/dev/null) && g=${g##*/} || g=
+      holder=
+      [ -n "$g" ] && holder=$(group_holder "$g")
+      if [ -n "$holder" ]; then
+        st "$a" deferred "In use by $holder: it goes back to the host when that VM powers off."
+        return
+      fi
+      echo >"$d/driver_override" 2>/dev/null
+      [ "$(drvname "$d")" = vfio-pci ] && echo "$a" >"$SYS/bus/pci/drivers/vfio-pci/unbind" 2>/dev/null
+      echo "$a" >"$SYS/bus/pci/drivers_probe" 2>/dev/null
+      managed_del "$a"
+      log "gave $a back to the host (driver now: $(drvname "$d"))"
+    }
+
+    write_rules() {
+      [ -d "${RULES%/*}" ] || return 0
+      if [ ! -s "$STATE/managed" ]; then
+        [ -e "$RULES" ] && rm -f "$RULES" && log "removed $RULES"
+        return 0
+      fi
+      {
+        echo "# Written by hangar-node-agent: these PCI devices go to vfio-pci at boot, for VMs."
+        echo "# Change them from Hangar (host > Hardware); the agent rewrites this file."
+        sort -u "$STATE/managed" | while read -r a; do
+          [ -n "$a" ] && echo "ACTION==\"add\", SUBSYSTEM==\"pci\", KERNEL==\"$a\", ATTR{driver_override}=\"vfio-pci\", RUN{builtin}+=\"kmod load vfio-pci\""
+        done
+      } >"$RULES.tmp"
+      if cmp -s "$RULES.tmp" "$RULES"; then rm -f "$RULES.tmp"; else mv "$RULES.tmp" "$RULES" && log "wrote $RULES"; fi
+    }
+
+    reconcile() {
+      host_needs
+      usage
+      : >"$T/status.new"
+      desired_list >"$T/desired"
+      while read -r a; do bind_vfio "$a"; done <"$T/desired"
+      sort -u "$STATE/managed" | while read -r a; do
+        [ -n "$a" ] || continue
+        grep -qx "$a" "$T/desired" || release "$a"
+      done
+      write_rules
+      mv "$T/status.new" "$T/status"
+    }
+
+    # ------------------------------------------------------------- inventory
+
+    # What the start of a disk says it holds (comma list), like blkid does.
+    signature() {
+      _d="$DEV/$1"
+      [ -b "$_d" ] || return 0
+      _s=$(dd if="$_d" bs=4096 count=1 2>/dev/null | tr -c '[:print:]' '.')
+      _out=
+      case $_s in *"bluestore block device"*) _out="$_out,ceph" ;; esac
+      case $_s in *LABELONE*) _out="$_out,lvm" ;; esac
+      case $_s in *"EFI PART"*) _out="$_out,gpt" ;; esac
+      case $_s in XFSB*) _out="$_out,xfs" ;; esac
+      case $_s in LUKS*) _out="$_out,luks" ;; esac
+      case $_s in *SWAPSPACE2* | *SWAP-SPACE*) _out="$_out,swap" ;; esac
+      [ "$(dd if="$_d" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' ')" = 53ef ] && _out="$_out,ext"
+      [ "$(dd if="$_d" bs=1 skip=65600 count=8 2>/dev/null)" = "_BHRfS_M" ] && _out="$_out,btrfs"
+      case $_out in *gpt*) ;; *) [ "$(dd if="$_d" bs=1 skip=510 count=2 2>/dev/null | od -An -tx1 | tr -d ' ')" = 55aa ] && _out="$_out,mbr" ;; esac
+      echo "${_out#,}"
+    }
+
+    gather_records() {
+      R=$1
+      : >"$R"
+      rec K node "$NODE" >>"$R"
+      rec K agent "$VERSION" >>"$R"
+      rec K generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$R"
+      rd "$PROC/cmdline"
+      rec K cmdline "$RV" >>"$R"
+      rec K kernel "$(uname -r)" >>"$R"
+      ng=$(ls "$SYS/kernel/iommu_groups" 2>/dev/null | wc -l)
+      rec K iommuGroups "$ng" >>"$R"
+      [ -d "$SYS/bus/pci/drivers/vfio-pci" ] && rec K vfio 1 >>"$R"
+      rd "$OUT/last-bind"
+      [ -n "$RV" ] && rec K lastBind "$RV" >>"$R"
+
+      # PCI
+      for d in "$SYS"/bus/pci/devices/*; do
+        [ -e "$d" ] || continue
+        a=${d##*/}
+        rd "$d/class"; cls=${RV#0x}
+        rd "$d/vendor"; ven=${RV#0x}
+        rd "$d/device"; dev=${RV#0x}
+        rd "$d/subsystem_vendor"; sv=${RV#0x}
+        rd "$d/subsystem_device"; sd=${RV#0x}
+        rd "$d/revision"; rev=${RV#0x}
+        drv=$(drvname "$d")
+        rd "$d/driver_override"; ov=$RV
+        [ "$ov" = "(null)" ] && ov=
+        g=$(readlink "$d/iommu_group" 2>/dev/null) && g=${g##*/} || g=
+        rd "$d/numa_node"; numa=$RV
+        rd "$d/sriov_totalvfs"; tvf=$RV
+        rd "$d/sriov_numvfs"; nvf=$RV
+        pf=$(readlink "$d/physfn" 2>/dev/null) && pf=${pf##*/} || pf=
+        rd "$d/boot_vga"; bv=$RV
+        par=$(pci_in_path "$(readlink -f "$d")" | tail -2 | head -1)
+        [ "$par" = "$a" ] && par=
+        rec P "$a" "$cls" "$ven" "$dev" "$sv" "$sd" "$rev" "$drv" "$ov" "$g" "$numa" "$tvf" "$nvf" "$pf" "$bv" "$par" >>"$R"
+        for m in "$d"/mdev_supported_types/*; do
+          [ -d "$m" ] || continue
+          rd "$m/name"; mn=$RV
+          rd "$m/available_instances"; av=$RV
+          rd "$m/device_api"; api=$RV
+          rd "$m/description"; desc=$RV
+          rec M "$a" "${m##*/}" "$mn" "$av" "$api" "$desc" >>"$R"
+        done
+      done
+      for m in "$SYS"/bus/mdev/devices/*; do
+        [ -e "$m" ] || continue
+        u=${m##*/}
+        par=$(pci_in_path "$(readlink -f "$m")" | tail -1)
+        ty=$(readlink "$m/mdev_type" 2>/dev/null) && ty=${ty##*/} || ty=
+        g=$(readlink "$m/iommu_group" 2>/dev/null) && g=${g##*/} || g=
+        rec D "$u" "$par" "$ty" "$g" >>"$R"
+      done
+
+      # USB (devices, not interfaces or root hubs)
+      for u in "$SYS"/bus/usb/devices/*; do
+        n=${u##*/}
+        case $n in *:* | usb*) continue ;; esac
+        [ -f "$u/idVendor" ] || continue
+        rd "$u/busnum"; bus=$RV
+        rd "$u/devnum"; dn=$RV
+        rd "$u/idVendor"; ven=$RV
+        rd "$u/idProduct"; prod=$RV
+        rd "$u/manufacturer"; man=$RV
+        rd "$u/product"; pn=$RV
+        rd "$u/serial"; ser=$RV
+        rd "$u/speed"; spd=$RV
+        rd "$u/bDeviceClass"; dc=$RV
+        ifc=
+        drvs=
+        for i in "$u/$n":*; do
+          [ -d "$i" ] || continue
+          rd "$i/bInterfaceClass"
+          ifc="$ifc${ifc:+,}$RV"
+          x=$(drvname "$i")
+          [ -n "$x" ] && drvs="$drvs${drvs:+,}$x"
+        done
+        ctl=$(pci_in_path "$(readlink -f "$u")" | tail -1)
+        rec U "$n" "$bus" "$dn" "$ven" "$prod" "$man" "$pn" "$ser" "$spd" "$dc" "$ifc" "$drvs" "$ctl" >>"$R"
+      done
+
+      # Disks
+      : >"$T/byid"
+      for l in "$DEV"/disk/by-id/*; do
+        [ -L "$l" ] || continue
+        t=$(readlink "$l")
+        rec "${t##*/}" "${l##*/}" >>"$T/byid"
+      done
+      for b in "$SYS"/block/*; do
+        n=${b##*/}
+        case $n in loop* | ram* | zram* | dm-* | md* | nbd* | fd* | rbd* | drbd* | zd*) continue ;; esac
+        rd "$b/size"; size=$((${RV:-0} * 512))
+        rd "$b/device/model"; model=$RV
+        rd "$b/device/vendor"; vend=$RV
+        rd "$b/device/serial"; ser=$RV
+        rd "$b/device/wwid"; wwid=$RV
+        [ -n "$wwid" ] || { rd "$b/wwid"; wwid=$RV; }
+        rd "$b/queue/rotational"; rot=$RV
+        rd "$b/removable"; rem=$RV
+        ids=$(awk -F"$US" -v n="$n" '$1 == n {print $2}' "$T/byid" | tr '\n' ',' | sed 's/,$//')
+        parts=
+        holders=$(ls "$b/holders" 2>/dev/null | tr '\n' ',')
+        for p in "$b"/"$n"*; do
+          [ -f "$p/partition" ] || continue
+          parts="$parts${parts:+,}${p##*/}"
+          h=$(ls "$p/holders" 2>/dev/null | tr '\n' ',')
+          holders="$holders$h"
+        done
+        holders=${holders%,}
+        mounts=$(awk -v n="$n" '$1 ~ "^/dev/" n "([0-9]|p[0-9]|$)" {print $2}' "$PROC/1/mounts" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+        swap=$(awk -v n="$n" '$1 ~ "^/dev/" n "([0-9]|p[0-9]|$)" {print "swap"}' "$PROC/swaps" 2>/dev/null | head -1)
+        path=$(readlink -f "$b")
+        ctl=$(pci_in_path "$path" | tail -1)
+        case $path in
+        */nvme/*) tr=nvme ;;
+        */usb[0-9]*) tr=usb ;;
+        */end_device-* | */port-*) tr=sas ;;
+        */ata[0-9]*) tr=sata ;;
+        */virtio[0-9]*) tr=virtio ;;
+        *) tr=scsi ;;
+        esac
+        case $n in sr*) tr=cdrom ;; esac
+        sig=
+        case $tr in cdrom) ;; *) sig=$(signature "$n") ;; esac
+        rec B "$n" "$size" "$model" "$vend" "$ser" "$wwid" "$rot" "$rem" "$ids" "$parts" "$holders" "${mounts}${swap:+${mounts:+,}$swap}" "$ctl" "$tr" "$sig" "$(openers "$n")" >>"$R"
+      done
+
+      # What the host needs, who uses what, the binder's view.
+      sed "s/^/H$US/" "$T/needs" >>"$R" 2>/dev/null
+      cat "$T/usage" >>"$R" 2>/dev/null
+      sed "s/^/S$US/" "$T/status" >>"$R" 2>/dev/null
+      while read -r a; do [ -n "$a" ] && rec W "$a" >>"$R"; done <"$T/desired" 2>/dev/null
+      [ -r "$STATE/managed" ] && while read -r a; do [ -n "$a" ] && rec X "$a" >>"$R"; done <"$STATE/managed"
+    }
+
+    render() {
+      awk -F"$US" -v rec="$1" -f "$AWK" "$1" "$IDS/pci.ids" "$IDS/usb.ids"
+    }
+
+    publish() {
+      gather_records "$T/records" || return
+      render "$T/records" >"$OUT/inventory.json.tmp" 2>"$T/render.err" && mv "$OUT/inventory.json.tmp" "$OUT/inventory.json"
+    }
+
+    case ${1:-run} in
+    gather)
+      [ -s "$T/needs" ] || host_needs
+      usage
+      : >>"$T/status"
+      : >>"$T/desired"
+      gather_records "$T/records"
+      render "$T/records"
+      ;;
+    reconcile)
+      reconcile
+      cat "$T/status"
+      ;;
+    run)
+      log "hangar-node-agent $VERSION on $NODE"
+      last=
+      n=0
+      while :; do
+        sum=$(cat "$CONF/$NODE" 2>/dev/null | md5sum)
+        if [ "$sum" != "$last" ] || [ $((n % 12)) -eq 0 ]; then
+          reconcile
+          last=$sum
+          publish
+        elif [ $((n % 4)) -eq 0 ]; then
+          usage
+          publish
+        fi
+        n=$((n + 1))
+        sleep 5
+      done
+      ;;
+    *)
+      echo "usage: $0 run|gather|reconcile" >&2
+      exit 2
+      ;;
+    esac
+  render.awk: |
+    # Renders the records agent.sh gathered as the inventory JSON, with names
+    # from pci.ids and usb.ids. Records are fields separated by \037; the
+    # first field is the kind (see agent.sh gather_records).
+    # Usage: awk -F'\037' -v rec=RECORDS -f render.awk RECORDS pci.ids usb.ids
+
+    function join(s, sep, rep, n, i, a, out) {
+      n = split(s, a, sep)
+      out = a[1]
+      for (i = 2; i <= n; i++) out = out rep a[i]
+      return out
+    }
+    # JSON string. Concatenation only: gsub replacement escapes differ between awks.
+    function q(s) {
+      s = join(s, "\\", "\\\\")
+      s = join(s, "\"", "\\\"")
+      gsub(/\t/, " ", s)
+      return "\"" s "\""
+    }
+    function qn(s) { return s == "" ? "null" : q(s) }
+    function num(s) { return s ~ /^-?[0-9]+$/ ? sprintf("%.0f", s + 0) : "null" }
+    function bool(s) { return s == "1" ? "true" : "false" }
+    function arr(s, n, i, a, out) {
+      if (s == "") return "[]"
+      n = split(s, a, ",")
+      out = "["
+      for (i = 1; i <= n; i++) if (a[i] != "") out = out (out == "[" ? "" : ",") q(a[i])
+      return out "]"
+    }
+    function cls2(c) { return substr(c, 1, 2) }
+    function cls4(c) { return substr(c, 1, 4) }
+
+    FILENAME == rec {
+      k = $1
+      if (k == "K") { meta[$2] = $3; next }
+      if (k == "P") {
+        P[np++] = $0
+        wantV[$4] = 1; wantV[$6] = 1
+        wantD[$4 ":" $5] = 1
+        wantS[$4 ":" $5 ":" $6 ":" $7] = 1
+        wantC[cls2($3)] = 1; wantSC[cls4($3)] = 1
+        next
+      }
+      if (k == "M") { M[nm++] = $0; next }
+      if (k == "D") { D[nd++] = $0; next }
+      if (k == "U") {
+        U[nu++] = $0
+        wantUV[$5] = 1; wantUP[$5 ":" $6] = 1; wantUC[$11] = 1
+        n = split($12, ic, ",")
+        for (i = 1; i <= n; i++) wantUC[ic[i]] = 1
+        next
+      }
+      if (k == "B") { B[nb++] = $0; next }
+      if (k == "H") { needs[$2] = $3; next }
+      if (k == "G") { groupVm[$2] = $3; next }
+      if (k == "V") { usbVm[$2 ":" $3] = $4; next }
+      if (k == "S") { stState[$2] = $3; stMsg[$2] = $4; next }
+      if (k == "W") { desired[$2] = 1; next }
+      if (k == "X") { managed[$2] = 1; next }
+      next
+    }
+
+    FILENAME ~ /pci\.ids$/ {
+      line = $0
+      if (line == "" || line ~ /^#/) next
+      if (line ~ /^C /) { pc = substr(line, 3, 2); inC = 1; if (pc in wantC) pciClass[pc] = substr(line, 7); next }
+      if (inC) {
+        if (line ~ /^\t\t/) next
+        if (line ~ /^\t/) { sc = pc substr(line, 2, 2); if (sc in wantSC) pciSub[sc] = substr(line, 6); next }
+      }
+      if (line ~ /^[0-9a-f][0-9a-f][0-9a-f][0-9a-f] /) { inC = 0; pv = substr(line, 1, 4); if (pv in wantV) pciVen[pv] = substr(line, 7); next }
+      if (line ~ /^\t\t[0-9a-f][0-9a-f][0-9a-f][0-9a-f] [0-9a-f][0-9a-f][0-9a-f][0-9a-f] /) {
+        key = pv ":" pd ":" substr(line, 3, 4) ":" substr(line, 8, 4)
+        if (key in wantS) pciSubsys[key] = substr(line, 14)
+        next
+      }
+      if (line ~ /^\t[0-9a-f][0-9a-f][0-9a-f][0-9a-f] /) { pd = substr(line, 2, 4); key = pv ":" pd; if (key in wantD) pciDev[key] = substr(line, 8); next }
+      next
+    }
+
+    FILENAME ~ /usb\.ids$/ {
+      line = $0
+      if (line == "" || line ~ /^#/) next
+      if (line ~ /^C /) { uDone = 1; uc = substr(line, 3, 2); if (uc in wantUC) usbClass[uc] = substr(line, 7); next }
+      if (line ~ /^[A-Z]/) { uDone = 1; next }
+      if (uDone) next
+      if (line ~ /^[0-9a-f][0-9a-f][0-9a-f][0-9a-f] /) { uv = substr(line, 1, 4); if (uv in wantUV) usbVen[uv] = substr(line, 7); next }
+      if (line ~ /^\t[0-9a-f][0-9a-f][0-9a-f][0-9a-f] /) { key = uv ":" substr(line, 2, 4); if (key in wantUP) usbProd[key] = substr(line, 8); next }
+      next
+    }
+
+    END {
+      printf "{\"node\":%s,\"agent\":%s,\"generated\":%s,\"kernel\":%s,\"cmdline\":%s,", q(meta["node"]), q(meta["agent"]), q(meta["generated"]), q(meta["kernel"]), q(meta["cmdline"])
+      printf "\"iommuGroups\":%s,\"vfioLoaded\":%s,\"lastBind\":%s,", num(meta["iommuGroups"]), bool(meta["vfio"]), num(meta["lastBind"])
+
+      # mediated device types per parent
+      for (i = 0; i < nm; i++) {
+        split(M[i], f, FS)
+        e = "{\"id\":" q(f[3]) ",\"name\":" q(f[4]) ",\"available\":" num(f[5]) ",\"api\":" q(f[6]) ",\"description\":" q(f[7]) "}"
+        mt[f[2]] = (f[2] in mt) ? mt[f[2]] "," e : e
+      }
+
+      printf "\"pci\":["
+      for (i = 0; i < np; i++) {
+        split(P[i], f, FS)
+        a = f[2]; c = f[3]; v = f[4]; d = f[5]; sv = f[6]; sd = f[7]; g = f[11]
+        st = (a in stState) ? "{\"state\":" q(stState[a]) ",\"message\":" q(stMsg[a]) "}" : "null"
+        used = (g != "" && (g in groupVm)) ? q(groupVm[g]) : "null"
+        printf "%s{\"address\":%s,\"class\":%s,\"className\":%s,\"subclassName\":%s,", (i ? "," : ""), q(a), q(c), qn(pciClass[cls2(c)]), qn(pciSub[cls4(c)])
+        printf "\"vendor\":%s,\"device\":%s,\"vendorName\":%s,\"deviceName\":%s,", q(v), q(d), qn(pciVen[v]), qn(pciDev[v ":" d])
+        printf "\"subsystemVendor\":%s,\"subsystemDevice\":%s,\"subsystemVendorName\":%s,\"subsystemName\":%s,", q(sv), q(sd), qn(pciVen[sv]), qn(pciSubsys[v ":" d ":" sv ":" sd])
+        printf "\"revision\":%s,\"driver\":%s,\"driverOverride\":%s,\"iommuGroup\":%s,\"numaNode\":%s,", q(f[8]), qn(f[9]), qn(f[10]), qn(g), num(f[12])
+        printf "\"sriovTotalVfs\":%s,\"sriovNumVfs\":%s,\"physfn\":%s,\"bootVga\":%s,\"parent\":%s,", num(f[13]), num(f[14]), qn(f[15]), bool(f[16]), qn(f[17])
+        printf "\"hostNeeds\":%s,\"usedBy\":%s,\"desired\":%s,\"managed\":%s,\"binder\":%s,", qn(needs[a]), used, (a in desired) ? "true" : "false", (a in managed) ? "true" : "false", st
+        printf "\"mdevTypes\":[%s]}", (a in mt) ? mt[a] : ""
+      }
+      printf "],\"mdevs\":["
+      for (i = 0; i < nd; i++) {
+        split(D[i], f, FS)
+        used = (f[5] != "" && (f[5] in groupVm)) ? q(groupVm[f[5]]) : "null"
+        printf "%s{\"uuid\":%s,\"parent\":%s,\"type\":%s,\"iommuGroup\":%s,\"usedBy\":%s}", (i ? "," : ""), q(f[2]), qn(f[3]), qn(f[4]), qn(f[5]), used
+      }
+      printf "],\"usb\":["
+      for (i = 0; i < nu; i++) {
+        split(U[i], f, FS)
+        v = f[5]; p = f[6]
+        vn = (v in usbVen) ? usbVen[v] : f[7]
+        pn = ((v ":" p) in usbProd) ? usbProd[v ":" p] : f[8]
+        n = split(f[12], ic, ",")
+        icn = ""
+        for (j = 1; j <= n; j++) if (ic[j] in usbClass) icn = icn (icn == "" ? "" : ",") usbClass[ic[j]]
+        k2 = (f[3] + 0) ":" (f[4] + 0)
+        used = (k2 in usbVm) ? q(usbVm[k2]) : "null"
+        printf "%s{\"path\":%s,\"bus\":%s,\"device\":%s,\"vendor\":%s,\"product\":%s,\"vendorName\":%s,\"productName\":%s,", (i ? "," : ""), q(f[2]), num(f[3]), num(f[4]), q(v), q(p), qn(vn), qn(pn)
+        printf "\"manufacturer\":%s,\"productString\":%s,\"serial\":%s,\"speed\":%s,\"deviceClass\":%s,\"className\":%s,", qn(f[7]), qn(f[8]), qn(f[9]), qn(f[10]), qn(f[11]), qn(usbClass[f[11]])
+        printf "\"interfaceClasses\":%s,\"interfaceClassNames\":%s,\"drivers\":%s,\"controller\":%s,\"usedBy\":%s}", arr(f[12]), arr(icn), arr(f[13]), qn(f[14]), used
+      }
+      printf "],\"disks\":["
+      for (i = 0; i < nb; i++) {
+        split(B[i], f, FS)
+        printf "%s{\"name\":%s,\"sizeBytes\":%s,\"model\":%s,\"vendor\":%s,\"serial\":%s,\"wwid\":%s,", (i ? "," : ""), q(f[2]), num(f[3]), qn(f[4]), qn(f[5]), qn(f[6]), qn(f[7])
+        printf "\"rotational\":%s,\"removable\":%s,\"byId\":%s,\"partitions\":%s,\"holders\":%s,\"mounts\":%s,", bool(f[8]), bool(f[9]), arr(f[10]), arr(f[11]), arr(f[12]), arr(f[13])
+        printf "\"controller\":%s,\"transport\":%s,\"signatures\":%s,\"openBy\":%s}", qn(f[14]), q(f[15]), arr(f[16]), arr(f[17])
+      }
+      printf "]}\n"
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/name: hangar-node-agent
+    app.kubernetes.io/part-of: hangar
+  name: hangar-node-agent-scripts-8c4bfb866g
+  namespace: hangar-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app.kubernetes.io/name: hangar-node-agent
+    app.kubernetes.io/part-of: hangar
+  name: hangar-node-agent
+  namespace: hangar-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hangar-node-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hangar-node-agent
+        app.kubernetes.io/part-of: hangar
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - command:
+        - sh
+        - /scripts/agent.sh
+        - run
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        image: docker.io/library/busybox:1.37.0-musl
+        name: agent
+        resources:
+          limits:
+            memory: 96Mi
+          requests:
+            cpu: 10m
+            memory: 16Mi
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /scripts
+          name: scripts
+          readOnly: true
+        - mountPath: /config
+          name: desired
+          readOnly: true
+        - mountPath: /run/hangar
+          name: inventory
+        - mountPath: /host/sys
+          name: host-sys
+        - mountPath: /host/dev
+          name: host-dev
+          readOnly: true
+        - mountPath: /host/etc/udev/rules.d
+          name: udev-rules
+        - mountPath: /host/var/lib/hangar
+          name: state
+        - mountPath: /hwdata
+          name: hwdata
+          readOnly: true
+      - command:
+        - httpd
+        - -f
+        - -p
+        - "8095"
+        - -h
+        - /www
+        image: docker.io/library/busybox:1.37.0-musl
+        name: http
+        ports:
+        - containerPort: 8095
+          name: inventory
+        readinessProbe:
+          httpGet:
+            path: /inventory.json
+            port: inventory
+          initialDelaySeconds: 3
+          periodSeconds: 10
+        resources:
+          limits:
+            memory: 32Mi
+          requests:
+            cpu: 5m
+            memory: 8Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsGroup: 65534
+          runAsNonRoot: true
+          runAsUser: 65534
+        volumeMounts:
+        - mountPath: /www
+          name: inventory
+          readOnly: true
+      hostPID: true
+      serviceAccountName: hangar-node-agent
+      terminationGracePeriodSeconds: 5
+      tolerations:
+      - operator: Exists
+      volumes:
+      - configMap:
+          defaultMode: 365
+          name: hangar-node-agent-scripts-8c4bfb866g
+        name: scripts
+      - configMap:
+          name: hangar-passthrough
+          optional: true
+        name: desired
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 16Mi
+        name: inventory
+      - hostPath:
+          path: /sys
+          type: Directory
+        name: host-sys
+      - hostPath:
+          path: /dev
+          type: Directory
+        name: host-dev
+      - hostPath:
+          path: /etc/udev/rules.d
+          type: DirectoryOrCreate
+        name: udev-rules
+      - hostPath:
+          path: /var/lib/hangar
+          type: DirectoryOrCreate
+        name: state
+      - hostPath:
+          path: /usr/share/hwdata
+        name: hwdata
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 1
+    type: RollingUpdate

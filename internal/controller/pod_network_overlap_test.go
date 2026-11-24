@@ -19,8 +19,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-const podNetworkOverlap = "PodNetworkOverlap"
-
 // newCiliumCluster is the fake cluster of applied_spec_test.go with Cilium
 // as the CNI, config's features and network, and objects (Nodes,
 // CiliumNodes, cilium-config). Its one component fails at once, without
@@ -71,9 +69,9 @@ func (cl *cluster) condition(conditionType string) *metav1.Condition {
 func (cl *cluster) overlapCondition() metav1.Condition {
 	cl.t.Helper()
 	cl.reconcile()
-	cond := cl.condition(podNetworkOverlap)
+	cond := cl.condition(k4allv1alpha1.ConditionPodNetworkOverlap)
 	if cond == nil {
-		cl.t.Fatalf("no %s condition on the ClusterConfig", podNetworkOverlap)
+		cl.t.Fatalf("no %s condition on the ClusterConfig", k4allv1alpha1.ConditionPodNetworkOverlap)
 	}
 	return *cond
 }
@@ -320,7 +318,7 @@ func TestPodNetworkOverlap_NotReportedWithCalico(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta.SetStatusCondition(&cc.Status.Conditions, metav1.Condition{
-		Type: podNetworkOverlap, Status: metav1.ConditionTrue, Reason: "OverlapFound", Message: "left by Cilium",
+		Type: k4allv1alpha1.ConditionPodNetworkOverlap, Status: metav1.ConditionTrue, Reason: "OverlapFound", Message: "left by Cilium",
 	})
 	if err := cl.c.Status().Update(context.Background(), cc); err != nil {
 		t.Fatal(err)
@@ -328,7 +326,7 @@ func TestPodNetworkOverlap_NotReportedWithCalico(t *testing.T) {
 
 	cl.reconcile()
 
-	if cond := cl.condition(podNetworkOverlap); cond != nil {
-		t.Errorf("%s with Calico: %s (%s): %s", podNetworkOverlap, cond.Status, cond.Reason, cond.Message)
+	if cond := cl.condition(k4allv1alpha1.ConditionPodNetworkOverlap); cond != nil {
+		t.Errorf("%s with Calico: %s (%s): %s", k4allv1alpha1.ConditionPodNetworkOverlap, cond.Status, cond.Reason, cond.Message)
 	}
 }
