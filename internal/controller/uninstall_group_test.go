@@ -66,7 +66,7 @@ func rookGroup() map[string]k4allv1alpha1.ComponentSpec {
 
 // groupsOnEnvtest is a cluster with every feature off where the components
 // are Installed at v1, with their objects (componentObject), and the
-// reconciler gives each its built-in hook.
+// reconciler gives each its built-in hook (standInHooks).
 func groupsOnEnvtest(t *testing.T, components map[string]k4allv1alpha1.ComponentSpec) (client.Client, *ReleaseReconciler) {
 	t.Helper()
 	cfg := envtestConfig(t)
@@ -102,7 +102,32 @@ func groupsOnEnvtest(t *testing.T, components map[string]k4allv1alpha1.Component
 	if err := c.Status().Update(ctx, rm); err != nil {
 		t.Fatal(err)
 	}
-	return c, &ReleaseReconciler{Client: c, Scheme: s, RestConfig: cfg, Log: logr.Discard()}
+	r := &ReleaseReconciler{Client: c, Scheme: s, RestConfig: cfg, Log: logr.Discard()}
+	standInHooks(r)
+	return c, r
+}
+
+// withoutRemover is a built-in hook without its Remover, its UninstallGuard
+// kept: the engine uninstalls the component, as it does any manifest
+// component, so the stand-in ConfigMap (componentObject) goes.
+// hangar-node-agent's and snapshot-controller's Removers delete the objects
+// of their upstream manifests, which these components do not have.
+type withoutRemover struct{ hooks.Hook }
+
+func (w withoutRemover) UninstallBlocked(ctx context.Context, name string) (string, error) {
+	if guard, ok := w.Hook.(hooks.UninstallGuard); ok {
+		return guard.UninstallBlocked(ctx, name)
+	}
+	return "", nil
+}
+
+// standInHooks gives r the built-in hooks on its client, with
+// hangar-node-agent and snapshot-controller as withoutRemover.
+func standInHooks(r *ReleaseReconciler) {
+	r.hookReg = hooks.NewRegistry(r.Client, r.Log, hooks.WithRestConfig(r.RestConfig))
+	for _, name := range []string{"hangar-node-agent", "snapshot-controller"} {
+		r.hookReg.Register(name, withoutRemover{r.hookReg.Get(name)})
+	}
 }
 
 // recordDeletes makes the reconciler's client record, in order, the
@@ -127,6 +152,7 @@ func recordDeletes(t *testing.T, r *ReleaseReconciler) *[]string {
 			return cl.Delete(ctx, obj, opts...)
 		},
 	})
+	standInHooks(r)
 	return &deleted
 }
 
