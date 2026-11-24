@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -40,8 +41,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -136,6 +139,12 @@ const resyncInterval = 5 * time.Minute
 // PostInstall or Sync failed.
 const hookFailedPrefix = "installed but hook failed: "
 
+// hookUnfinished tells whether an installed component's message says that
+// its hook failed: the hook's PostInstall runs again.
+func hookUnfinished(message string) bool {
+	return strings.HasPrefix(message, hookFailedPrefix)
+}
+
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("releasemanifest", req.Name)
 	rm := &k4allv1alpha1.ReleaseManifest{}
@@ -227,11 +236,13 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	markUnmanagedComponents(rm)
+	before := maps.Clone(rm.Status.Components)
 	// Removals first: a replacement can then take over what the removed
 	// component held (traefik: the node's ports and the "nginx" IngressClass).
 	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	inactiveOK := r.reconcileInactiveComponents(ctx, log, rm, active, config.Spec)
 	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
+	keepFailedSince(before, rm)
 	setDowngradeRefused(rm, active)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
 
@@ -253,6 +264,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if anyUninstallRefused(rm) {
 		requeue = sooner(requeue, uninstallRefusedPollInterval)
 	}
+	requeue = sooner(requeue, failedRetry(rm, time.Now()))
 	return ctrl.Result{RequeueAfter: sooner(requeue, hookRequeue)}, nil
 }
 
@@ -461,7 +473,9 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 				strings.HasPrefix(currentStatus.Message, uninstallQueuedPrefix) {
 				currentStatus.Message = engine.InstalledMessage
 			}
-			hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, &currentStatus))
+			// A PostInstall that failed runs again until it succeeds.
+			postInstall := hookUnfinished(currentStatus.Message)
+			hookRequeue = sooner(hookRequeue, r.runHooks(ctx, log, name, spec, config, &currentStatus, postInstall))
 			rm.Status.Components[name] = currentStatus
 			continue
 		}
@@ -552,37 +566,49 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			st.Message = fmt.Sprintf("upgrade step %s installed, upgrading towards %s", toApply.Version, spec.Version)
 		}
 
-		// Run PostInstall hook for post-install configuration
-		if hook := r.hookReg.Get(name); hook != nil {
-			if hookErr := hook.PostInstall(ctx, spec, config); hookErr != nil {
-				log.Error(hookErr, "post-install hook failed", "name", name)
-				st.Message = hookFailedPrefix + hookErr.Error()
-			}
-		}
-		hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, st))
+		hookRequeue = sooner(hookRequeue, r.runHooks(ctx, log, name, spec, config, st, true))
 		rm.Status.Components[name] = *st
 	}
 	return allOK, stepsLeft, hookRequeue
 }
 
-// syncHook runs the Sync of the component's hook, when the hook is a Syncer,
-// and returns how soon it wants to run again (0: at the periodic reconcile).
-// A failure goes into st's message like a PostInstall one; a success clears
-// such a message from an installed component.
-func (r *ReleaseReconciler) syncHook(
+// runHooks runs the component's hook after an apply, or on an installed
+// component that is up to date: its PostInstall when postInstall is set, then
+// its Sync, when the hook is a Syncer. It returns how soon Sync wants to run
+// again (0: at the periodic reconcile). The first failure goes into st's
+// message; when neither fails, an installed component's earlier hook failure
+// is cleared.
+func (r *ReleaseReconciler) runHooks(
 	ctx context.Context, log logr.Logger, name string, spec k4allv1alpha1.ComponentSpec,
-	config k4allv1alpha1.ClusterConfigSpec, st *k4allv1alpha1.ComponentStatus,
+	config k4allv1alpha1.ClusterConfigSpec, st *k4allv1alpha1.ComponentStatus, postInstall bool,
 ) time.Duration {
-	syncer, ok := r.hookReg.Get(name).(hooks.Syncer)
-	if !ok {
+	hook := r.hookReg.Get(name)
+	if hook == nil {
 		return 0
 	}
-	after, err := syncer.Sync(ctx, spec, config)
+	var unfinished error
+	note := func(step string, err error) {
+		if err == nil {
+			return
+		}
+		log.Error(err, "hook failed", "name", name, "step", step)
+		if unfinished == nil {
+			unfinished = err
+		}
+	}
+	if postInstall {
+		note("PostInstall", hook.PostInstall(ctx, spec, config))
+	}
+	var after time.Duration
+	if syncer, ok := hook.(hooks.Syncer); ok {
+		var err error
+		after, err = syncer.Sync(ctx, spec, config)
+		note("Sync", err)
+	}
 	switch {
-	case err != nil:
-		log.Error(err, "hook sync failed", "name", name)
-		st.Message = hookFailedPrefix + err.Error()
-	case st.State == k4allv1alpha1.ComponentStateInstalled && strings.HasPrefix(st.Message, hookFailedPrefix):
+	case unfinished != nil:
+		st.Message = hookFailedPrefix + unfinished.Error()
+	case st.State == k4allv1alpha1.ComponentStateInstalled && hookUnfinished(st.Message):
 		st.Message = engine.InstalledMessage
 	}
 	return after
@@ -1148,6 +1174,10 @@ func (r *ReleaseReconciler) componentValues(
 	return engine.ApplyOverride(values, override)
 }
 
+// SetupWithManager watches the ReleaseManifests and the ClusterConfig's
+// spec. Not its status: every reconcile writes it (lastReconcileTime), and a
+// reconcile that ran into the next second would start the next one at once,
+// trying a failed component again with no backoff.
 func (r *ReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&k4allv1alpha1.ReleaseManifest{}).
@@ -1165,7 +1195,7 @@ func (r *ReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 				return requests
 			},
-		)).
+		), builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("release").
 		Complete(r)
 }
