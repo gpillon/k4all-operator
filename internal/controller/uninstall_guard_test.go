@@ -38,18 +38,28 @@ metadata:
 
 // A component whose hook refuses its uninstall stays installed when it goes
 // away from the release, whichever way: Rook while a CephCluster holds data.
-// Its status says why, and the uninstall happens at the first reconcile
-// after the hook lets it.
+// Its status says why (with its feature off, which component of the feature
+// refuses: see uninstall_group_test.go), and the uninstall happens at the
+// first reconcile after the hook lets it.
 func TestReconcile_UninstallWaitsForTheHookToAllowIt(t *testing.T) {
-	for name, goAway := range map[string]func(*k4allv1alpha1.ComponentSpec){
-		"its feature is off":    func(s *k4allv1alpha1.ComponentSpec) { s.FeatureGate = "rook" },
-		"management is Removed": func(s *k4allv1alpha1.ComponentSpec) { s.Management = k4allv1alpha1.ComponentManagementRemoved },
+	for name, tc := range map[string]struct {
+		goAway func(*k4allv1alpha1.ComponentSpec)
+		want   string
+	}{
+		"its feature is off": {
+			func(s *k4allv1alpha1.ComponentSpec) { s.FeatureGate = "rook" },
+			"uninstall refused: probe: CephCluster rook-ceph/rook-ceph holds data",
+		},
+		"management is Removed": {
+			func(s *k4allv1alpha1.ComponentSpec) { s.Management = k4allv1alpha1.ComponentManagementRemoved },
+			"uninstall refused: CephCluster rook-ceph/rook-ceph holds data",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			spec := k4allv1alpha1.ComponentSpec{
 				Type: k4allv1alpha1.ComponentTypeManifest, Version: "v1", InlineManifests: []string{guardedConfigMap},
 			}
-			goAway(&spec)
+			tc.goAway(&spec)
 			c, r := installedOnEnvtest(t, spec, "v1")
 			ctx := context.Background()
 			cm := &corev1.ConfigMap{}
@@ -69,7 +79,7 @@ func TestReconcile_UninstallWaitsForTheHookToAllowIt(t *testing.T) {
 			}
 			st := probeStatus(t, c)
 			if st.State != k4allv1alpha1.ComponentStateInstalled || st.InstalledVersion != "v1" ||
-				!strings.Contains(st.Message, "uninstall refused: CephCluster rook-ceph/rook-ceph holds data") {
+				st.Message != tc.want {
 				t.Fatalf("status %s at %q (%s), want Installed at v1 with the refusal", st.State, st.InstalledVersion, st.Message)
 			}
 			rm := &k4allv1alpha1.ReleaseManifest{}
@@ -108,7 +118,7 @@ func TestReconcile_UninstallIsRefusedWhenTheHookCannotTell(t *testing.T) {
 
 	st := probeStatus(t, c)
 	if st.State != k4allv1alpha1.ComponentStateInstalled ||
-		!strings.Contains(st.Message, "uninstall refused: cannot tell whether probe may be uninstalled: list CephClusters: timeout") {
+		!strings.Contains(st.Message, "uninstall refused: probe: cannot tell whether probe may be uninstalled: list CephClusters: timeout") {
 		t.Fatalf("status %s (%s), want Installed with the refusal", st.State, st.Message)
 	}
 }

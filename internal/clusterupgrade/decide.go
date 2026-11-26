@@ -10,6 +10,8 @@ import (
 	"time"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	drainpkg "github.com/gpillon/k4all-operator/internal/drain"
+	"github.com/gpillon/k4all-operator/internal/nodesettings"
 	"github.com/gpillon/k4all-operator/internal/upgradegraph"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +42,9 @@ const (
 	// upgrade-target, upgrade-done and upgrade-cordoned annotations and
 	// remove the draining label.
 	Finish ActionKind = "Finish"
+	// EvictSelf evicts the operator's own pod (Pods) from the node it
+	// drained, so the leader moves before the node's reboot (k4all#97).
+	EvictSelf ActionKind = "EvictSelf"
 )
 
 // Action is one change to one Node.
@@ -47,35 +52,21 @@ type Action struct {
 	Kind    ActionKind
 	Node    string
 	Release string   // SetTarget only
-	Pods    []string // Evict only: namespace/name
+	Pods    []string // Evict and EvictSelf only: namespace/name
 }
 
 // Pod is a pod the drain moves off its node: not a DaemonSet, static or
 // finished pod, nor the operator itself.
-type Pod struct {
-	Namespace, Name string
-	Created         time.Time
-	Terminating     bool
-	// NoController: no ownerReference is its controller, so nothing
-	// recreates it once evicted. The drain leaves it to the admin, as
-	// `kubectl drain` without --force does (k4all#99).
-	NoController bool
-}
-
-func (p Pod) String() string { return p.Namespace + "/" + p.Name }
+type Pod = drainpkg.Pod
 
 // PDB is a PodDisruptionBudget with fewer healthy pods than it wants.
-type PDB struct {
-	Namespace, Name  string
-	Healthy, Desired int32
-}
+type PDB = drainpkg.PDB
 
-// Blocker is a pod a drain cannot move: its PodDisruptionBudget allows no
-// disruption although every pod it expects is healthy, so waiting changes
-// nothing (the primary of a single-instance CloudNativePG cluster).
-type Blocker struct {
-	PDB, Pod string // namespace/name
-}
+// Blocker is a pod a drain cannot move (drain.Blocker).
+type Blocker = drainpkg.Blocker
+
+// Self is the operator's own pod and its node.
+type Self = drainpkg.Self
 
 // Input is the state Decide works from.
 type Input struct {
@@ -102,6 +93,12 @@ type Input struct {
 	Retry bool
 	// Generation of the ClusterUpgrade, for the conditions.
 	Generation int64
+	// SelfNode is the node that runs the operator: last among the nodes of
+	// its type (k4all#97). Self is the operator's pod there (nil: unknown),
+	// SelfEvictTried that this drain of SelfNode evicted it once already.
+	SelfNode       string
+	Self           *Self
+	SelfEvictTried bool
 }
 
 var roleOrder = map[string]int{"bootstrap": 0, "control": 1, "worker": 2}
@@ -118,7 +115,7 @@ func Decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action) {
 // decide returns the status, the actions and, for a Failed upgrade with no
 // failed node, the reason of the Failed condition.
 func decide(in Input) (k4allv1alpha1.ClusterUpgradeStatus, []Action, string) {
-	nodes := sortedNodes(in.Nodes)
+	nodes := sortedNodes(in.Nodes, in.SelfNode)
 	status := observe(in, nodes)
 
 	inFlight := -1
@@ -177,37 +174,12 @@ func blockedNext(in Input, status *k4allv1alpha1.ClusterUpgradeStatus) string {
 		return ""
 	}
 	n := &status.Nodes[i]
-	var why []string
-	if blockers := in.Blockers[n.Name]; len(blockers) > 0 {
-		named := make([]string, 0, 4)
-		for j, b := range blockers {
-			if j == 3 {
-				named = append(named, fmt.Sprintf("and %d more", len(blockers)-3))
-				break
-			}
-			named = append(named, fmt.Sprintf("PDB %s allows no disruption of pod %s", b.PDB, b.Pod))
-		}
-		why = append(why, "cannot be drained: "+strings.Join(named, "; ")+
-			" (a single-instance CloudNativePG cluster? see docs/upgrades.md, Drains that never end)")
-	}
-	if bare := in.BarePods[n.Name]; len(bare) > 0 {
-		why = append(why, "runs pods that declare no controller: "+nameSome(bare)+
-			" (a drain would delete them, and nothing recreates them: delete them, or recreate them under a"+
-			" controller; see docs/upgrades.md, Pods that declare no controller)")
-	}
-	if len(why) == 0 {
+	why := drainpkg.BlockedMessage(in.Blockers[n.Name], in.BarePods[n.Name])
+	if why == "" {
 		return ""
 	}
-	n.Message = strings.Join(why, "; ") + "; the node is not cordoned"
+	n.Message = why
 	return n.Name + " " + n.Message
-}
-
-// nameSome names up to three of names and counts the rest.
-func nameSome(names []string) string {
-	if len(names) <= 3 {
-		return strings.Join(names, ", ")
-	}
-	return fmt.Sprintf("%s, and %d more", strings.Join(names[:3], ", "), len(names)-3)
 }
 
 // waitForPDBs names the PodDisruptionBudget the next node waits for. After a
@@ -215,28 +187,20 @@ func nameSome(names []string) string {
 // has its healthy pods back, the next drain would be refused. The wait ends
 // settleMinutes after the last node finished.
 func waitForPDBs(in Input, status k4allv1alpha1.ClusterUpgradeStatus) string {
-	if len(in.UnhealthyPDBs) == 0 {
-		return ""
-	}
 	var last time.Time
 	for _, n := range status.Nodes {
 		if n.CompletedAt != nil && n.CompletedAt.After(last) {
 			last = n.CompletedAt.Time
 		}
 	}
-	if last.IsZero() || in.Now.Sub(last) >= settleTime(in.Spec) {
-		return ""
-	}
-	p := in.UnhealthyPDBs[0]
-	return fmt.Sprintf("waiting for PDB %s/%s: %d/%d healthy", p.Namespace, p.Name, p.Healthy, p.Desired)
+	return drainpkg.WaitForPDBs(in.UnhealthyPDBs, last, in.Now, DrainSettings(in.Spec).Settle)
 }
 
-// settleTime is spec.drain.settleMinutes, 10 when unset.
-func settleTime(spec k4allv1alpha1.ClusterUpgradeSpec) time.Duration {
-	if spec.Drain.SettleMinutes != nil {
-		return time.Duration(*spec.Drain.SettleMinutes) * time.Minute
-	}
-	return 10 * time.Minute
+// DrainSettings is spec.drain: the timeout (30 minutes when unset), the PDB
+// settle time (10 minutes when unset) and continueOnTimeout. The
+// node-settings rollout drains with the same ones.
+func DrainSettings(spec k4allv1alpha1.ClusterUpgradeSpec) drainpkg.Settings {
+	return drainpkg.SettingsFrom(spec.Drain.TimeoutMinutes, spec.Drain.SettleMinutes, spec.Drain.ContinueOnTimeout)
 }
 
 // setConditions derives the conditions from the phase, keeping the
@@ -376,7 +340,7 @@ func previousHop(in Input, release string) k4allv1alpha1.Hop {
 
 // missingAnnotation names the first node k4all-upgrade has not described.
 func missingAnnotation(nodes []Node) string {
-	for _, n := range sortedNodes(nodes) {
+	for _, n := range sortedNodes(nodes, "") {
 		for _, key := range []string{k4allv1alpha1.NodeReleaseAnnotation, k4allv1alpha1.NodeTypeAnnotation} {
 			if n.Annotations[key] == "" {
 				return fmt.Sprintf("%s has no %s annotation: is k4all-upgrade v2.4.0 or later running there?", n.Name, key)
@@ -427,7 +391,9 @@ func askedHop(node Node, hop string) string {
 }
 
 // waitFor says what keeps the next node from starting, and which node: one
-// not Ready, or one running a hop of its own.
+// not Ready, one running a hop of its own, or one in a node-settings step
+// (a ClusterUpgrade and the node-settings rollout never change two nodes at
+// once).
 func waitFor(nodes []Node) (string, int) {
 	for i, n := range nodes {
 		if !n.Ready {
@@ -436,6 +402,9 @@ func waitFor(nodes []Node) (string, int) {
 		if hop := n.Annotations[upgradeInProgressAnnotation]; hop != "" {
 			return fmt.Sprintf("waiting for the hop %s runs on its own (%s)", n.Name, hop), i
 		}
+		if nodesettings.StepRunning(n.Annotations) {
+			return "waiting for the node-settings step on " + n.Name, i
+		}
 	}
 	return "", -1
 }
@@ -443,12 +412,9 @@ func waitFor(nodes []Node) (string, int) {
 // upgradeInProgressAnnotation is the pause gate k4all-upgrade sets during any hop.
 const upgradeInProgressAnnotation = "k4all.magesgate.com/upgrade-in-progress"
 
-// DrainingLabel is on a Node from its Cordon to its Uncordon or Finish. The
-// operator's pod tolerates the cordon, which a single node needs, and prefers
-// the nodes without this label (config/manager/manager.yaml): a drain that
-// evicts it does not put it back on the node about to reboot (k4all#86).
-// k4all-upgrade sets it too when it drains a node itself.
-const DrainingLabel = "k4all.magesgate.com/draining"
+// DrainingLabel is on a Node from its Cordon to its Uncordon or Finish
+// (drainpkg.Label).
+const DrainingLabel = drainpkg.Label
 
 // nextPending is the index of the first node behind the current hop, -1
 // when there is none.
@@ -579,40 +545,38 @@ func drain(in Input, node Node, n *k4allv1alpha1.NodeUpgradeStatus, hop string) 
 		started := metav1.NewTime(in.Now)
 		n.DrainStartedAt = &started
 	}
-	left, back := splitPods(in.Pods[n.Name], n.DrainStartedAt.Time)
-	if len(left) > 0 && len(in.Nodes) > 1 {
-		timeout := time.Duration(drainTimeoutMinutes(in.Spec)) * time.Minute
-		switch {
-		case in.Now.Sub(n.DrainStartedAt.Time) < timeout:
-			n.Phase = k4allv1alpha1.NodeUpgradeDraining
-			n.Message = fmt.Sprintf("%d pods left: %s", len(left), podList(left))
-			var evict, bare []string
-			for _, p := range left {
-				switch {
-				case p.NoController:
-					bare = append(bare, p.String())
-				case !p.Terminating:
-					evict = append(evict, p.String())
-				}
-			}
-			if len(bare) > 0 {
-				n.Message += "; not evicted, they declare no controller: " + nameSome(bare) +
-					" (delete them, or recreate them under a controller)"
-			}
-			return []Action{{Kind: Evict, Node: n.Name, Pods: evict}}
-		case !in.Spec.Drain.ContinueOnTimeout:
-			n.Phase = k4allv1alpha1.NodeUpgradeFailed
-			n.Message = fmt.Sprintf("drain timed out after %d minutes, %d pods left: %s",
-				drainTimeoutMinutes(in.Spec), len(left), podList(left))
-			n.Reason = k4allv1alpha1.NodeReasonDrainTimeout
-			return nil
-		}
+	single := len(in.Nodes) <= 1
+	p := drainpkg.Drain(in.Pods[n.Name], n.DrainStartedAt.Time, in.Now, DrainSettings(in.Spec), single)
+	switch p.Outcome {
+	case drainpkg.Evicting:
+		n.Phase, n.Message = k4allv1alpha1.NodeUpgradeDraining, p.Message
+		return []Action{{Kind: Evict, Node: n.Name, Pods: p.Evict}}
+	case drainpkg.TimedOut:
+		n.Phase, n.Message = k4allv1alpha1.NodeUpgradeFailed, p.Message
+		n.Reason = k4allv1alpha1.NodeReasonDrainTimeout
+		return nil
+	}
+	if (drainpkg.SelfEviction{Node: n.Name, Self: in.Self, Started: n.DrainStartedAt.Time, Single: single,
+		Elsewhere: elsewhere(in.Nodes, n.Name), Tried: in.SelfEvictTried}).Now() {
+		n.Phase, n.Message = k4allv1alpha1.NodeUpgradeDraining, "moving the k4all-operator off the node before its hop"
+		return []Action{{Kind: EvictSelf, Node: n.Name, Pods: []string{in.Self.String()}}}
 	}
 	n.Phase = k4allv1alpha1.NodeUpgradeUpgrading
-	if len(back) > 0 {
-		n.Message = backMessagePrefix + podList(back)
+	if len(p.Back) > 0 {
+		n.Message = backMessagePrefix + drainpkg.Names(p.Back)
 	}
 	return []Action{{Kind: SetTarget, Node: n.Name, Release: hop}}
+}
+
+// elsewhere tells whether a node other than name is Ready and schedulable:
+// somewhere for the operator's next pod.
+func elsewhere(nodes []Node, name string) bool {
+	for _, n := range nodes {
+		if n.Name != name && n.Ready && !n.Unschedulable {
+			return true
+		}
+	}
+	return false
 }
 
 // NoteRefusedEvictions adds to the status of a node being drained, and to the
@@ -634,42 +598,6 @@ func NoteRefusedEvictions(status *k4allv1alpha1.ClusterUpgradeStatus, node strin
 // it after the drain started; it stays for the rest of the hop.
 const backMessagePrefix = "back on the node after the drain started: "
 
-// splitPods sorts the pods of a node being drained: the ones it had when the
-// drain started, which the drain moves, and the ones put back on it since,
-// which tolerate the cordon or were bound to the node. Like kubectl drain,
-// the drain neither evicts nor waits for the second ones.
-func splitPods(pods []Pod, drainStarted time.Time) (left, back []Pod) {
-	for _, p := range pods {
-		if p.Created.After(drainStarted) {
-			back = append(back, p)
-		} else {
-			left = append(left, p)
-		}
-	}
-	return left, back
-}
-
-// podList names up to three pods.
-func podList(pods []Pod) string {
-	names := make([]string, 0, 3)
-	for i, p := range pods {
-		if i == 3 {
-			names = append(names, fmt.Sprintf("and %d more", len(pods)-3))
-			break
-		}
-		names = append(names, p.String())
-	}
-	return strings.Join(names, ", ")
-}
-
-// drainTimeoutMinutes is spec.drain.timeoutMinutes, 30 when unset.
-func drainTimeoutMinutes(spec k4allv1alpha1.ClusterUpgradeSpec) int32 {
-	if spec.Drain.TimeoutMinutes > 0 {
-		return spec.Drain.TimeoutMinutes
-	}
-	return 30
-}
-
 // previous is the node's entry in the last status written.
 func previous(in Input, name string) k4allv1alpha1.NodeUpgradeStatus {
 	for _, n := range in.Previous.Nodes {
@@ -681,8 +609,10 @@ func previous(in Input, name string) k4allv1alpha1.NodeUpgradeStatus {
 }
 
 // sortedNodes orders nodes as they are upgraded: bootstrap, control, worker,
-// then by name.
-func sortedNodes(nodes []Node) []Node {
+// then by name, except that self, the node running the operator, goes last
+// among the nodes of its type: the operator moves once, onto a node done
+// already (k4all#97). The bootstrap node still goes first.
+func sortedNodes(nodes []Node, self string) []Node {
 	out := append([]Node(nil), nodes...)
 	rank := func(n Node) int {
 		if r, ok := roleOrder[n.Annotations[k4allv1alpha1.NodeTypeAnnotation]]; ok {
@@ -693,6 +623,9 @@ func sortedNodes(nodes []Node) []Node {
 	sort.SliceStable(out, func(i, j int) bool {
 		if rank(out[i]) != rank(out[j]) {
 			return rank(out[i]) < rank(out[j])
+		}
+		if (out[i].Name == self) != (out[j].Name == self) {
+			return out[j].Name == self
 		}
 		return out[i].Name < out[j].Name
 	})

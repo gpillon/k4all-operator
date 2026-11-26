@@ -118,6 +118,71 @@ func FilterRemovedComponents(
 	return removed
 }
 
+// Feature gates a component can name in its featureGate, also read by the
+// hooks that add or leave out parts of a component (headlamp's plugins).
+const (
+	FeatureVirt = "virt"
+	FeatureRook = "rook"
+	// FeatureSnapshots is on with virt or rook: the CSI snapshot controller
+	// serves both (KubeVirt and Hangar snapshot VM disks, ceph-rbd has a
+	// VolumeSnapshotClass). It has no ClusterConfig switch of its own.
+	FeatureSnapshots = "snapshots"
+	// FeatureVirtMetadata is the metadata service of VMs: virt, plus
+	// features.virt.metadata.enabled. An operator before v0.6.0 does not
+	// know it and leaves the k4all-metadata component out.
+	FeatureVirtMetadata = "virtMetadata"
+)
+
+// FeatureEnabled says whether the ClusterConfig turns on the feature gate; an
+// unknown gate is off.
+func FeatureEnabled(gate string, config k4allv1alpha1.ClusterConfigSpec) bool {
+	switch gate {
+	case FeatureVirt:
+		return config.Features.Virt.Enabled
+	case "argocd":
+		return config.Features.ArgoCD.Enabled
+	case "ovsCni":
+		return config.Features.OVSCNI.Enabled
+	case FeatureRook:
+		return rookEnabled(config)
+	case FeatureSnapshots:
+		return config.Features.Virt.Enabled || rookEnabled(config)
+	case FeatureVirtMetadata:
+		md := config.Features.Virt.Metadata
+		return config.Features.Virt.Enabled && md != nil && md.Enabled
+	}
+	return false
+}
+
+// RemovedAfter is the feature gate whose components the components of gate
+// are uninstalled after when both are off; "" for none. virtMetadata goes
+// after virt: the metadata service serves the VMs whose virt group's
+// uninstall waits for them to be deleted (an UninstallGuard), and a VM
+// started without it gets a new MAC and no asset tag.
+func RemovedAfter(gate string) string {
+	if gate == FeatureVirtMetadata {
+		return FeatureVirt
+	}
+	return ""
+}
+
+// rookEnabled says whether k4all runs Rook: features.rook.enabled. A cluster
+// without the field (every cluster before k4all v2.7.0) runs none.
+func rookEnabled(config k4allv1alpha1.ClusterConfigSpec) bool {
+	return config.Features.Rook != nil && config.Features.Rook.Enabled
+}
+
+// hangarNodeAgent is the component of Hangar's privileged node agent.
+const hangarNodeAgent = "hangar-node-agent"
+
+// hangarNodeAgentWanted says whether the ClusterConfig keeps Hangar's node
+// agent: yes unless features.virt.hangar.nodeAgent is false. Absent is the
+// release's default, which installs it with virt (D6).
+func hangarNodeAgentWanted(config k4allv1alpha1.ClusterConfigSpec) bool {
+	hangar := config.Features.Virt.Hangar
+	return hangar == nil || hangar.NodeAgent == nil || *hangar.NodeAgent
+}
+
 // CNI types accepted by ClusterConfig.spec.networking.cni.type.
 const (
 	cniCalico = "calico"
@@ -147,17 +212,14 @@ func shouldInstall(name string, spec k4allv1alpha1.ComponentSpec, config k4allv1
 		}
 	}
 
+	// Hangar's node agent: with its feature gate (virt), unless left out.
+	if name == hangarNodeAgent && !hangarNodeAgentWanted(config) {
+		return false
+	}
+
 	// Feature-gated components
 	if spec.FeatureGate != "" {
-		switch spec.FeatureGate {
-		case "virt":
-			return config.Features.Virt.Enabled
-		case "argocd":
-			return config.Features.ArgoCD.Enabled
-		case "ovsCni":
-			return config.Features.OVSCNI.Enabled
-		}
-		return false
+		return FeatureEnabled(spec.FeatureGate, config)
 	}
 
 	// Virtualization components without explicit featureGate

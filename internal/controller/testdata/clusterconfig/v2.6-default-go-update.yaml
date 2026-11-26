@@ -1,0 +1,32 @@
+# v2.6-default.yaml as the operator writes it back with its Go types (what the
+# migrations' Update sends), written by hand from the v0.5.x types: omitempty
+# drops the empty strings, false booleans and the empty componentOverrides; a
+# struct value with only zero fields is written as {}. No v2.7.0 field.
+apiVersion: k4all.magesgate.com/v1alpha1
+kind: ClusterConfig
+metadata:
+  name: k4all-cluster-config
+spec:
+  networking:
+    cni:
+      type: calico
+      cilium: {}
+    firewalld: {}
+  features:
+    virt:
+      emulation: auto
+    argocd: {}
+    ovsCni: {}
+    ovsBridge:
+      enabled: true
+  cluster:
+    podNetwork: "10.100.0.1/18"
+    serviceNetwork: "10.96.0.0/16"
+    ha:
+      interface: auto
+      type: none
+  ingress:
+    traefik:
+      isDefault: true
+    cilium: {}
+  proxy: {}

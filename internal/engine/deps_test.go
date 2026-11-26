@@ -144,3 +144,118 @@ func TestFilterActiveComponents(t *testing.T) {
 		t.Error("argocd should NOT be active (argocd disabled)")
 	}
 }
+
+// Rook is on only with features.rook.enabled: a cluster without the rook
+// field (every v2.6.x cluster) or with it off runs no Rook, and nothing
+// behind the rook gate (Cairn).
+func TestFeatureEnabled_RookFollowsTheClusterConfig(t *testing.T) {
+	everythingElse := k4allv1alpha1.FeaturesConfig{
+		Virt:   k4allv1alpha1.VirtConfig{Enabled: true},
+		ArgoCD: k4allv1alpha1.ArgoCDConfig{Enabled: true},
+		OVSCNI: k4allv1alpha1.OVSCNIConfig{Enabled: true},
+	}
+	cairn := map[string]k4allv1alpha1.ComponentSpec{
+		"cairn": {Type: k4allv1alpha1.ComponentTypeManifest, Version: "v0.1.0", FeatureGate: FeatureRook},
+	}
+	for _, tc := range []struct {
+		name string
+		rook *k4allv1alpha1.RookConfig
+		want bool
+	}{
+		{"no rook field", nil, false},
+		{"rook: {}", &k4allv1alpha1.RookConfig{}, false},
+		{"enabled false", &k4allv1alpha1.RookConfig{Enabled: false, SmallCluster: k4allv1alpha1.RookSmallClusterAllow}, false},
+		{"enabled true", &k4allv1alpha1.RookConfig{Enabled: true}, true},
+	} {
+		features := everythingElse
+		features.Rook = tc.rook
+		config := k4allv1alpha1.ClusterConfigSpec{Features: features}
+		if got := FeatureEnabled(FeatureRook, config); got != tc.want {
+			t.Errorf("%s: rook on %v, want %v", tc.name, got, tc.want)
+		}
+		if _, got := FilterActiveComponents(cairn, config)["cairn"]; got != tc.want {
+			t.Errorf("%s: cairn active %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The CSI snapshot controller serves both features (D13): KubeVirt and
+// Hangar snapshot VM disks, and ceph-rbd has a VolumeSnapshotClass. It is on
+// with either, off with neither.
+func TestFeatureEnabled_SnapshotsWithVirtOrRook(t *testing.T) {
+	rookOn := &k4allv1alpha1.RookConfig{Enabled: true}
+	for _, tc := range []struct {
+		name string
+		virt bool
+		rook *k4allv1alpha1.RookConfig
+		want bool
+	}{
+		{"neither", false, nil, false},
+		{"rook field off", false, &k4allv1alpha1.RookConfig{}, false},
+		{"virt", true, nil, true},
+		{"rook", false, rookOn, true},
+		{"both", true, rookOn, true},
+	} {
+		config := k4allv1alpha1.ClusterConfigSpec{Features: k4allv1alpha1.FeaturesConfig{
+			Virt: k4allv1alpha1.VirtConfig{Enabled: tc.virt},
+			Rook: tc.rook,
+		}}
+		if got := FeatureEnabled(FeatureSnapshots, config); got != tc.want {
+			t.Errorf("%s: snapshots on %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Hangar's node agent comes with virt (D6) unless the ClusterConfig says
+// nodeAgent: false; absent means the release's default, installed.
+func TestFilterActiveComponents_HangarNodeAgent(t *testing.T) {
+	components := map[string]k4allv1alpha1.ComponentSpec{
+		"hangar":            {Type: k4allv1alpha1.ComponentTypeManifest, Version: "v0.1.0", FeatureGate: FeatureVirt},
+		"hangar-node-agent": {Type: k4allv1alpha1.ComponentTypeManifest, Version: "v0.1.0", FeatureGate: FeatureVirt},
+	}
+	yes, no := true, false
+	for _, tc := range []struct {
+		name   string
+		virt   bool
+		hangar *k4allv1alpha1.HangarSettings
+		want   bool
+	}{
+		{"virt off", false, nil, false},
+		{"virt off, nodeAgent true", false, &k4allv1alpha1.HangarSettings{NodeAgent: &yes}, false},
+		{"virt, no hangar field", true, nil, true},
+		{"virt, hangar: {}", true, &k4allv1alpha1.HangarSettings{}, true},
+		{"virt, nodeAgent true", true, &k4allv1alpha1.HangarSettings{NodeAgent: &yes}, true},
+		{"virt, nodeAgent false", true, &k4allv1alpha1.HangarSettings{NodeAgent: &no}, false},
+	} {
+		config := k4allv1alpha1.ClusterConfigSpec{Features: k4allv1alpha1.FeaturesConfig{
+			Virt: k4allv1alpha1.VirtConfig{Enabled: tc.virt, Hangar: tc.hangar},
+		}}
+		active := FilterActiveComponents(components, config)
+		if _, got := active["hangar-node-agent"]; got != tc.want {
+			t.Errorf("%s: hangar-node-agent active %v, want %v", tc.name, got, tc.want)
+		}
+		if _, got := active["hangar"]; got != tc.virt {
+			t.Errorf("%s: hangar active %v, want %v (with virt)", tc.name, got, tc.virt)
+		}
+	}
+}
+
+// The gates the ReleaseManifest names follow their ClusterConfig switch.
+func TestFeatureEnabled_FollowsTheClusterConfig(t *testing.T) {
+	for _, gate := range []string{FeatureVirt, "argocd", "ovsCni"} {
+		on := k4allv1alpha1.ClusterConfigSpec{Features: k4allv1alpha1.FeaturesConfig{
+			Virt:   k4allv1alpha1.VirtConfig{Enabled: true},
+			ArgoCD: k4allv1alpha1.ArgoCDConfig{Enabled: true},
+			OVSCNI: k4allv1alpha1.OVSCNIConfig{Enabled: true},
+		}}
+		if !FeatureEnabled(gate, on) {
+			t.Errorf("%s: off with its switch on", gate)
+		}
+		if FeatureEnabled(gate, k4allv1alpha1.ClusterConfigSpec{}) {
+			t.Errorf("%s: on with its switch off", gate)
+		}
+	}
+	if FeatureEnabled("unknown", k4allv1alpha1.ClusterConfigSpec{}) {
+		t.Error("an unknown gate is on")
+	}
+}

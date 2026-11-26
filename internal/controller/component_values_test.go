@@ -57,7 +57,7 @@ func TestComponentValues_OverrideValuesReachComponentWithoutHook(t *testing.T) {
 		},
 	}
 
-	got, err := r.componentValues(context.Background(), "cert-manager", k4allv1alpha1.ComponentSpec{}, config)
+	got, err := r.componentValues(context.Background(), "cert-manager", k4allv1alpha1.ComponentSpec{}, config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestComponentValues_OverrideWinsOverHookDefaults(t *testing.T) {
 		"cilium": {Values: overrideValues(t, `{"externalIPs":{"enabled":false}}`)},
 	}
 
-	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestComponentValues_OverrideHelmArgsAreAppliedWithHelmTypes(t *testing.T) {
 		"cilium": {HelmArgs: []string{"--set hubble.enabled=false", "--set operator.replicas=2"}},
 	}
 
-	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestComponentValues_CiliumL2AnnouncementsFollowClusterConfig(t *testing.T) 
 	r := newValuesReconciler()
 
 	t.Run("off by default", func(t *testing.T) {
-		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, ciliumConfig())
+		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, ciliumConfig(), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -152,7 +152,7 @@ func TestComponentValues_CiliumL2AnnouncementsFollowClusterConfig(t *testing.T) 
 	t.Run("on when enabled", func(t *testing.T) {
 		config := ciliumConfig()
 		config.Networking.CNI.Cilium.L2Announcements = true
-		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -165,7 +165,7 @@ func TestComponentValues_CiliumHubbleDeploysRelayAndUI(t *testing.T) {
 	config := ciliumConfig()
 	config.Networking.CNI.Cilium.Hubble = true
 
-	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestComponentValues_CiliumGatewayAPI(t *testing.T) {
 	config := ciliumConfig()
 	config.Networking.CNI.Cilium.GatewayAPI = true
 
-	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+	got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestComponentValues_CiliumDevices(t *testing.T) {
 		config := ciliumConfig()
 		config.Features.OVSBridge.Enabled = ovsBridge
 		config.Networking.CNI.Cilium.AdditionalDevices = additional
-		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -210,7 +210,7 @@ func TestComponentValues_CiliumDevices(t *testing.T) {
 		}
 		config := ciliumConfig()
 		config.Features.OVSBridge.Enabled = true
-		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config)
+		got, err := r.componentValues(context.Background(), "cilium", k4allv1alpha1.ComponentSpec{}, config, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

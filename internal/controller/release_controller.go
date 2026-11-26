@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -33,15 +34,19 @@ import (
 	"github.com/gpillon/k4all-operator/internal/engine"
 	"github.com/gpillon/k4all-operator/internal/migrations"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -53,6 +58,9 @@ type ReleaseReconciler struct {
 	RestConfig *rest.Config
 	ToolsImage string
 	Log        logr.Logger
+	// APIReader reads the ClusterConfig past the cache before its status is
+	// written; the Client when nil.
+	APIReader client.Reader
 
 	engine  *engine.Engine
 	hookReg *hooks.Registry
@@ -78,6 +86,13 @@ type ReleaseReconciler struct {
 
 const ForceResyncAnnotation = "k4all.magesgate.com/force-resync"
 
+// AllowDowngradeAnnotation on the ReleaseManifest names the downgrades a
+// person allows, as "component=version" entries separated by commas.
+// Without one the operator never applies a version lower than the one a
+// component has installed (k4all ADR-0010): the entry allows exactly that
+// version, so a stale annotation allows nothing else.
+const AllowDowngradeAnnotation = "k4all.magesgate.com/allow-downgrade"
+
 // UpgradeInProgressAnnotation is set by the host tool k4all-upgrade on its own
 // Node while an OS/Kubernetes hop is running (value "<from>-><to>"). While any
 // Node carries it, components are not reconciled: no installs, no upgrades, no
@@ -94,10 +109,11 @@ const upgradePollInterval = 30 * time.Second
 // operator uninstalls what it created (an Uninstalling component).
 const uninstallPollInterval = 15 * time.Second
 
-// anyUninstalling tells whether a component is Uninstalling.
+// anyUninstalling tells whether a component is Uninstalling, or queued to
+// be once another is gone.
 func anyUninstalling(rm *k4allv1alpha1.ReleaseManifest) bool {
 	for _, st := range rm.Status.Components {
-		if st.State == k4allv1alpha1.ComponentStateUninstalling {
+		if st.State == k4allv1alpha1.ComponentStateUninstalling || strings.HasPrefix(st.Message, uninstallQueuedPrefix) {
 			return true
 		}
 	}
@@ -127,6 +143,26 @@ const resyncInterval = 5 * time.Minute
 // hookFailedPrefix starts the message of an installed component whose
 // PostInstall or Sync failed.
 const hookFailedPrefix = "installed but hook failed: "
+
+// hookWaitingPrefix starts the message of an installed component whose
+// PostInstall or Sync waits on the cluster (hooks.Waiting), not on a fault.
+const hookWaitingPrefix = "waiting: "
+
+// hookMessage is the message of an installed component whose hook returned
+// err: waiting, or failed.
+func hookMessage(err error) string {
+	var waiting hooks.Waiting
+	if goerrors.As(err, &waiting) {
+		return hookWaitingPrefix + waiting.Reason
+	}
+	return hookFailedPrefix + err.Error()
+}
+
+// hookUnfinished tells whether an installed component's message says that
+// its hook failed or waits: the hook's PostInstall runs again.
+func hookUnfinished(message string) bool {
+	return strings.HasPrefix(message, hookFailedPrefix) || strings.HasPrefix(message, hookWaitingPrefix)
+}
 
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("releasemanifest", req.Name)
@@ -170,7 +206,28 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// The release may need the ClusterConfig in a new shape before its
 	// components are applied from it.
 	env := migrations.Env{Client: r.Client, RestConfig: r.RestConfig, Log: log.WithName("migrations")}
-	if migrated, err := migrations.RunWith(ctx, env, rm, config); err != nil {
+	migrated, err := migrations.RunWith(ctx, env, rm, config)
+	// The ClusterConfig status before the reconcile changes it: what it
+	// changes must be its own (reportUnlistedConditions).
+	statusRead := config.Status.DeepCopy()
+	var ahead *migrations.AheadError
+	if goerrors.As(err, &ahead) {
+		// An older operator after a newer one: no component until a person
+		// looks. They may need what the unknown migrations did.
+		log.Error(err, "component reconcile stopped")
+		setMigrationsAhead(&rm.Status.Conditions, rm.Generation, err.Error())
+		engine.SetReadyCondition(rm, metav1.ConditionFalse, migrationsAheadCondition, err.Error())
+		if err := r.patchStatus(ctx, rm); err != nil {
+			return ctrl.Result{}, err
+		}
+		setMigrationsAhead(&config.Status.Conditions, config.Generation, err.Error())
+		r.patchClusterConfigStatus(ctx, config)
+		reportUnlistedConditions(log, statusRead.Conditions, config.Status.Conditions)
+		return ctrl.Result{RequeueAfter: resyncInterval}, nil
+	}
+	meta.RemoveStatusCondition(&rm.Status.Conditions, migrationsAheadCondition)
+	meta.RemoveStatusCondition(&config.Status.Conditions, migrationsAheadCondition)
+	if err != nil {
 		log.Error(err, "ClusterConfig migration failed")
 		engine.SetReadyCondition(rm, metav1.ConditionFalse, "MigrationFailed", err.Error())
 		_ = r.patchStatus(ctx, rm)
@@ -202,11 +259,15 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	markUnmanagedComponents(rm)
+	before := maps.Clone(rm.Status.Components)
 	// Removals first: a replacement can then take over what the removed
 	// component held (traefik: the node's ports and the "nginx" IngressClass).
 	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	inactiveOK := r.reconcileInactiveComponents(ctx, log, rm, active, config.Spec)
-	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
+	held := heldFeatures(rm, active)
+	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec, held)
+	keepFailedSince(before, rm)
+	setDowngradeRefused(rm, active)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
 
 	if err := r.patchStatus(ctx, rm); err != nil {
@@ -216,6 +277,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Update ClusterConfig status
 	r.updateClusterConfigStatus(ctx, config, rm)
+	reportUnlistedConditions(log, statusRead.Conditions, config.Status.Conditions)
 
 	requeue := resyncInterval
 	if stepsLeft {
@@ -227,6 +289,10 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if anyUninstallRefused(rm) {
 		requeue = sooner(requeue, uninstallRefusedPollInterval)
 	}
+	if rookComingUp(config.Status.Conditions) {
+		requeue = sooner(requeue, rookReadyPollInterval)
+	}
+	requeue = sooner(requeue, failedRetry(rm, time.Now()))
 	return ctrl.Result{RequeueAfter: sooner(requeue, hookRequeue)}, nil
 }
 
@@ -309,31 +375,49 @@ func markUnmanagedComponents(rm *k4allv1alpha1.ReleaseManifest) {
 
 // reconcileInactiveComponents handles components disabled by feature gates or
 // a CNI switch (but still Managed): if they were previously installed they are
-// uninstalled first, then marked Skipped. It returns false if any uninstall failed.
+// uninstalled first, then marked Skipped. They go as removalPlan says: the
+// components of one feature gate as one, all kept while one refuses, and in
+// reverse dependency order. It returns false if any uninstall failed or was
+// refused.
 func (r *ReleaseReconciler) reconcileInactiveComponents(
 	ctx context.Context, log logr.Logger, rm *k4allv1alpha1.ReleaseManifest,
 	active map[string]k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
 ) bool {
-	allOK := true
+	inactive := make(map[string]k4allv1alpha1.ComponentSpec)
 	for name, spec := range rm.Spec.Components {
 		mgmt := spec.Management
 		if mgmt == k4allv1alpha1.ComponentManagementUnmanaged || mgmt == k4allv1alpha1.ComponentManagementRemoved {
 			continue
 		}
-		if _, isActive := active[name]; isActive {
-			continue
+		if _, isActive := active[name]; !isActive {
+			inactive[name] = spec
 		}
-
+	}
+	installed := make(map[string]bool, len(inactive))
+	for name, spec := range inactive {
 		prevStatus := rm.Status.Components[name]
-		wasInstalled := prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
-			uninstallUnfinished(prevStatus) || r.engine.IsInstalled(ctx, name, spec, &prevStatus)
+		// A refused downgrade is Failed but still runs its installedVersion.
+		installed[name] = prevStatus.State == k4allv1alpha1.ComponentStateInstalled ||
+			uninstallUnfinished(prevStatus) || strings.HasPrefix(prevStatus.Message, downgradeRefusedPrefix) ||
+			r.engine.IsInstalled(ctx, name, spec, &prevStatus)
+	}
+	plan := planRemoval(inactive)
+	refused := r.uninstallRefusals(ctx, log, rm, plan, installed)
 
-		if wasInstalled {
+	allOK := true
+	gone := make(map[string]bool, len(inactive))
+	for _, name := range plan.order {
+		spec := inactive[name]
+		prevStatus := rm.Status.Components[name]
+		if installed[name] {
 			if !uninstallStarted(prevStatus) {
-				if reason := r.uninstallRefusal(ctx, name); reason != "" {
-					log.Info("uninstall refused by the component's hook", "name", name, "reason", reason)
+				if reason, ok := refused[name]; ok {
 					rm.Status.Components[name] = refusedUninstall(prevStatus, reason)
 					allOK = false
+					continue
+				}
+				if first := plan.waitsFor(name, gone); first != "" {
+					rm.Status.Components[name] = queuedUninstall(prevStatus, first)
 					continue
 				}
 			}
@@ -356,6 +440,7 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 				continue
 			}
 		}
+		gone[name] = true
 
 		if prevStatus.State == k4allv1alpha1.ComponentStateSkipped && prevStatus.Message == skippedMessage {
 			continue
@@ -373,20 +458,47 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 // leaves out.
 const skippedMessage = "disabled by ClusterConfig feature gate"
 
+// heldFeatures are the feature gates of the managed components out of the
+// release that are still installed once reconcileInactiveComponents has
+// run: their uninstall refused, queued, under way or failed. Every other
+// one is Skipped by then. Read by the components applied after (Headlamp
+// keeps the console of a held feature).
+func heldFeatures(rm *k4allv1alpha1.ReleaseManifest, active map[string]k4allv1alpha1.ComponentSpec) hooks.HeldFeatures {
+	gates := map[string]bool{}
+	for name, spec := range rm.Spec.Components {
+		if _, isActive := active[name]; isActive || spec.FeatureGate == "" ||
+			spec.Management == k4allv1alpha1.ComponentManagementUnmanaged ||
+			spec.Management == k4allv1alpha1.ComponentManagementRemoved {
+			continue
+		}
+		if st, ok := rm.Status.Components[name]; ok && st.State != k4allv1alpha1.ComponentStateSkipped {
+			gates[spec.FeatureGate] = true
+		}
+	}
+	held := make(hooks.HeldFeatures, 0, len(gates))
+	for gate := range gates {
+		held = append(held, gate)
+	}
+	sort.Strings(held)
+	return held
+}
+
 // reconcileActiveComponents installs or upgrades the active components in
 // dependency order, running the PreInstall/PostInstall hooks around each one.
-// A component with an upgradePath moves by one step per call. It returns false
-// if any component failed, stepsLeft when some component is mid-path, and
-// hookRequeue when a hook's Sync asked to run again that soon (0: none asked).
+// A component with an upgradePath moves by one step per call. held are the
+// features off whose components are still installed (heldFeatures). It
+// returns false if any component failed, stepsLeft when some component is
+// mid-path, and hookRequeue when a hook's Sync asked to run again that soon
+// (0: none asked).
 func (r *ReleaseReconciler) reconcileActiveComponents(
 	ctx context.Context, log logr.Logger, rm *k4allv1alpha1.ReleaseManifest, order []string,
-	active map[string]k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+	active map[string]k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, held hooks.HeldFeatures,
 ) (allOK, stepsLeft bool, hookRequeue time.Duration) {
 	allOK = true
 	for _, name := range order {
 		spec := active[name]
 		currentStatus := rm.Status.Components[name]
-		hash := r.appliedHash(name, spec, config)
+		hash := r.appliedHash(name, spec, config, held)
 
 		// A static pod whose manifest the operator did not write stays left
 		// alone until the component's spec changes.
@@ -410,11 +522,26 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			// No hash: installed by an operator that did not record hashes.
 			// Adopt it instead of reinstalling every component on operator upgrade.
 			currentStatus.AppliedHash = hash
-			// Back in the release after a refused uninstall: nothing is refused now.
-			if strings.HasPrefix(currentStatus.Message, uninstallRefusedPrefix) {
+			// Back in the release after a refused or queued uninstall:
+			// nothing is being uninstalled now.
+			if strings.HasPrefix(currentStatus.Message, uninstallRefusedPrefix) ||
+				strings.HasPrefix(currentStatus.Message, uninstallQueuedPrefix) {
 				currentStatus.Message = engine.InstalledMessage
 			}
-			hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, &currentStatus))
+			// A PostInstall that failed or waited runs again until it is done.
+			postInstall := hookUnfinished(currentStatus.Message)
+			hookRequeue = sooner(hookRequeue, r.runHooks(ctx, log, name, spec, config, &currentStatus, postInstall))
+			rm.Status.Components[name] = currentStatus
+			continue
+		}
+
+		if why := downgradeRefused(rm, name, spec, currentStatus); why != "" {
+			allOK = false
+			if currentStatus.State != k4allv1alpha1.ComponentStateFailed {
+				currentStatus.State = k4allv1alpha1.ComponentStateFailed
+				currentStatus.LastTransitionTime = metav1.Now()
+			}
+			currentStatus.Message = why
 			rm.Status.Components[name] = currentStatus
 			continue
 		}
@@ -447,7 +574,7 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 		log.Info("reconciling component", "name", name, "type", spec.Type, "version", toApply.Version,
 			"target", spec.Version)
 
-		extraValues, valuesErr := r.componentValues(ctx, name, toApply, config)
+		extraValues, valuesErr := r.componentValues(ctx, name, toApply, config, held)
 		if valuesErr != nil {
 			log.Error(valuesErr, "preparing component values failed", "name", name)
 			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
@@ -459,7 +586,7 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			continue
 		}
 
-		var opts []engine.ReconcileOption
+		opts := []engine.ReconcileOption{engine.MutateObjects(hooks.ObjectMutator(r.hookReg.Get(name), config))}
 		if intermediate {
 			opts = append(opts, engine.WaitUntilReady())
 		}
@@ -494,37 +621,54 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			st.Message = fmt.Sprintf("upgrade step %s installed, upgrading towards %s", toApply.Version, spec.Version)
 		}
 
-		// Run PostInstall hook for post-install configuration
-		if hook := r.hookReg.Get(name); hook != nil {
-			if hookErr := hook.PostInstall(ctx, spec, config); hookErr != nil {
-				log.Error(hookErr, "post-install hook failed", "name", name)
-				st.Message = hookFailedPrefix + hookErr.Error()
-			}
-		}
-		hookRequeue = sooner(hookRequeue, r.syncHook(ctx, log, name, spec, config, st))
+		hookRequeue = sooner(hookRequeue, r.runHooks(ctx, log, name, spec, config, st, true))
 		rm.Status.Components[name] = *st
 	}
 	return allOK, stepsLeft, hookRequeue
 }
 
-// syncHook runs the Sync of the component's hook, when the hook is a Syncer,
-// and returns how soon it wants to run again (0: at the periodic reconcile).
-// A failure goes into st's message like a PostInstall one; a success clears
-// such a message from an installed component.
-func (r *ReleaseReconciler) syncHook(
+// runHooks runs the component's hook after an apply, or on an installed
+// component that is up to date: its PostInstall when postInstall is set, then
+// its Sync, when the hook is a Syncer. It returns how soon Sync wants to run
+// again (0: at the periodic reconcile). The first failure, or wait
+// (hooks.Waiting), goes into st's message; when neither fails nor waits, an
+// installed component's earlier hook failure or wait is cleared.
+func (r *ReleaseReconciler) runHooks(
 	ctx context.Context, log logr.Logger, name string, spec k4allv1alpha1.ComponentSpec,
-	config k4allv1alpha1.ClusterConfigSpec, st *k4allv1alpha1.ComponentStatus,
+	config k4allv1alpha1.ClusterConfigSpec, st *k4allv1alpha1.ComponentStatus, postInstall bool,
 ) time.Duration {
-	syncer, ok := r.hookReg.Get(name).(hooks.Syncer)
-	if !ok {
+	hook := r.hookReg.Get(name)
+	if hook == nil {
 		return 0
 	}
-	after, err := syncer.Sync(ctx, spec, config)
+	var unfinished error
+	note := func(step string, err error) {
+		if err == nil {
+			return
+		}
+		var waiting hooks.Waiting
+		if goerrors.As(err, &waiting) {
+			log.Info("hook waits", "name", name, "step", step, "reason", waiting.Reason)
+		} else {
+			log.Error(err, "hook failed", "name", name, "step", step)
+		}
+		if unfinished == nil {
+			unfinished = err
+		}
+	}
+	if postInstall {
+		note("PostInstall", hook.PostInstall(ctx, spec, config))
+	}
+	var after time.Duration
+	if syncer, ok := hook.(hooks.Syncer); ok {
+		var err error
+		after, err = syncer.Sync(ctx, spec, config)
+		note("Sync", err)
+	}
 	switch {
-	case err != nil:
-		log.Error(err, "hook sync failed", "name", name)
-		st.Message = hookFailedPrefix + err.Error()
-	case st.State == k4allv1alpha1.ComponentStateInstalled && strings.HasPrefix(st.Message, hookFailedPrefix):
+	case unfinished != nil:
+		st.Message = hookMessage(unfinished)
+	case st.State == k4allv1alpha1.ComponentStateInstalled && hookUnfinished(st.Message):
 		st.Message = engine.InstalledMessage
 	}
 	return after
@@ -596,6 +740,71 @@ func (r *ReleaseReconciler) versionReporter(name string, spec k4allv1alpha1.Comp
 		return reporter
 	}
 	return r.engine.HelmReleaseReporter(name, spec)
+}
+
+// downgradeRefused says why the operator does not move a component from the
+// version it has installed down to the release's, or "" when it may go: the
+// release pins nothing lower, or AllowDowngradeAnnotation names this
+// downgrade. Versions compare as semver; a pin that is not semver ("latest")
+// is never refused.
+func downgradeRefused(rm *k4allv1alpha1.ReleaseManifest, name string, spec k4allv1alpha1.ComponentSpec,
+	st k4allv1alpha1.ComponentStatus) string {
+	if st.InstalledVersion == "" || !newerVersion(st.InstalledVersion, spec.Version) ||
+		downgradeAllowed(rm.GetAnnotations()[AllowDowngradeAnnotation], name, spec.Version) {
+		return ""
+	}
+	return fmt.Sprintf("%sthe release pins %s, older than the installed %s "+
+		"(to allow it, annotate the ReleaseManifest with %s: %s=%s)",
+		downgradeRefusedPrefix, spec.Version, st.InstalledVersion, AllowDowngradeAnnotation, name, spec.Version)
+}
+
+// downgradeAllowed tells whether the AllowDowngradeAnnotation value has the
+// entry name=version (semver equality, else the same text).
+func downgradeAllowed(value, name, version string) bool {
+	for _, entry := range strings.Split(value, ",") {
+		n, v, ok := strings.Cut(entry, "=")
+		if !ok || strings.TrimSpace(n) != name {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if c, ok := engine.CompareVersions(v, version); (ok && c == 0) || v == version {
+			return true
+		}
+	}
+	return false
+}
+
+// downgradeRefusedCondition lists, on the ReleaseManifest, the components
+// left at a version newer than the release pins (downgradeRefused).
+const downgradeRefusedCondition = "DowngradeRefused"
+
+// downgradeRefusedPrefix starts the message of a component the reconcile
+// did not downgrade.
+const downgradeRefusedPrefix = "not downgrading: "
+
+// setDowngradeRefused sets downgradeRefusedCondition from what this
+// reconcile did: a component that waits for its operator's uninstall, say,
+// was not refused, whatever its installedVersion.
+func setDowngradeRefused(rm *k4allv1alpha1.ReleaseManifest, active map[string]k4allv1alpha1.ComponentSpec) {
+	var refused []string
+	for name := range active {
+		if strings.HasPrefix(rm.Status.Components[name].Message, downgradeRefusedPrefix) {
+			refused = append(refused, name)
+		}
+	}
+	if len(refused) == 0 {
+		meta.RemoveStatusCondition(&rm.Status.Conditions, downgradeRefusedCondition)
+		return
+	}
+	sort.Strings(refused)
+	meta.SetStatusCondition(&rm.Status.Conditions, metav1.Condition{
+		Type:               downgradeRefusedCondition,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: rm.Generation,
+		Reason:             downgradeRefusedCondition,
+		Message: "the release pins these components lower than they are installed, and " +
+			AllowDowngradeAnnotation + " does not allow it: " + strings.Join(refused, ", "),
+	})
 }
 
 // newerVersion tells whether a is a later semver than b.
@@ -690,12 +899,19 @@ func (r *ReleaseReconciler) uninstallRefusal(ctx context.Context, name string) s
 // hook refuses the uninstall: still Installed at its version, so the next
 // reconcile asks the hook again, with the reason in its message.
 func refusedUninstall(prev k4allv1alpha1.ComponentStatus, reason string) k4allv1alpha1.ComponentStatus {
+	st := keptInstalled(prev)
+	st.Message = uninstallRefusedPrefix + reason
+	return st
+}
+
+// keptInstalled is prev, Installed: a component kept at the version it runs
+// though it is out of the release.
+func keptInstalled(prev k4allv1alpha1.ComponentStatus) k4allv1alpha1.ComponentStatus {
 	st := prev
 	if st.State != k4allv1alpha1.ComponentStateInstalled {
 		st.State = k4allv1alpha1.ComponentStateInstalled
 		st.LastTransitionTime = metav1.Now()
 	}
-	st.Message = uninstallRefusedPrefix + reason
 	return st
 }
 
@@ -772,17 +988,25 @@ func (r *ReleaseReconciler) prepareUninstall(
 }
 
 // uninstallWithCleanup uninstalls a component and runs its Cleanup hook (if any),
-// returning the collected error messages. Both steps always run.
+// returning the collected error messages. Both steps always run. A hook that
+// is a Remover uninstalls the component in place of the engine.
 func (r *ReleaseReconciler) uninstallWithCleanup(
 	ctx context.Context, log logr.Logger, name string, spec k4allv1alpha1.ComponentSpec,
 	installedVersion string, config k4allv1alpha1.ClusterConfigSpec,
 ) []string {
 	var uninstallErrs []string
-	if err := r.engine.UninstallComponent(ctx, name, spec, installedVersion); err != nil {
+	hook := r.hookReg.Get(name)
+	var err error
+	if remover, ok := hook.(hooks.Remover); ok {
+		err = remover.Remove(ctx, spec, config)
+	} else {
+		err = r.engine.UninstallComponent(ctx, name, spec, installedVersion)
+	}
+	if err != nil {
 		log.Error(err, "uninstall failed", "name", name)
 		uninstallErrs = append(uninstallErrs, fmt.Sprintf("uninstall: %v", err))
 	}
-	if hook := r.hookReg.Get(name); hook != nil {
+	if hook != nil {
 		if err := hook.Cleanup(ctx, name, config); err != nil {
 			log.Error(err, "cleanup hook failed", "name", name)
 			uninstallErrs = append(uninstallErrs, fmt.Sprintf("cleanup hook: %v", err))
@@ -793,8 +1017,10 @@ func (r *ReleaseReconciler) uninstallWithCleanup(
 
 // setReadySummary sets the Ready condition from the outcome of a full reconcile.
 // Components still on their upgrade path (Upgrading, or Pending on a step),
-// being uninstalled (Uninstalling: their operator removes what it created)
-// or kept installed by a refused uninstall keep it False.
+// being uninstalled (Uninstalling: their operator removes what it created;
+// or queued behind another) or kept installed by a refused uninstall keep it
+// False. A hook that waits (hooks.Waiting) does not: its component is
+// installed as asked.
 func setReadySummary(rm *k4allv1alpha1.ReleaseManifest, allOK bool, activeCount int) {
 	installed, failed := 0, false
 	var waiting, uninstalling, refused []string
@@ -807,7 +1033,7 @@ func setReadySummary(rm *k4allv1alpha1.ReleaseManifest, allOK bool, activeCount 
 			refused = append(refused, name)
 		case st.State == k4allv1alpha1.ComponentStateFailed:
 			failed = true
-		case st.State == k4allv1alpha1.ComponentStateUninstalling:
+		case st.State == k4allv1alpha1.ComponentStateUninstalling, strings.HasPrefix(st.Message, uninstallQueuedPrefix):
 			uninstalling = append(uninstalling, name)
 		case st.State == k4allv1alpha1.ComponentStateUpgrading, st.State == k4allv1alpha1.ComponentStatePending:
 			waiting = append(waiting, name)
@@ -859,18 +1085,72 @@ func (r *ReleaseReconciler) updateClusterConfigStatus(ctx context.Context, confi
 		Message:            fmt.Sprintf("CNI=%s, reconciled at %s", config.Status.ActiveCNI, config.Status.LastReconcileTime.Format(time.RFC3339)),
 	})
 
-	statusPayload := map[string]interface{}{
-		"status": config.Status,
+	if config.Spec.Networking.CNI.Type == ciliumCNI {
+		meta.SetStatusCondition(&config.Status.Conditions, r.podNetworkOverlap(ctx, config, rm))
+	} else {
+		meta.RemoveStatusCondition(&config.Status.Conditions, k4allv1alpha1.ConditionPodNetworkOverlap)
 	}
-	raw, err := json.Marshal(statusPayload)
+	if cond, ok := r.rookReadyCondition(ctx, config, rm); ok {
+		meta.SetStatusCondition(&config.Status.Conditions, cond)
+	} else {
+		meta.RemoveStatusCondition(&config.Status.Conditions, k4allv1alpha1.ConditionRookReady)
+	}
+	r.setKubeVirtSettings(ctx, config)
+	if cond, ok := metadataServiceCondition(config, rm); ok {
+		meta.SetStatusCondition(&config.Status.Conditions, cond)
+	} else {
+		meta.RemoveStatusCondition(&config.Status.Conditions, k4allv1alpha1.ConditionMetadataService)
+	}
+
+	r.patchClusterConfigStatus(ctx, config)
+}
+
+// migrationsAheadCondition is set, on the ClusterConfig and the
+// ReleaseManifest, while the ClusterConfig counts more migrations than this
+// operator knows (migrations.AheadError); components are not reconciled.
+const migrationsAheadCondition = "MigrationsAhead"
+
+func setMigrationsAhead(conditions *[]metav1.Condition, generation int64, message string) {
+	meta.SetStatusCondition(conditions, metav1.Condition{
+		Type:               migrationsAheadCondition,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: generation,
+		Reason:             migrationsAheadCondition,
+		Message:            message,
+	})
+}
+
+// patchClusterConfigStatus writes what the ReleaseReconciler owns of
+// config's status (copyReleaseStatus) onto the ClusterConfig as the API
+// server has it now, under an optimistic lock, and reads it again on a
+// conflict. config was read at the start of the reconcile: patching its
+// whole status, conditions list and all, overwrote what another controller
+// (node settings) wrote in between.
+func (r *ReleaseReconciler) patchClusterConfigStatus(ctx context.Context, config *k4allv1alpha1.ClusterConfig) {
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest := &k4allv1alpha1.ClusterConfig{}
+		if err := r.reader().Get(ctx, client.ObjectKeyFromObject(config), latest); err != nil {
+			return err
+		}
+		base := latest.DeepCopy()
+		copyReleaseStatus(config.Status, &latest.Status)
+		if equality.Semantic.DeepEqual(base.Status, latest.Status) {
+			return nil
+		}
+		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
 	if err != nil {
-		r.Log.Error(err, "failed to marshal ClusterConfig status patch")
-		return
-	}
-	patch := client.RawPatch(types.MergePatchType, raw)
-	if err := r.Status().Patch(ctx, config, patch); err != nil {
 		r.Log.Error(err, "failed to update ClusterConfig status")
 	}
+}
+
+// reader reads past the manager's cache when the reconciler has an
+// APIReader: a write under an optimistic lock needs the latest version.
+func (r *ReleaseReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func isComponentInstalled(rm *k4allv1alpha1.ReleaseManifest, name string) bool {
@@ -925,9 +1205,10 @@ func (r *ReleaseReconciler) getClusterConfig(ctx context.Context) (*k4allv1alpha
 
 // appliedHash identifies what a component is applied from: its spec, its
 // componentOverrides and, when it has a hook, the rest of the ClusterConfig
-// spec the hook reads. Hooks are not run here: some prepare the cluster.
+// spec the hook reads, and the held features an OverrideMerger's values
+// follow. Hooks are not run here: some prepare the cluster.
 func (r *ReleaseReconciler) appliedHash(
-	name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+	name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, held hooks.HeldFeatures,
 ) string {
 	inputs := struct {
 		Spec     k4allv1alpha1.ComponentSpec      `json:"spec"`
@@ -937,6 +1218,9 @@ func (r *ReleaseReconciler) appliedHash(
 		// after an operator upgrade. Empty (left out) for most hooks, so
 		// their hashes stay the same.
 		HookRevision string `json:"hookRevision,omitempty"`
+		// The held features the hook's values follow (Headlamp's consoles).
+		// None (left out) for every hook while nothing is held.
+		Held hooks.HeldFeatures `json:"held,omitempty"`
 	}{Spec: spec}
 	if override, ok := config.ComponentOverrides[name]; ok {
 		inputs.Override = &override
@@ -947,6 +1231,9 @@ func (r *ReleaseReconciler) appliedHash(
 		inputs.Config = &hookConfig
 		if rev, ok := hook.(hooks.ValuesRevisioner); ok {
 			inputs.HookRevision = rev.ValuesRevision()
+		}
+		if merger, ok := hook.(hooks.OverrideMerger); ok {
+			inputs.Held = merger.HeldFeaturesUsed(held)
 		}
 	}
 	raw, err := json.Marshal(inputs)
@@ -960,24 +1247,34 @@ func (r *ReleaseReconciler) appliedHash(
 // componentValues returns the values the engine layers on top of the
 // ReleaseManifest values of one component: the PreInstall hook's values
 // first, then the ClusterConfig componentOverrides, so the user always wins.
-// The PreInstall hook, if any, may also prepare the cluster.
+// The PreInstall hook, if any, may also prepare the cluster. A hook that is
+// an OverrideMerger layers the override itself, with the held features.
 func (r *ReleaseReconciler) componentValues(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+	held hooks.HeldFeatures,
 ) (map[string]interface{}, error) {
 	values := make(map[string]interface{})
-	if hook := r.hookReg.Get(name); hook != nil {
+	hook := r.hookReg.Get(name)
+	if hook != nil {
 		var err error
 		if values, err = hook.PreInstall(ctx, name, spec, config, values); err != nil {
 			return nil, err
 		}
 	}
 	override, ok := config.ComponentOverrides[name]
+	if merger, isMerger := hook.(hooks.OverrideMerger); isMerger {
+		return merger.MergeOverride(spec, config, held, values, override)
+	}
 	if !ok {
 		return values, nil
 	}
 	return engine.ApplyOverride(values, override)
 }
 
+// SetupWithManager watches the ReleaseManifests and the ClusterConfig's
+// spec. Not its status: every reconcile writes it (lastReconcileTime), and a
+// reconcile that ran into the next second would start the next one at once,
+// trying a failed component again with no backoff.
 func (r *ReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&k4allv1alpha1.ReleaseManifest{}).
@@ -995,7 +1292,7 @@ func (r *ReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 				return requests
 			},
-		)).
+		), builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("release").
 		Complete(r)
 }

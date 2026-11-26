@@ -220,14 +220,19 @@ func nextHop(usable, minors []Release, cur *semver.Version, curVersion string, g
 	if len(options) == 0 {
 		return Release{}, fmt.Errorf("%w: no release can be reached from %s on the way to %s", ErrNoPath, curVersion, goal.Version)
 	}
-	newerInStream := false
+	// Finish the stream: a newer usable release of it that no hop reaches
+	// from here (its minFrom comes after a blocked patch, say) stops the
+	// plan instead of being left behind.
+	var newerInStream []Release
 	for _, r := range usable {
-		if sameStream(r.key, cur) && r.key.GreaterThan(cur) && !r.minFromKey.GreaterThan(cur) {
-			newerInStream = true
+		if sameStream(r.key, cur) && r.key.GreaterThan(cur) {
+			newerInStream = append(newerInStream, r)
 		}
 	}
-	if len(crossing) > 0 && newerInStream && len(inStream) == 0 {
-		return Release{}, fmt.Errorf("%w: cannot leave %s before reaching the latest patch of its stream", ErrNoPath, curVersion)
+	if len(crossing) > 0 && len(newerInStream) > 0 && len(inStream) == 0 {
+		tip := latest(newerInStream)
+		return Release{}, fmt.Errorf("%w: cannot leave %s before reaching %s, the latest patch of its stream, and no hop reaches it from %s (minFrom %s)",
+			ErrNoPath, curVersion, tip.Version, curVersion, tip.MinFrom)
 	}
 	if len(inStream) > 0 && len(crossing) > 0 {
 		return latest(inStream), nil

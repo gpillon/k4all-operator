@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -129,4 +130,29 @@ func TestCompare_PutsPrereleasesFirst(t *testing.T) {
 			t.Errorf("Compare(%s, %s) = %d, %v; want < 0", ordered[i], ordered[i+1], c, err)
 		}
 	}
+}
+
+// streamWithABlockedPatch is the review's case (k4all#74): v2.5.4 is
+// blocked, and v2.5.5, the latest patch of 2.5, comes only from v2.5.4 (an
+// exit patch, k4all ADR-0010).
+func streamWithABlockedPatch(exitMinFrom string) []entry {
+	return []entry{
+		release("v2.5.0", "minor", "v2.4.0", "1.35.10", "1.35", 45),
+		release("v2.5.3", "patch", "v2.5.0", "1.35.10", "1.35", 45),
+		release("v2.5.4", "patch", "v2.5.0", "1.35.10", "1.35", 45, "blocked", true),
+		release("v2.5.5", "patch", exitMinFrom, "1.35.10", "1.35", 45),
+		release("v2.6.0", "minor", "v2.5.0", "1.36.6", "1.36", 45),
+	}
+}
+
+func TestPlan_ANodeDoesNotLeaveItsStreamBelowAPatchItCannotReach(t *testing.T) {
+	g := graph(t, streamWithABlockedPatch("v2.5.4"))
+	_, err := g.Plan("v2.5.3", "")
+	if !errors.Is(err, ErrNoPath) || !strings.Contains(err.Error(), "cannot leave v2.5.3 before reaching v2.5.5") {
+		t.Errorf("Plan from v2.5.3: err = %v, want ErrNoPath naming v2.5.5", err)
+	}
+	// inside the stream nothing changes
+	expectPath(t, plan(t, g, "v2.5.3", "v2.5.3"))
+	// a node that can reach the latest patch goes through it
+	expectPath(t, plan(t, graph(t, streamWithABlockedPatch("v2.5.3")), "v2.5.3", ""), "v2.5.5", "v2.6.0")
 }

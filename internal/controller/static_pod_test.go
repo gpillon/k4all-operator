@@ -37,7 +37,7 @@ func TestReconcile_LeavesAForeignStaticPodAlone(t *testing.T) {
 		Status: k4allv1alpha1.ReleaseManifestStatus{Components: map[string]k4allv1alpha1.ComponentStatus{"kube-vip": {
 			State:       k4allv1alpha1.ComponentStateUnmanaged,
 			Message:     "kube-vip: its static pod manifest was not written by the k4all-operator: left alone",
-			AppliedHash: r.appliedHash("kube-vip", kubeVIP, cc.Spec),
+			AppliedHash: r.appliedHash("kube-vip", kubeVIP, cc.Spec, nil),
 		}}},
 	}
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(rm, cc).
