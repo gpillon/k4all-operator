@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
@@ -587,6 +588,136 @@ func TestRookHook_DoesNotCreateWhatWasThereBefore(t *testing.T) {
 	}
 
 	isGone(t, c, newObject(cephAPIVersion, cephBlockPoolKind, rookNamespace, cephPoolName))
+}
+
+// seedEntry is what the seed record says of key: "created" or "found",
+// without the time; "" when it has no such entry.
+func seedEntry(t *testing.T, c client.Client, key string) string {
+	t.Helper()
+	record := &corev1.ConfigMap{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: rookNamespace, Name: seedRecordName}, record); err != nil {
+		t.Fatalf("get the seed record: %v", err)
+	}
+	how, _, _ := strings.Cut(record.Data[key], " ")
+	return how
+}
+
+// cdiStorageProfile is the StorageProfile ceph-rbd as CDI's controller
+// makes it for a new StorageClass, with spec, before the hook reads it.
+func cdiStorageProfile(t *testing.T, c client.Client, spec map[string]interface{}) {
+	t.Helper()
+	profile := newObject(storageProfileAPIVersion, storageProfileKind, "", cephStorageClassName)
+	profile.Object["spec"] = spec
+	if err := c.Create(context.Background(), profile, client.FieldOwner("cdi-controller")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// profileSets are the claimPropertySets of the StorageProfile ceph-rbd's spec.
+func profileSets(t *testing.T, c client.Client) []interface{} {
+	t.Helper()
+	profile := getObject(t, c, storageProfileAPIVersion, storageProfileKind, "", cephStorageClassName)
+	sets, _, _ := unstructured.NestedSlice(profile.Object, "spec", "claimPropertySets")
+	return sets
+}
+
+// The v2.7.0 VM round (F4): CDI creates the StorageProfile of a new
+// StorageClass at once, its spec empty, and the hook, finding it, recorded
+// it "found" and wrote nothing: with virtualization on, k4all's seed never
+// reached the profile. An empty spec is CDI's, not an admin's: the hook
+// writes the seed spec on it, once, as its seed manager, and records it
+// created. Emptied again later, it stays so.
+func TestRookHook_SeedsTheStorageProfileCDIMadeEmpty(t *testing.T) {
+	c := rookEnvtest(t)
+	withOptionalAPIs(t, c)
+	rookNodes(t, c, 3)
+	forgetRook(t, c)
+	cdiStorageProfile(t, c, map[string]interface{}{})
+	h := NewRookHook(c, logr.Discard())
+
+	if err := syncRook(t, h); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	want := cephStorageProfile().Object["spec"].(map[string]interface{})["claimPropertySets"]
+	if sets := profileSets(t, c); !reflect.DeepEqual(sets, want) {
+		t.Errorf("StorageProfile claimPropertySets %v, want the seed's %v", sets, want)
+	}
+	profile := getObject(t, c, storageProfileAPIVersion, storageProfileKind, "", cephStorageClassName)
+	if got := managers(profile); !slices.Contains(got, seedFieldManager) || slices.Contains(got, ownedFieldManager) {
+		t.Errorf("StorageProfile field managers %v, want %q and not %q", got, seedFieldManager, ownedFieldManager)
+	}
+	if how := seedEntry(t, c, "storageprofile.ceph-rbd"); how != "created" {
+		t.Errorf("seed record: storageprofile.ceph-rbd %q, want created", how)
+	}
+
+	profile.Object["spec"] = map[string]interface{}{}
+	if err := c.Update(context.Background(), profile, client.FieldOwner("kubectl-edit")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncRook(t, h); err != nil {
+		t.Fatalf("Sync after the edit: %v", err)
+	}
+	if sets := profileSets(t, c); len(sets) != 0 {
+		t.Errorf("StorageProfile emptied by an admin: claimPropertySets %v, want none", sets)
+	}
+}
+
+// CDI's profile made between the hook's read and its create, the class
+// having appeared a moment before: the create finds it there, and the hook
+// seeds it the same way.
+func TestRookHook_SeedsTheStorageProfileCDIMadeInBetween(t *testing.T) {
+	c := rookEnvtest(t)
+	withOptionalAPIs(t, c)
+	rookNodes(t, c, 3)
+	forgetRook(t, c)
+	_, cfg := envtestClient(t)
+	w, err := client.NewWithWatch(cfg, client.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	racing := interceptor.NewClient(w, interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == storageProfileKind {
+				cdiStorageProfile(t, c, map[string]interface{}{})
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
+
+	if err := syncRook(t, NewRookHook(racing, logr.Discard())); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	want := cephStorageProfile().Object["spec"].(map[string]interface{})["claimPropertySets"]
+	if sets := profileSets(t, c); !reflect.DeepEqual(sets, want) {
+		t.Errorf("StorageProfile claimPropertySets %v, want the seed's %v", sets, want)
+	}
+	if how := seedEntry(t, c, "storageprofile.ceph-rbd"); how != "created" {
+		t.Errorf("seed record: storageprofile.ceph-rbd %q, want created", how)
+	}
+}
+
+// A StorageProfile spec someone set before the hook (an admin, by hand) is
+// theirs: the hook leaves it as it is and records the profile found.
+func TestRookHook_KeepsAStorageProfileSpecSomeoneSet(t *testing.T) {
+	c := rookEnvtest(t)
+	withOptionalAPIs(t, c)
+	rookNodes(t, c, 3)
+	forgetRook(t, c)
+	theirs := []interface{}{map[string]interface{}{"accessModes": []interface{}{"ReadWriteOnce"}, "volumeMode": "Block"}}
+	cdiStorageProfile(t, c, map[string]interface{}{"claimPropertySets": theirs})
+
+	if err := syncRook(t, NewRookHook(c, logr.Discard())); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if sets := profileSets(t, c); !reflect.DeepEqual(sets, theirs) {
+		t.Errorf("StorageProfile claimPropertySets %v, want theirs, %v", sets, theirs)
+	}
+	if how := seedEntry(t, c, "storageprofile.ceph-rbd"); how != "found" {
+		t.Errorf("seed record: storageprofile.ceph-rbd %q, want found", how)
+	}
 }
 
 // Uninstalling rook-ceph (its feature turned off, after the admin deleted

@@ -51,7 +51,8 @@ func NewRookHook(c client.Client, log logr.Logger) *RookHook {
 // ceph-rbd and CDI's StorageProfile, with the defaults of the nodes the
 // cluster has now. Once means: an object k4all created, or found there
 // before it, is never created again, so an admin's delete stays (the
-// CephCluster deleted before turning Rook off). The seed record in the
+// CephCluster deleted before turning Rook off). The StorageProfile CDI
+// creates empty for ceph-rbd gets the seed's spec once. The seed record in the
 // rook-ceph namespace says which; Cleanup drops it. Then it puts the
 // component's image in the CephCluster it created (keepCephImage). The
 // reconciler runs Sync after every apply of rook-ceph and at every
@@ -76,7 +77,13 @@ func (h *RookHook) Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, c
 		err := h.client.Get(ctx, client.ObjectKeyFromObject(obj), obj)
 		switch {
 		case err == nil:
-			if err := h.recordSeed(ctx, record, key, "found"); err != nil {
+			how := seedFound
+			if s.fillsEmptySpec {
+				if how, err = h.fillEmptySpec(ctx, s.build(rookPlan{})); err != nil {
+					return 0, err
+				}
+			}
+			if err := h.recordSeed(ctx, record, key, how); err != nil {
 				return 0, err
 			}
 			continue
@@ -96,15 +103,60 @@ func (h *RookHook) Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, c
 		obj = s.build(*plan)
 		h.log.Info("creating", "kind", s.kind, "name", obj.GetName(), "mons", plan.Mons, "mgrs", plan.Mgrs,
 			"poolSize", plan.PoolSize, "warning", plan.Warning)
-		if err := h.client.Create(ctx, obj, client.FieldOwner(seedFieldManager)); err != nil &&
-			!apierrors.IsAlreadyExists(err) {
+		how := seedCreated
+		err = h.client.Create(ctx, obj, client.FieldOwner(seedFieldManager))
+		switch {
+		case apierrors.IsAlreadyExists(err) && s.fillsEmptySpec:
+			// Made in between: CDI's profile, as the StorageClass appeared.
+			if how, err = h.fillEmptySpec(ctx, obj); err != nil {
+				return 0, err
+			}
+		case err != nil && !apierrors.IsAlreadyExists(err):
 			return 0, fmt.Errorf("create %s %s: %w", s.kind, obj.GetName(), err)
 		}
-		if err := h.recordSeed(ctx, record, key, "created"); err != nil {
+		if err := h.recordSeed(ctx, record, key, how); err != nil {
 			return 0, err
 		}
 	}
 	return 0, h.keepCephImage(ctx, record, image)
+}
+
+// fillEmptySpec writes the spec of seed on the object of its name when that
+// object's spec is empty, as the seed manager, and says "created"; it says
+// "found", writing nothing, when the spec has anything in it. CDI creates
+// the StorageProfile of a StorageClass at once, its spec empty: that is
+// CDI's, not an admin's, and k4all's seed has not been written yet. The
+// write is conditional on the object as read (its resourceVersion), so a
+// spec set in between is never overwritten.
+func (h *RookHook) fillEmptySpec(ctx context.Context, seed client.Object) (string, error) {
+	desired, ok := seed.(*unstructured.Unstructured)
+	if !ok {
+		return "", fmt.Errorf("seed %s is %T, want unstructured", seed.GetName(), seed)
+	}
+	how := seedFound
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		live := &unstructured.Unstructured{}
+		live.SetGroupVersionKind(desired.GroupVersionKind())
+		if err := h.client.Get(ctx, client.ObjectKeyFromObject(desired), live); err != nil {
+			return err
+		}
+		if spec, _, _ := unstructured.NestedMap(live.Object, "spec"); len(spec) > 0 {
+			return nil
+		}
+		filled := live.DeepCopy()
+		filled.Object["spec"] = desired.Object["spec"]
+		if err := h.client.Patch(ctx, filled, client.MergeFromWithOptions(live, client.MergeFromWithOptimisticLock{}),
+			client.FieldOwner(seedFieldManager)); err != nil {
+			return err
+		}
+		h.log.Info("writing the seed spec on the empty one", "kind", desired.GetKind(), "name", desired.GetName())
+		how = seedCreated
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("seed the spec of %s %s: %w", desired.GetKind(), desired.GetName(), err)
+	}
+	return how, nil
 }
 
 // keepCephImage keeps spec.cephVersion.image of the CephCluster k4all
@@ -115,7 +167,7 @@ func (h *RookHook) Sync(ctx context.Context, spec k4allv1alpha1.ComponentSpec, c
 // console's. A CephCluster k4all found is its admin's, image included, and
 // one deleted is not created again.
 func (h *RookHook) keepCephImage(ctx context.Context, record *corev1.ConfigMap, image string) error {
-	if !strings.HasPrefix(record.Data[seedKey(cephClusterKind, cephClusterName)], "created") {
+	if !strings.HasPrefix(record.Data[seedKey(cephClusterKind, cephClusterName)], seedCreated) {
 		return nil
 	}
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -172,9 +224,17 @@ func (h *RookHook) Cleanup(ctx context.Context, _ string, _ k4allv1alpha1.Cluste
 
 // seedRecordName is the ConfigMap, in the rook-ceph namespace, that lists
 // the objects the Rook hook created or found: "<kind>.<name>" to "created"
-// or "found" and the time. Deleting an entry lets k4all create that object
-// again.
+// or "found" and the time. "created" also stands for CDI's StorageProfile
+// that the hook found with an empty spec and gave its seed's
+// (fillEmptySpec). Deleting an entry lets k4all create that object again.
 const seedRecordName = "k4all-rook-seeds"
+
+// What the seed record says of an object: k4all created it (or gave CDI's
+// empty StorageProfile its spec), or found it there.
+const (
+	seedCreated = "created"
+	seedFound   = "found"
+)
 
 func seedKey(kind, name string) string {
 	return strings.ToLower(kind) + "." + name
@@ -225,7 +285,10 @@ type rookSeed struct {
 	// optional: the API comes with another component (CDI, the snapshot
 	// CRDs), and a cluster without it gets no such object.
 	optional bool
-	build    func(rookPlan) client.Object
+	// fillsEmptySpec: found with an empty spec, the object gets the seed's
+	// (fillEmptySpec), and counts as created.
+	fillsEmptySpec bool
+	build          func(rookPlan) client.Object
 }
 
 // rookSeeds are the objects the Rook hook creates, in order.
@@ -235,7 +298,8 @@ func rookSeeds(settings RookSettings, image string) []rookSeed {
 		{kind: cephBlockPoolKind, build: func(p rookPlan) client.Object { return cephBlockPoolObject(p) }},
 		{kind: "StorageClass", build: func(p rookPlan) client.Object { return cephStorageClass(p) }},
 		{kind: snapshotClassKind, optional: true, build: func(rookPlan) client.Object { return cephSnapshotClass() }},
-		{kind: storageProfileKind, optional: true, build: func(rookPlan) client.Object { return cephStorageProfile() }},
+		{kind: storageProfileKind, optional: true, fillsEmptySpec: true,
+			build: func(rookPlan) client.Object { return cephStorageProfile() }},
 	}
 }
 
