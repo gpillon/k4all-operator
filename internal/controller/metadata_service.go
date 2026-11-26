@@ -11,12 +11,28 @@ import (
 	"github.com/gpillon/k4all-operator/internal/metadata"
 )
 
+// metadataSettings are the settings the metadata service runs with: the
+// ClusterConfig's, and on also while virt is off but features.virt.metadata
+// is on and the release still has the k4all-metadata component Installed.
+// Its uninstall then waits for the virt group's (engine.RemovedAfter), which
+// the VMs hold while they exist, and it serves those VMs until it goes.
+// Turned off itself, it is off at once. rm may be nil (no release yet).
+func metadataSettings(spec k4allv1alpha1.ClusterConfigSpec, rm *k4allv1alpha1.ReleaseManifest) hooks.MetadataSettings {
+	s := hooks.MetadataSettingsFrom(spec)
+	md := spec.Features.Virt.Metadata
+	if s.Enabled || md == nil || !md.Enabled || rm == nil {
+		return s
+	}
+	s.Enabled = rm.Status.Components[hooks.MetadataComponent].State == k4allv1alpha1.ComponentStateInstalled
+	return s
+}
+
 // metadataServiceCondition is the ClusterConfig's MetadataService
 // condition: whether the k4all-metadata component's policies are in place,
 // from its status in the release. ok is false while the service is off (no
-// condition then).
+// condition then; metadataSettings).
 func metadataServiceCondition(config *k4allv1alpha1.ClusterConfig, rm *k4allv1alpha1.ReleaseManifest) (metav1.Condition, bool) {
-	s := hooks.MetadataSettingsFrom(config.Spec)
+	s := metadataSettings(config.Spec, rm)
 	if !s.Enabled {
 		return metav1.Condition{}, false
 	}

@@ -15,15 +15,19 @@ import (
 // mount under the plugins dir.
 var pluginLists = []string{"initContainers", "volumes", "volumeMounts"}
 
-// featurePlugins are the plugins Headlamp gets only with their feature on:
-// Hangar is the console of KubeVirt, Cairn the console of Rook.
+// featurePlugins are the plugins Headlamp gets only with their feature on,
+// or held (its components still installed): Hangar is the console of
+// KubeVirt, Cairn the console of Rook.
 var featurePlugins = map[string]string{
 	"hangar-plugin": engine.FeatureVirt,
 	"cairn-plugin":  engine.FeatureRook,
 }
 
 // MergeOverride gives Headlamp the plugins of the release whose feature is
-// on, and layers componentOverrides.headlamp on the values. Helm replaces
+// on or held: a feature turned off keeps its console while its uninstall is
+// refused or under way (the refusal tells the admin to clean up there), and
+// loses it once its components are gone. It layers
+// componentOverrides.headlamp on the values. Helm replaces
 // lists, so an override that added a plugin used to drop the release's; the
 // plugin lists merge by key instead (initContainers and volumes by name,
 // volumeMounts by mountPath): an override entry takes the place of the
@@ -33,7 +37,7 @@ var featurePlugins = map[string]string{
 // entry (made while Helm replaced the lists), and the release's stays. An
 // empty list in the override empties the list, as with Helm.
 func (h *HeadlampHook) MergeOverride(spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
-	values map[string]interface{}, override k4allv1alpha1.ComponentOverride) (map[string]interface{}, error) {
+	held HeldFeatures, values map[string]interface{}, override k4allv1alpha1.ComponentOverride) (map[string]interface{}, error) {
 	out, err := engine.ApplyOverride(values, override)
 	if err != nil {
 		return nil, err
@@ -58,13 +62,28 @@ func (h *HeadlampHook) MergeOverride(spec k4allv1alpha1.ComponentSpec, config k4
 		}
 		kept := make([]interface{}, 0, len(entries)+len(extra))
 		for _, e := range entries {
-			if !featureOff(entryName(e), config) {
+			if !featureOff(entryName(e), config, held) {
 				kept = append(kept, e)
 			}
 		}
 		out[list] = mergeByKey(kept, extra, listKey(list), list == "initContainers")
 	}
 	return out, nil
+}
+
+// HeldFeaturesUsed implements OverrideMerger: the held features with a
+// console plugin.
+func (h *HeadlampHook) HeldFeaturesUsed(held HeldFeatures) HeldFeatures {
+	var used HeldFeatures
+	for _, gate := range held {
+		for _, feature := range featurePlugins {
+			if gate == feature {
+				used = append(used, gate)
+				break
+			}
+		}
+	}
+	return used
 }
 
 // mergeByKey puts each entry of extra in place of the entry of base with
@@ -112,10 +131,11 @@ func listKey(list string) string {
 	return "name"
 }
 
-// featureOff: the entry belongs to a plugin whose feature is off.
-func featureOff(name string, config k4allv1alpha1.ClusterConfigSpec) bool {
+// featureOff: the entry belongs to a plugin whose feature is off and not
+// held.
+func featureOff(name string, config k4allv1alpha1.ClusterConfigSpec, held HeldFeatures) bool {
 	feature, gated := featurePlugins[name]
-	return gated && !engine.FeatureEnabled(feature, config)
+	return gated && !engine.FeatureEnabled(feature, config) && !held.Holds(feature)
 }
 
 // entryName is the name of an initContainer, a volume or a volume mount.

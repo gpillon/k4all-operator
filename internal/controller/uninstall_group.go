@@ -25,7 +25,11 @@ import (
 //     the consoles, then CDI, then KubeVirt; Cairn, then the CSI drivers,
 //     then the Rook operator. The components of a group go one after the
 //     other, each once the one before it is gone; any component also waits
-//     for what depends on it, in any group (snapshot-controller for Hangar).
+//     for what depends on it, in any group (snapshot-controller for Hangar);
+//   - a component whose gate goes after another's (engine.RemovedAfter:
+//     k4all-metadata after virt) waits for every component of that gate,
+//     held or uninstalling, though it depends on one of them: it serves what
+//     they keep.
 //
 // A component the release sets management Removed is not part of it: it is
 // removed on its own (reconcileRemovedComponents).
@@ -42,17 +46,30 @@ type removalPlan struct {
 // planRemoval is the removalPlan of components, the managed components out
 // of the release.
 func planRemoval(components map[string]k4allv1alpha1.ComponentSpec) removalPlan {
+	// follows: name goes after other, its gate after other's.
+	follows := func(name, other string) bool {
+		after := engine.RemovedAfter(components[name].FeatureGate)
+		return after != "" && name != other && components[other].FeatureGate == after
+	}
 	// The dependency graph turned around: a component "depends on" what
-	// depends on it, so its topological order has dependents first.
+	// depends on it, so its topological order has dependents first; one that
+	// follows a gate "depends on" that gate's components instead.
 	reversed := make(map[string]k4allv1alpha1.ComponentSpec, len(components))
 	for name := range components {
 		reversed[name] = k4allv1alpha1.ComponentSpec{}
 	}
 	for name, spec := range components {
 		for _, dep := range spec.DependsOn {
-			if r, ok := reversed[dep]; ok && dep != name {
+			if r, ok := reversed[dep]; ok && dep != name && !follows(name, dep) {
 				r.DependsOn = append(r.DependsOn, name)
 				reversed[dep] = r
+			}
+		}
+		for other := range components {
+			if follows(name, other) {
+				r := reversed[name]
+				r.DependsOn = append(r.DependsOn, other)
+				reversed[name] = r
 			}
 		}
 	}
@@ -69,11 +86,13 @@ func planRemoval(components map[string]k4allv1alpha1.ComponentSpec) removalPlan 
 	for _, name := range order {
 		plan.group[name] = components[name].FeatureGate
 	}
-	dependsOn := func(name, dep string) bool { return name != dep && slices.Contains(components[name].DependsOn, dep) }
+	dependsOn := func(name, dep string) bool {
+		return name != dep && slices.Contains(components[name].DependsOn, dep) && !follows(name, dep)
+	}
 	for i, name := range order {
 		for _, earlier := range order[:i] {
 			sameGroup := plan.group[name] != "" && plan.group[earlier] == plan.group[name]
-			if sameGroup || dependsOn(earlier, name) {
+			if sameGroup || dependsOn(earlier, name) || follows(name, earlier) {
 				plan.before[name] = append(plan.before[name], earlier)
 			}
 		}

@@ -138,10 +138,10 @@ func TestAppliedHash_HookRevisionReappliesOnlyThatComponent(t *testing.T) {
 	config.Features.Virt.Enabled = true
 	spec := k4allv1alpha1.ComponentSpec{Type: "helm", Version: "1.19.8"}
 
-	if r.appliedHash("cilium", spec, config) == oldAppliedHash(t, spec, config) {
+	if r.appliedHash("cilium", spec, config, nil) == oldAppliedHash(t, spec, config) {
 		t.Errorf("cilium: the hash ignores the hook revision, running clusters would keep the old Cilium values")
 	}
-	if r.appliedHash("topolvm", spec, config) != oldAppliedHash(t, spec, config) {
+	if r.appliedHash("topolvm", spec, config, nil) != oldAppliedHash(t, spec, config) {
 		t.Errorf("topolvm: the hash changed without a hook revision, every cluster would re-apply it")
 	}
 }

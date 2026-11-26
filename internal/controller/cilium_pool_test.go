@@ -29,7 +29,7 @@ func ciliumValues(t *testing.T, config k4allv1alpha1.ClusterConfigSpec, objects 
 	r := &ReleaseReconciler{
 		hookReg: hooks.NewRegistry(fake.NewClientBuilder().WithObjects(objects...).Build(), logr.Discard()),
 	}
-	got, err := r.componentValues(context.Background(), "cilium", ciliumSpec, config)
+	got, err := r.componentValues(context.Background(), "cilium", ciliumSpec, config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestComponentValues_CiliumUnreadableConfigIsAnError(t *testing.T) {
 	}).Build()
 	r := &ReleaseReconciler{hookReg: hooks.NewRegistry(c, logr.Discard())}
 
-	got, err := r.componentValues(context.Background(), "cilium", ciliumSpec, ciliumConfig())
+	got, err := r.componentValues(context.Background(), "cilium", ciliumSpec, ciliumConfig(), nil)
 
 	if err == nil {
 		t.Fatalf("componentValues = %v, want an error", got)
@@ -136,7 +136,7 @@ func TestComponentValues_CiliumRefusesAPodNetworkItCannotUse(t *testing.T) {
 			config := ciliumConfig()
 			config.Cluster.PodNetwork = podNetwork
 
-			got, err := r.componentValues(context.Background(), "cilium", ciliumSpec, config)
+			got, err := r.componentValues(context.Background(), "cilium", ciliumSpec, config, nil)
 
 			if err == nil {
 				t.Fatalf("componentValues = %v, want an error", got)

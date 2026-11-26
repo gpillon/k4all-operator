@@ -154,6 +154,18 @@ func FeatureEnabled(gate string, config k4allv1alpha1.ClusterConfigSpec) bool {
 	return false
 }
 
+// RemovedAfter is the feature gate whose components the components of gate
+// are uninstalled after when both are off; "" for none. virtMetadata goes
+// after virt: the metadata service serves the VMs whose virt group's
+// uninstall waits for them to be deleted (an UninstallGuard), and a VM
+// started without it gets a new MAC and no asset tag.
+func RemovedAfter(gate string) string {
+	if gate == FeatureVirtMetadata {
+		return FeatureVirt
+	}
+	return ""
+}
+
 // rookEnabled says whether k4all runs Rook: features.rook.enabled. A cluster
 // without the field (every cluster before k4all v2.7.0) runs none.
 func rookEnabled(config k4allv1alpha1.ClusterConfigSpec) bool {

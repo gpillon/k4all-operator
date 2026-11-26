@@ -559,3 +559,71 @@ func TestMetadataSecret_EachWarningOnce(t *testing.T) {
 		t.Fatalf("events:\n%s", ev)
 	}
 }
+
+// The v2.7.0 VM round (F2): virt turned off while VMs hold the virt group
+// keeps the k4all-metadata component installed, queued behind the group
+// (TestReconcile_TheMetadataServiceGoesAfterTheVirtGroup). Its controller
+// serves on from the ClusterConfig and the release, as the operator runs it
+// (no Settings): every VM keeps its Secret, the running ones are still
+// served. Once the component is gone the Secrets go too; the metadata service
+// turned off itself drops them at once, whatever the release says.
+func TestMetadataSecret_KeptWhileTheComponentStaysForTheVirtGroup(t *testing.T) {
+	virtWorkloadAPIs(t)
+	c := envtestClient(t)
+	ctx := context.Background()
+	mdNamespaceSeq++
+	ns := fmt.Sprintf("md-kept-%d-%d", time.Now().UnixNano()%100000, mdNamespaceSeq)
+	cc := &k4allv1alpha1.ClusterConfig{ObjectMeta: metav1.ObjectMeta{Name: "k4all-cluster-config"}}
+	cc.Spec.Networking.CNI.Type = calicoCNI
+	cc.Spec.Features.Virt.Metadata = &k4allv1alpha1.MetadataSettings{Enabled: true}
+	rm := &k4allv1alpha1.ReleaseManifest{
+		ObjectMeta: metav1.ObjectMeta{Name: "k4all"},
+		Spec: k4allv1alpha1.ReleaseManifestSpec{Components: map[string]k4allv1alpha1.ComponentSpec{
+			hooks.MetadataComponent: metadataComponent(),
+		}},
+	}
+	createAll(t, c, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, cc, rm)
+	metadataState := func(state k4allv1alpha1.ComponentState, message string) {
+		t.Helper()
+		rm.Status.Components = map[string]k4allv1alpha1.ComponentStatus{
+			hooks.MetadataComponent: {State: state, Message: message, LastTransitionTime: metav1.Now()},
+		}
+		if err := c.Status().Update(ctx, rm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setSwitches := func(virt, md bool) {
+		t.Helper()
+		cc.Spec.Features.Virt.Enabled = virt
+		cc.Spec.Features.Virt.Metadata.Enabled = md
+		if err := c.Update(ctx, cc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := &MetadataReconciler{Client: c, Reader: c, APIReader: c, Recorder: record.NewFakeRecorder(100), Log: logr.Discard()}
+	createAll(t, c, testVM(ns, "web", optIn(), map[string]any{}))
+
+	metadataState(k4allv1alpha1.ComponentStateInstalled, "uninstall queued: waiting for hangar to be uninstalled first")
+	reconcileVM(t, r, ns, "web")
+	if mdSecret(t, c, ns, "web") == nil {
+		t.Fatal("virt off, k4all-metadata kept for the virt group: the VM has no Secret")
+	}
+
+	metadataState(k4allv1alpha1.ComponentStateSkipped, "disabled by ClusterConfig feature gate")
+	reconcileVM(t, r, ns, "web")
+	if mdSecret(t, c, ns, "web") != nil {
+		t.Fatal("k4all-metadata uninstalled: the Secret stays")
+	}
+
+	setSwitches(true, true)
+	metadataState(k4allv1alpha1.ComponentStateInstalled, "installed successfully")
+	reconcileVM(t, r, ns, "web")
+	if mdSecret(t, c, ns, "web") == nil {
+		t.Fatal("virt and metadata on: the VM has no Secret")
+	}
+	setSwitches(true, false)
+	reconcileVM(t, r, ns, "web")
+	if mdSecret(t, c, ns, "web") != nil {
+		t.Fatal("metadata turned off, k4all-metadata still Installed: the Secret stays")
+	}
+}

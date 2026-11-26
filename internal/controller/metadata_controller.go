@@ -54,6 +54,7 @@ const (
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=k4all.magesgate.com,resources=clusterconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=k4all.magesgate.com,resources=releasemanifests,verbs=get;list;watch
 
 // MetadataReconciler renders, for each VM the metadata service serves, the
 // Secret k4all-md-<vm> in the VM's namespace: what the VM's metadata server
@@ -148,8 +149,20 @@ func (r *MetadataReconciler) readSettings(ctx context.Context) (hooks.MetadataSe
 		if err := r.Reader.List(ctx, list); err != nil {
 			return s, fmt.Errorf("list ClusterConfigs: %w", err)
 		}
+		// The release says whether k4all-metadata is kept for the virt
+		// group (metadataSettings). Its uninstall is seen at the next
+		// reconcile of each VM, within metadataResync: the virt group
+		// goes only once its VMs, and their Secrets with them, are gone.
+		releases := &k4allv1alpha1.ReleaseManifestList{}
+		if err := r.Reader.List(ctx, releases); err != nil {
+			return s, fmt.Errorf("list ReleaseManifests: %w", err)
+		}
+		var rm *k4allv1alpha1.ReleaseManifest
+		if len(releases.Items) > 0 {
+			rm = &releases.Items[0]
+		}
 		if len(list.Items) > 0 {
-			s = hooks.MetadataSettingsFrom(list.Items[0].Spec)
+			s = metadataSettings(list.Items[0].Spec, rm)
 		}
 	}
 	r.settings.Store(&s)

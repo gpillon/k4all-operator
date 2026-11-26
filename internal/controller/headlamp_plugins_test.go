@@ -8,8 +8,12 @@ import (
 	"testing"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/controller/hooks"
 	"github.com/gpillon/k4all-operator/internal/engine"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // pluginEntries is one Headlamp plugin as k4all-release.yaml ships it: an
@@ -73,10 +77,12 @@ func headlampRelease(t *testing.T) k4allv1alpha1.ComponentSpec {
 }
 
 // helmValues are the values Helm gets: the release's values with the
-// reconciler's on top, merged as the engine does (lists replace).
-func helmValues(t *testing.T, r *ReleaseReconciler, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) map[string]interface{} {
+// reconciler's on top, merged as the engine does (lists replace), with the
+// features held.
+func helmValues(t *testing.T, r *ReleaseReconciler, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+	held ...string) map[string]interface{} {
 	t.Helper()
-	extra, err := r.componentValues(context.Background(), "headlamp", spec, config)
+	extra, err := r.componentValues(context.Background(), "headlamp", spec, config, held)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,6 +168,98 @@ func TestHeadlampPlugins_CairnWithRook(t *testing.T) {
 	off := virtOn()
 	off.Features.Rook = &k4allv1alpha1.RookConfig{Enabled: false}
 	expectPlugins(t, helmValues(t, r, headlampRelease(t), off), "k4all-plugin", "hangar-plugin")
+}
+
+// The v2.7.0 VM round (F6): Rook turned off with a CephCluster is refused,
+// yet Headlamp lost Cairn, the console the refusal tells the admin to clean
+// up with; virt turned off with VMs lost Hangar the same way. A console
+// stays while its feature is held (components still installed: refused,
+// queued, uninstalling) and goes with them. Another held gate (the metadata
+// service queued, the snapshot controller) keeps no console.
+func TestHeadlampPlugins_AConsoleStaysWhileItsFeatureIsHeld(t *testing.T) {
+	r := newValuesReconciler()
+	rookOff := k4allv1alpha1.ClusterConfigSpec{}
+	rookOff.Features.Rook = &k4allv1alpha1.RookConfig{Enabled: false}
+
+	expectPlugins(t, helmValues(t, r, headlampRelease(t), rookOff, "rook"), "k4all-plugin", "cairn-plugin")
+	expectPlugins(t, helmValues(t, r, headlampRelease(t), rookOff, "virt"), "k4all-plugin", "hangar-plugin")
+	expectPlugins(t, helmValues(t, r, headlampRelease(t), rookOff, "rook", "virt"),
+		"k4all-plugin", "hangar-plugin", "cairn-plugin")
+	expectPlugins(t, helmValues(t, r, headlampRelease(t), rookOff, "snapshots", "virtMetadata"), "k4all-plugin")
+	expectPlugins(t, helmValues(t, r, headlampRelease(t), rookOff), "k4all-plugin")
+}
+
+// Headlamp is applied again when a console's feature stops being held: the
+// held features its plugins follow are in its appliedHash, the others not,
+// and no other component's hash has them.
+func TestAppliedHash_HeadlampFollowsTheHeldConsoles(t *testing.T) {
+	r := newValuesReconciler()
+	spec := headlampRelease(t)
+	var config k4allv1alpha1.ClusterConfigSpec
+	none := r.appliedHash("headlamp", spec, config, nil)
+
+	if r.appliedHash("headlamp", spec, config, hooks.HeldFeatures{"rook"}) == none {
+		t.Error("headlamp: Rook held or not, the same hash: Cairn would stay after the Rook group is gone")
+	}
+	if r.appliedHash("headlamp", spec, config, hooks.HeldFeatures{"snapshots", "virtMetadata"}) != none {
+		t.Error("headlamp: a held gate without a console changes the hash: Headlamp re-applied for nothing")
+	}
+	for _, name := range []string{"cilium", "kubevirt", "topolvm"} {
+		if r.appliedHash(name, spec, config, hooks.HeldFeatures{"rook", "virt"}) != r.appliedHash(name, spec, config, nil) {
+			t.Errorf("%s: the held features change its hash, want only Headlamp's", name)
+		}
+	}
+}
+
+// Through the reconcile: Rook off with a CephCluster holds the Rook group,
+// and Headlamp, applied after the group's uninstall is decided, has the
+// hash with Rook held; once the group is gone, the hash without, so the
+// next apply drops Cairn.
+func TestReconcile_HeadlampFollowsTheRookGroup(t *testing.T) {
+	components := rookGroup()
+	components["headlamp"] = gatedComponent("headlamp", "")
+	c, r := groupsOnEnvtest(t, components)
+	withCephClusterCRD(t, c)
+	cluster := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "ceph.rook.io/v1",
+		"kind":       "CephCluster",
+		"metadata":   map[string]interface{}{"name": "rook-ceph", "namespace": metav1.NamespaceDefault},
+		"spec": map[string]interface{}{
+			"cephVersion":     map[string]interface{}{"image": "quay.io/ceph/ceph:v20.2.4"},
+			"dataDirHostPath": "/var/lib/rook",
+		},
+	}}
+	createAll(t, c, cluster)
+	// Headlamp's hash as the reconcile computes it: from the component and
+	// the ClusterConfig as the API server has them (defaults, migrations).
+	hash := func(held hooks.HeldFeatures) string {
+		t.Helper()
+		cc := &k4allv1alpha1.ClusterConfig{}
+		if err := c.Get(context.Background(), client.ObjectKey{Name: "k4all-cluster-config"}, cc); err != nil {
+			t.Fatal(err)
+		}
+		rm := &k4allv1alpha1.ReleaseManifest{}
+		if err := c.Get(context.Background(), client.ObjectKey{Name: "k4all"}, rm); err != nil {
+			t.Fatal(err)
+		}
+		return r.appliedHash("headlamp", rm.Spec.Components["headlamp"], cc.Spec, held)
+	}
+
+	reconcileProbe(t, r)
+	held := hash(hooks.HeldFeatures{"rook"})
+	if st := componentStatus(t, c, "headlamp"); st.AppliedHash != held {
+		t.Errorf("headlamp applied from %q, want the hash with Rook held (%q)", st.AppliedHash, held)
+	}
+
+	if err := deleteNow(c, cluster); err != nil {
+		t.Fatal(err)
+	}
+	reconcileProbe(t, r)
+	assertGone(t, c, "cairn", "ceph-csi-drivers", "rook-ceph")
+	free := hash(nil)
+	if st := componentStatus(t, c, "headlamp"); st.AppliedHash != free {
+		t.Errorf("headlamp applied from %q, want the hash with nothing held (%q)", st.AppliedHash, free)
+	}
 }
 
 // withHeadlampOverride sets componentOverrides.headlamp.values.

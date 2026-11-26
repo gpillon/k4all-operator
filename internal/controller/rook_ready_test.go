@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -284,5 +285,80 @@ func TestReconcile_RookReadySurvivesAnotherConditionsChange(t *testing.T) {
 	cl.reconcile()
 	if cond := cl.condition(k4allv1alpha1.ConditionRookReady); cond != nil {
 		t.Errorf("Rook off: RookReady %s (%s), want it removed", cond.Status, cond.Reason)
+	}
+}
+
+// rookReadyCluster is a cluster with Rook on, 3 nodes and a release with no
+// component (nothing else asks for a sooner reconcile), plus objects.
+func rookReadyCluster(t *testing.T, objects ...client.Object) *cluster {
+	t.Helper()
+	config := rookOn("")
+	config.Generation = 0
+	config.Spec.Networking.CNI.Type = calicoCNI
+	rm := &k4allv1alpha1.ReleaseManifest{ObjectMeta: metav1.ObjectMeta{Name: "k4all"}}
+	s := gateScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(append(objects, &config, rm)...).
+		WithStatusSubresource(&k4allv1alpha1.ReleaseManifest{}, &k4allv1alpha1.ClusterConfig{}).
+		Build()
+	return &cluster{t: t, c: c, r: &ReleaseReconciler{Client: c, Scheme: s, Log: logr.Discard()}}
+}
+
+// The v2.7.0 VM round (F3): RookReady said CephClusterProgressing for
+// minutes after the CephCluster was Ready and HEALTH_OK, until an unrelated
+// ClusterConfig edit: nothing reconciles when Rook updates the CephCluster,
+// and no watch can (Rook's CRDs come with the rook-ceph component, if
+// ever). So while Rook works towards a ready cluster the reconcile comes
+// back within 30 s; once RookReady is True, at the periodic resync.
+func TestReconcile_ComesBackSoonWhileRookIsNotReady(t *testing.T) {
+	cluster := cephCluster("Progressing", "Configuring Ceph Mons", "", nil)
+	cl := rookReadyCluster(t, append(cephNodeObjects(3), seedRecord("created"), cluster)...)
+
+	res := cl.reconcile()
+	if cond := cl.condition(k4allv1alpha1.ConditionRookReady); cond == nil || cond.Reason != "CephClusterProgressing" {
+		t.Fatalf("RookReady %+v, want CephClusterProgressing", cond)
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > 30*time.Second {
+		t.Errorf("RequeueAfter %s while the CephCluster progresses, want at most 30s", res.RequeueAfter)
+	}
+
+	ready := cephCluster("Ready", "Cluster created successfully", "HEALTH_OK", nil)
+	live := cephCluster("", "", "", nil)
+	if err := cl.c.Get(context.Background(), client.ObjectKeyFromObject(live), live); err != nil {
+		t.Fatal(err)
+	}
+	live.Object["status"] = ready.Object["status"]
+	if err := cl.c.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	res = cl.reconcile()
+	if cond := cl.condition(k4allv1alpha1.ConditionRookReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("RookReady %+v, want True", cond)
+	}
+	if res.RequeueAfter != resyncInterval {
+		t.Errorf("RequeueAfter %s with RookReady True, want the resync, %s", res.RequeueAfter, resyncInterval)
+	}
+}
+
+// RookReady False because of what only a person or a new node changes (too
+// few nodes with smallCluster Refuse, the CephCluster k4all made deleted):
+// nothing to watch for, the periodic resync is enough.
+func TestReconcile_RookWaitingOnAPersonIsNotPolled(t *testing.T) {
+	for name, tc := range map[string]struct {
+		objects []client.Object
+		reason  string
+	}{
+		"one node": {cephNodeObjects(1), "NotEnoughNodes"},
+		"deleted":  {append(cephNodeObjects(3), seedRecord("created")), "CephClusterDeleted"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cl := rookReadyCluster(t, tc.objects...)
+			res := cl.reconcile()
+			if cond := cl.condition(k4allv1alpha1.ConditionRookReady); cond == nil || cond.Reason != tc.reason {
+				t.Fatalf("RookReady %+v, want %s", cond, tc.reason)
+			}
+			if res.RequeueAfter != resyncInterval {
+				t.Errorf("RequeueAfter %s, want the resync, %s", res.RequeueAfter, resyncInterval)
+			}
+		})
 	}
 }
