@@ -527,21 +527,86 @@ func TestReconcile_AQueuedComponentBackInTheReleaseDropsTheQueue(t *testing.T) {
 	}
 }
 
-// k4all-metadata's gate is virtMetadata (virt and metadata.enabled), not
-// virt: it is not in the virt group. With virt off and a VM, it goes (it
-// has no guard: it holds no data) while the virt group is held; KubeVirt,
-// which it depends on, stays.
-func TestReconcile_TheMetadataServiceIsNotHeldWithVirt(t *testing.T) {
+// metadataComponent is k4all-metadata as the k4all v2.7.0 release has it:
+// gate virtMetadata (virt and features.virt.metadata.enabled), outside the
+// virt group, on KubeVirt.
+func metadataComponent() k4allv1alpha1.ComponentSpec {
+	return gatedComponent("k4all-metadata", "virtMetadata", "kubevirt")
+}
+
+// The v2.7.0 VM round (F2): virt off with VMs holds the virt group, and
+// k4all-metadata, outside the group, went at once: its policies and every
+// VM's Secret with it. Running VMs got 503 from 169.254.169.254, and a VM
+// that restarted got a random MAC and no asset tag. It serves the VMs that
+// hold the group: it stays, queued behind the group while the group is held
+// and while it is uninstalled, and goes once the group is gone.
+func TestReconcile_TheMetadataServiceGoesAfterTheVirtGroup(t *testing.T) {
 	virtWorkloadAPIs(t)
 	components := virtGroup()
-	// An unknown gate is off here: it stands for virtMetadata off with virt.
-	components["k4all-metadata"] = gatedComponent("k4all-metadata", "virtMetadata", "kubevirt")
+	components["k4all-metadata"] = metadataComponent()
+	c, r := groupsOnEnvtest(t, components)
+	runningOperatorCR(t, c, kubeVirtCR, kubeVirtFinalizer)
+	runningOperatorCR(t, c, cdiCR, cdiFinalizer)
+	vm := kubevirtObject("VirtualMachine", "vm1")
+	createAll(t, c, vm)
+	deleted := recordDeletes(t, r)
+
+	reconcileProbe(t, r)
+
+	if len(*deleted) > 0 {
+		t.Errorf("deleted %v while kubevirt refuses, want nothing", *deleted)
+	}
+	assertKept(t, c, "uninstall refused: kubevirt: 1 VirtualMachine (default/vm1) exists: "+
+		"delete it or set kubevirt Unmanaged first", "kubevirt", "cdi", "virtctl", "hangar", "hangar-node-agent")
+	assertKept(t, c, "uninstall queued: waiting for hangar to be uninstalled first", "k4all-metadata")
+
+	if err := deleteNow(c, vm); err != nil {
+		t.Fatal(err)
+	}
+	reconcileProbe(t, r)
+	assertGone(t, c, "hangar", "hangar-node-agent", "virtctl")
+	assertKept(t, c, "uninstall queued: waiting for cdi to be uninstalled first", "k4all-metadata")
+
+	cdiCR.operatorDone(t, c)
+	reconcileProbe(t, r)
+	assertGone(t, c, "cdi")
+	assertKept(t, c, "uninstall queued: waiting for kubevirt to be uninstalled first", "k4all-metadata")
+
+	*deleted = nil
+	kubeVirtCR.operatorDone(t, c)
+	reconcileProbe(t, r)
+
+	if want := []string{"kubevirt", "k4all-metadata"}; !slices.Equal(*deleted, want) {
+		t.Fatalf("deleted %v, want %v", *deleted, want)
+	}
+	assertGone(t, c, "kubevirt", "k4all-metadata")
+}
+
+// Turned off on its own, virt on, the metadata service has nothing to wait
+// for: it goes at once, as before.
+func TestReconcile_TheMetadataServiceTurnedOffAloneGoesAtOnce(t *testing.T) {
+	virtWorkloadAPIs(t)
+	components := virtGroup()
+	components["k4all-metadata"] = metadataComponent()
 	c, r := groupsOnEnvtest(t, components)
 	createAll(t, c, kubevirtObject("VirtualMachine", "vm1"))
+	cc := &k4allv1alpha1.ClusterConfig{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "k4all-cluster-config"}, cc); err != nil {
+		t.Fatal(err)
+	}
+	cc.Spec.Features.Virt.Enabled = true
+	cc.Spec.Features.Virt.Metadata = &k4allv1alpha1.MetadataSettings{Enabled: false}
+	if err := c.Update(context.Background(), cc); err != nil {
+		t.Fatal(err)
+	}
 
 	reconcileProbe(t, r)
 
 	assertGone(t, c, "k4all-metadata")
-	assertKept(t, c, "uninstall refused: kubevirt: 1 VirtualMachine (default/vm1) exists: "+
-		"delete it or set kubevirt Unmanaged first", "kubevirt", "cdi", "virtctl", "hangar", "hangar-node-agent")
+	for _, name := range []string{"kubevirt", "cdi", "virtctl", "hangar", "hangar-node-agent"} {
+		if st := componentStatus(t, c, name); st.State != k4allv1alpha1.ComponentStateInstalled ||
+			strings.HasPrefix(st.Message, "uninstall ") {
+			t.Errorf("%s: %s (%s), want Installed, its feature on", name, st.State, st.Message)
+		}
+	}
 }

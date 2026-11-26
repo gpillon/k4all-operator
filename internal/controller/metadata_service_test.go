@@ -57,12 +57,27 @@ func TestMetadataServiceCondition(t *testing.T) {
 		}
 	}
 	// off: no condition
-	for name, config := range map[string]*k4allv1alpha1.ClusterConfig{
-		"absent":   mdClusterConfig(nil),
-		"disabled": mdClusterConfig(&k4allv1alpha1.MetadataSettings{}),
+	virtOff := mdClusterConfig(on)
+	virtOff.Spec.Features.Virt.Enabled = false
+	for name, tc := range map[string]struct {
+		config *k4allv1alpha1.ClusterConfig
+		rm     *k4allv1alpha1.ReleaseManifest
+	}{
+		"absent":   {mdClusterConfig(nil), mdRelease(installed)},
+		"disabled": {mdClusterConfig(&k4allv1alpha1.MetadataSettings{}), mdRelease(installed)},
+		"virt off, uninstalled": {virtOff, mdRelease(&k4allv1alpha1.ComponentStatus{
+			State: k4allv1alpha1.ComponentStateSkipped, Message: "disabled by ClusterConfig feature gate"})},
 	} {
-		if cond, ok := metadataServiceCondition(config, mdRelease(installed)); ok {
+		if cond, ok := metadataServiceCondition(tc.config, tc.rm); ok {
 			t.Errorf("%s: %+v", name, cond)
 		}
+	}
+	// Virt off while VMs hold the virt group: k4all-metadata stays, queued
+	// behind the group, and still serves (F2).
+	queued := &k4allv1alpha1.ComponentStatus{State: k4allv1alpha1.ComponentStateInstalled,
+		Message: "uninstall queued: waiting for hangar to be uninstalled first"}
+	if cond, ok := metadataServiceCondition(virtOff, mdRelease(queued)); !ok ||
+		cond.Status != metav1.ConditionTrue || cond.Reason != "Serving" {
+		t.Errorf("virt off, k4all-metadata kept: %v %+v, want True (Serving)", ok, cond)
 	}
 }
