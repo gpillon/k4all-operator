@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -35,6 +37,26 @@ const (
 	cephPhaseFailure       = "Failure"
 	cephHealthChecksInLine = 5
 )
+
+// rookReadyPollInterval is how soon a reconcile comes back while Rook works
+// towards a ready Ceph cluster (rookComingUp): nothing watches the
+// CephCluster, whose CRD comes with rook-ceph, so RookReady would otherwise
+// lag behind it until the periodic resync.
+const rookReadyPollInterval = 30 * time.Second
+
+// rookComingUp tells whether conditions have RookReady not True for a
+// reason the cluster moves past on its own: Rook installing, k4all about to
+// create the CephCluster, the CephCluster's state or health, a failed
+// check. Not while it waits on a person or on nodes (NotEnoughNodes,
+// CephClusterDeleted): the resync is enough there, and a single node with
+// smallCluster Refuse would poll forever.
+func rookComingUp(conditions []metav1.Condition) bool {
+	cond := meta.FindStatusCondition(conditions, k4allv1alpha1.ConditionRookReady)
+	if cond == nil || cond.Status == metav1.ConditionTrue {
+		return false
+	}
+	return cond.Reason != rookReasonNotEnough && cond.Reason != rookReasonDeleted
+}
 
 // rookReadyCondition is the RookReady condition of the ClusterConfig: the
 // Ceph cluster of features.rook, or why k4all has not created it. false:

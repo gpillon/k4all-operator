@@ -288,6 +288,9 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if anyUninstallRefused(rm) {
 		requeue = sooner(requeue, uninstallRefusedPollInterval)
 	}
+	if rookComingUp(config.Status.Conditions) {
+		requeue = sooner(requeue, rookReadyPollInterval)
+	}
 	requeue = sooner(requeue, failedRetry(rm, time.Now()))
 	return ctrl.Result{RequeueAfter: sooner(requeue, hookRequeue)}, nil
 }
