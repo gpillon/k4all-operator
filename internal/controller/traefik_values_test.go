@@ -28,7 +28,7 @@ func traefikValues(t *testing.T, config k4allv1alpha1.ClusterConfigSpec) map[str
 	r := &ReleaseReconciler{
 		hookReg: hooks.NewRegistry(fake.NewClientBuilder().WithObjects(node).Build(), logr.Discard()),
 	}
-	got, err := r.componentValues(context.Background(), "traefik", k4allv1alpha1.ComponentSpec{}, config)
+	got, err := r.componentValues(context.Background(), "traefik", k4allv1alpha1.ComponentSpec{}, config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

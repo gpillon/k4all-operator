@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -103,14 +104,29 @@ type Remover interface {
 	Remove(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error
 }
 
+// HeldFeatures are the feature gates the ClusterConfig turns off while
+// components of theirs are still installed: their uninstall refused (VMs, a
+// CephCluster), queued or not over yet (gpillon/k4all#96). Sorted.
+type HeldFeatures []string
+
+// Holds tells whether gate is one of the held features.
+func (h HeldFeatures) Holds(gate string) bool {
+	return slices.Contains(h, gate)
+}
+
 // OverrideMerger is implemented by a hook that layers its component's
 // ClusterConfig componentOverride on the PreInstall values itself, instead
 // of the plain deep merge, where a list of the override replaces the
 // release's list (headlamp: plugin lists merge by name). The reconciler calls
-// it on every apply, with an empty override when the ClusterConfig has none.
+// it on every apply, with an empty override when the ClusterConfig has none,
+// and the features held at that reconcile.
 type OverrideMerger interface {
-	MergeOverride(spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+	MergeOverride(spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, held HeldFeatures,
 		values map[string]interface{}, override k4allv1alpha1.ComponentOverride) (map[string]interface{}, error)
+	// HeldFeaturesUsed are the features of held that MergeOverride's values
+	// depend on (Headlamp: those with a console). The reconciler puts them
+	// in the component's appliedHash: it is applied again when they change.
+	HeldFeaturesUsed(held HeldFeatures) HeldFeatures
 }
 
 // ManifestMutator is implemented by a hook that folds ClusterConfig settings

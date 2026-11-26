@@ -264,7 +264,8 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// component held (traefik: the node's ports and the "nginx" IngressClass).
 	removedOK := r.reconcileRemovedComponents(ctx, log, rm, removed, config.Spec)
 	inactiveOK := r.reconcileInactiveComponents(ctx, log, rm, active, config.Spec)
-	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec)
+	held := heldFeatures(rm, active)
+	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec, held)
 	keepFailedSince(before, rm)
 	setDowngradeRefused(rm, active)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
@@ -457,20 +458,47 @@ func (r *ReleaseReconciler) reconcileInactiveComponents(
 // leaves out.
 const skippedMessage = "disabled by ClusterConfig feature gate"
 
+// heldFeatures are the feature gates of the managed components out of the
+// release that are still installed once reconcileInactiveComponents has
+// run: their uninstall refused, queued, under way or failed. Every other
+// one is Skipped by then. Read by the components applied after (Headlamp
+// keeps the console of a held feature).
+func heldFeatures(rm *k4allv1alpha1.ReleaseManifest, active map[string]k4allv1alpha1.ComponentSpec) hooks.HeldFeatures {
+	gates := map[string]bool{}
+	for name, spec := range rm.Spec.Components {
+		if _, isActive := active[name]; isActive || spec.FeatureGate == "" ||
+			spec.Management == k4allv1alpha1.ComponentManagementUnmanaged ||
+			spec.Management == k4allv1alpha1.ComponentManagementRemoved {
+			continue
+		}
+		if st, ok := rm.Status.Components[name]; ok && st.State != k4allv1alpha1.ComponentStateSkipped {
+			gates[spec.FeatureGate] = true
+		}
+	}
+	held := make(hooks.HeldFeatures, 0, len(gates))
+	for gate := range gates {
+		held = append(held, gate)
+	}
+	sort.Strings(held)
+	return held
+}
+
 // reconcileActiveComponents installs or upgrades the active components in
 // dependency order, running the PreInstall/PostInstall hooks around each one.
-// A component with an upgradePath moves by one step per call. It returns false
-// if any component failed, stepsLeft when some component is mid-path, and
-// hookRequeue when a hook's Sync asked to run again that soon (0: none asked).
+// A component with an upgradePath moves by one step per call. held are the
+// features off whose components are still installed (heldFeatures). It
+// returns false if any component failed, stepsLeft when some component is
+// mid-path, and hookRequeue when a hook's Sync asked to run again that soon
+// (0: none asked).
 func (r *ReleaseReconciler) reconcileActiveComponents(
 	ctx context.Context, log logr.Logger, rm *k4allv1alpha1.ReleaseManifest, order []string,
-	active map[string]k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+	active map[string]k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, held hooks.HeldFeatures,
 ) (allOK, stepsLeft bool, hookRequeue time.Duration) {
 	allOK = true
 	for _, name := range order {
 		spec := active[name]
 		currentStatus := rm.Status.Components[name]
-		hash := r.appliedHash(name, spec, config)
+		hash := r.appliedHash(name, spec, config, held)
 
 		// A static pod whose manifest the operator did not write stays left
 		// alone until the component's spec changes.
@@ -546,7 +574,7 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 		log.Info("reconciling component", "name", name, "type", spec.Type, "version", toApply.Version,
 			"target", spec.Version)
 
-		extraValues, valuesErr := r.componentValues(ctx, name, toApply, config)
+		extraValues, valuesErr := r.componentValues(ctx, name, toApply, config, held)
 		if valuesErr != nil {
 			log.Error(valuesErr, "preparing component values failed", "name", name)
 			rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
@@ -1177,9 +1205,10 @@ func (r *ReleaseReconciler) getClusterConfig(ctx context.Context) (*k4allv1alpha
 
 // appliedHash identifies what a component is applied from: its spec, its
 // componentOverrides and, when it has a hook, the rest of the ClusterConfig
-// spec the hook reads. Hooks are not run here: some prepare the cluster.
+// spec the hook reads, and the held features an OverrideMerger's values
+// follow. Hooks are not run here: some prepare the cluster.
 func (r *ReleaseReconciler) appliedHash(
-	name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+	name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, held hooks.HeldFeatures,
 ) string {
 	inputs := struct {
 		Spec     k4allv1alpha1.ComponentSpec      `json:"spec"`
@@ -1189,6 +1218,9 @@ func (r *ReleaseReconciler) appliedHash(
 		// after an operator upgrade. Empty (left out) for most hooks, so
 		// their hashes stay the same.
 		HookRevision string `json:"hookRevision,omitempty"`
+		// The held features the hook's values follow (Headlamp's consoles).
+		// None (left out) for every hook while nothing is held.
+		Held hooks.HeldFeatures `json:"held,omitempty"`
 	}{Spec: spec}
 	if override, ok := config.ComponentOverrides[name]; ok {
 		inputs.Override = &override
@@ -1199,6 +1231,9 @@ func (r *ReleaseReconciler) appliedHash(
 		inputs.Config = &hookConfig
 		if rev, ok := hook.(hooks.ValuesRevisioner); ok {
 			inputs.HookRevision = rev.ValuesRevision()
+		}
+		if merger, ok := hook.(hooks.OverrideMerger); ok {
+			inputs.Held = merger.HeldFeaturesUsed(held)
 		}
 	}
 	raw, err := json.Marshal(inputs)
@@ -1213,9 +1248,10 @@ func (r *ReleaseReconciler) appliedHash(
 // ReleaseManifest values of one component: the PreInstall hook's values
 // first, then the ClusterConfig componentOverrides, so the user always wins.
 // The PreInstall hook, if any, may also prepare the cluster. A hook that is
-// an OverrideMerger layers the override itself.
+// an OverrideMerger layers the override itself, with the held features.
 func (r *ReleaseReconciler) componentValues(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec,
+	held hooks.HeldFeatures,
 ) (map[string]interface{}, error) {
 	values := make(map[string]interface{})
 	hook := r.hookReg.Get(name)
@@ -1227,7 +1263,7 @@ func (r *ReleaseReconciler) componentValues(
 	}
 	override, ok := config.ComponentOverrides[name]
 	if merger, isMerger := hook.(hooks.OverrideMerger); isMerger {
-		return merger.MergeOverride(spec, config, values, override)
+		return merger.MergeOverride(spec, config, held, values, override)
 	}
 	if !ok {
 		return values, nil

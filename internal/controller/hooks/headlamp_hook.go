@@ -30,8 +30,9 @@ const (
 )
 
 // HeadlampHook configures the Headlamp dashboard:
-//   - Gives it the plugins of the release whose feature is on, merged with
-//     those of componentOverrides.headlamp (MergeOverride, headlamp_plugins.go)
+//   - Gives it the plugins of the release whose feature is on or held,
+//     merged with those of componentOverrides.headlamp (MergeOverride,
+//     headlamp_plugins.go)
 //   - Creates admin ServiceAccount + ClusterRoleBinding
 //   - Creates long-lived token Secret
 //   - Publishes the dashboard on dashboard.<ingress IP>.nip.io, through
