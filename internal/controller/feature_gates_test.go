@@ -228,7 +228,7 @@ func TestManifestApply_KeepsAGateSetDuringTheApply(t *testing.T) {
 		Namespace: "kubevirt",
 	}
 	ctx := context.Background()
-	if err := engine.NewManifestApplier(base, logr.Discard()).Apply(ctx, "kubevirt", spec, nil); err != nil {
+	if _, err := engine.NewManifestApplier(base, logr.Discard()).Apply(ctx, "kubevirt", spec, nil); err != nil {
 		t.Fatal(err)
 	}
 	kubeVirtCR.patchByHand(t, base, `{"spec":{"configuration":{"developerConfiguration":{"featureGates":["HostDevices"]}}}}`)
@@ -247,7 +247,7 @@ func TestManifestApply_KeepsAGateSetDuringTheApply(t *testing.T) {
 			return nil
 		},
 	})
-	if err := engine.NewManifestApplier(c, logr.Discard()).Apply(ctx, "kubevirt", spec, nil); err != nil {
+	if _, err := engine.NewManifestApplier(c, logr.Discard()).Apply(ctx, "kubevirt", spec, nil); err != nil {
 		t.Fatal(err)
 	}
 	if gates, want := kubeVirtCR.featureGates(t, base), []string{"HostDevices", "Snapshot"}; !slices.Equal(gates, want) {
