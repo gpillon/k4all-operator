@@ -202,6 +202,13 @@ func TestMigrations_CleanTheIngressNginxNamespaceLeftByV050(t *testing.T) {
 	c := envtestClient(t)
 	ctx := context.Background()
 	ns := "ingress-nginx"
+	// The migration cleans this very name. envtest never finishes deleting
+	// a namespace: a second run of the test (go test -count) finds the first
+	// run's still being deleted, and cannot make it again.
+	left := &corev1.Namespace{}
+	if err := c.Get(ctx, client.ObjectKey{Name: ns}, left); err == nil && left.DeletionTimestamp != nil {
+		t.Skip("namespace ingress-nginx is still being deleted by an earlier run of this test")
+	}
 	for _, o := range []client.Object{
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ingress-nginx-admission"}},

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,6 +65,9 @@ type ReleaseReconciler struct {
 
 	engine  *engine.Engine
 	hookReg *hooks.Registry
+	// swept are the Removed components whose hook's SweepRemoved has run
+	// since the operator started (sweepRemoved).
+	swept map[string]bool
 }
 
 // +kubebuilder:rbac:groups=k4all.magesgate.com,resources=releasemanifests,verbs=get;list;watch;create;update;patch;delete
@@ -268,6 +272,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	activeOK, stepsLeft, hookRequeue := r.reconcileActiveComponents(ctx, log, rm, order, active, config.Spec, held)
 	keepFailedSince(before, rm)
 	setDowngradeRefused(rm, active)
+	setValuesDropRefused(rm, active)
 	setReadySummary(rm, inactiveOK && activeOK && removedOK, len(active))
 
 	if err := r.patchStatus(ctx, rm); err != nil {
@@ -586,11 +591,26 @@ func (r *ReleaseReconciler) reconcileActiveComponents(
 			continue
 		}
 
-		opts := []engine.ReconcileOption{engine.MutateObjects(hooks.ObjectMutator(r.hookReg.Get(name), config))}
+		opts := []engine.ReconcileOption{
+			engine.MutateObjects(hooks.ObjectMutator(r.hookReg.Get(name), config)),
+			engine.AllowValuesDrop(func(revision int) bool {
+				return valuesDropAllowed(rm.GetAnnotations()[AllowValuesDropAnnotation], name, revision)
+			}),
+		}
 		if intermediate {
 			opts = append(opts, engine.WaitUntilReady())
 		}
 		st, err := r.engine.ReconcileComponent(ctx, name, toApply, extraValues, opts...)
+		var dropped *engine.ValuesDropError
+		if goerrors.As(err, &dropped) {
+			// Nothing was applied: the release runs as it was, until a
+			// person carries its values or accepts the drop.
+			log.Info("not taking over a helm release written by another manager", "name", name,
+				"revision", dropped.Revision, "writtenBy", dropped.WrittenBy, "dropped", dropped.Paths)
+			allOK = false
+			rm.Status.Components[name] = refusedTakeover(currentStatus, name, dropped)
+			continue
+		}
 		if goerrors.Is(err, engine.ErrHelmReleaseBusy) {
 			// A helm operation that may still run (a previous leader
 			// finishing it): come back soon, as on an upgrade step.
@@ -807,6 +827,75 @@ func setDowngradeRefused(rm *k4allv1alpha1.ReleaseManifest, active map[string]k4
 	})
 }
 
+// AllowValuesDropAnnotation on the ReleaseManifest names the Helm releases
+// whose values a person lets the operator drop when it takes them over, as
+// "component=revision" entries separated by commas: the revision is the
+// last one of the release, written outside k4all-operator
+// (engine.ValuesDropError). An entry allows exactly that revision, so a
+// stale annotation allows nothing else.
+const AllowValuesDropAnnotation = "k4all.magesgate.com/allow-values-drop"
+
+// valuesDropRefusedCondition lists, on the ReleaseManifest, the components
+// whose Helm release the operator does not take over: it was written last
+// outside k4all-operator, and k4all's values would drop some of its values.
+const valuesDropRefusedCondition = "ValuesDropRefused"
+
+// valuesDropRefusedPrefix starts the message of a component whose Helm
+// release the reconcile did not take over.
+const valuesDropRefusedPrefix = "not taking over: "
+
+// refusedTakeover is the status of a component whose Helm release was left
+// as it runs (engine.ValuesDropError): Failed, at the version it had, with
+// what would go and the two ways on.
+func refusedTakeover(prev k4allv1alpha1.ComponentStatus, name string, dropped *engine.ValuesDropError) k4allv1alpha1.ComponentStatus {
+	st := prev
+	if st.State != k4allv1alpha1.ComponentStateFailed {
+		st.State = k4allv1alpha1.ComponentStateFailed
+		st.LastTransitionTime = metav1.Now()
+	}
+	st.Message = fmt.Sprintf("%s%s (to keep them, carry them in the ClusterConfig's componentOverrides.%s values; "+
+		"to drop them, annotate the ReleaseManifest with %s: %s=%d)",
+		valuesDropRefusedPrefix, dropped.Error(), name, AllowValuesDropAnnotation, name, dropped.Revision)
+	return st
+}
+
+// valuesDropAllowed tells whether the AllowValuesDropAnnotation value has the
+// entry name=revision.
+func valuesDropAllowed(value, name string, revision int) bool {
+	for _, entry := range strings.Split(value, ",") {
+		n, v, ok := strings.Cut(entry, "=")
+		if ok && strings.TrimSpace(n) == name && strings.TrimSpace(v) == strconv.Itoa(revision) {
+			return true
+		}
+	}
+	return false
+}
+
+// setValuesDropRefused sets valuesDropRefusedCondition from what this
+// reconcile did, as setDowngradeRefused.
+func setValuesDropRefused(rm *k4allv1alpha1.ReleaseManifest, active map[string]k4allv1alpha1.ComponentSpec) {
+	var refused []string
+	for name := range active {
+		if strings.HasPrefix(rm.Status.Components[name].Message, valuesDropRefusedPrefix) {
+			refused = append(refused, name)
+		}
+	}
+	if len(refused) == 0 {
+		meta.RemoveStatusCondition(&rm.Status.Conditions, valuesDropRefusedCondition)
+		return
+	}
+	sort.Strings(refused)
+	meta.SetStatusCondition(&rm.Status.Conditions, metav1.Condition{
+		Type:               valuesDropRefusedCondition,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: rm.Generation,
+		Reason:             valuesDropRefusedCondition,
+		Message: "the Helm releases of these components were written last outside k4all-operator, and k4all's " +
+			"values would drop some of theirs, which componentOverrides does not carry and " +
+			AllowValuesDropAnnotation + " does not allow (see their status): " + strings.Join(refused, ", "),
+	})
+}
+
 // newerVersion tells whether a is a later semver than b.
 func newerVersion(a, b string) bool {
 	c, ok := engine.CompareVersions(a, b)
@@ -866,6 +955,9 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 				allOK = false
 				continue
 			}
+			r.markSwept(name) // Remove did what a sweep would do
+		} else if hasPrev && prevStatus.State == k4allv1alpha1.ComponentStateRemoved {
+			r.sweepRemoved(ctx, name)
 		}
 		rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
 			State:              k4allv1alpha1.ComponentStateRemoved,
@@ -874,6 +966,25 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 		}
 	}
 	return allOK
+}
+
+// sweepRemoved runs the SweepRemoved of the hook of name, a component
+// already Removed, if it is a RemovedSweeper, once per operator start: what
+// an earlier operator's removal left (#45) goes after the operator upgrade.
+func (r *ReleaseReconciler) sweepRemoved(ctx context.Context, name string) {
+	sweeper, ok := r.hookReg.Get(name).(hooks.RemovedSweeper)
+	if !ok || r.swept[name] {
+		return
+	}
+	r.markSwept(name)
+	sweeper.SweepRemoved(ctx)
+}
+
+func (r *ReleaseReconciler) markSwept(name string) {
+	if r.swept == nil {
+		r.swept = map[string]bool{}
+	}
+	r.swept[name] = true
 }
 
 // uninstallRefusedPrefix starts the message of a component whose hook

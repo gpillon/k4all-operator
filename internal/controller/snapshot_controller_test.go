@@ -2,10 +2,8 @@ package controller
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -13,9 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/engine"
@@ -47,30 +43,7 @@ spec:
 // for the test, and removes it when the test ends.
 func withVolumeSnapshotCRD(t *testing.T, c client.Client) {
 	t.Helper()
-	opts := envtest.CRDInstallOptions{
-		Paths:              []string{filepath.Join("hooks", "testdata", "crds", "snapshot.storage.k8s.io_volumesnapshots.yaml")},
-		ErrorIfPathMissing: true,
-	}
-	cfg := envtestConfig(t)
-	if _, err := envtest.InstallCRDs(cfg, opts); err != nil {
-		t.Fatalf("install the VolumeSnapshot CRD: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := envtest.UninstallCRDs(cfg, opts); err != nil {
-			t.Errorf("uninstall the VolumeSnapshot CRD: %v", err)
-		}
-		crd := &unstructured.Unstructured{}
-		crd.SetAPIVersion("apiextensions.k8s.io/v1")
-		crd.SetKind("CustomResourceDefinition")
-		crd.SetName("volumesnapshots.snapshot.storage.k8s.io")
-		err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 30*time.Second, true,
-			func(ctx context.Context) (bool, error) {
-				return apierrors.IsNotFound(c.Get(ctx, client.ObjectKeyFromObject(crd), crd)), nil
-			})
-		if err != nil {
-			t.Errorf("the VolumeSnapshot CRD is still there: %v", err)
-		}
-	})
+	withTestCRD(t, c, "snapshot.storage.k8s.io_volumesnapshots.yaml", "volumesnapshots.snapshot.storage.k8s.io")
 }
 
 // D13: virt and rook both off turn the snapshots gate off. While a

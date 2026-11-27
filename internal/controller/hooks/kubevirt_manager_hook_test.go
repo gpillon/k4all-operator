@@ -13,13 +13,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/operatorscheme"
 )
 
 var (
@@ -69,16 +68,13 @@ func virtualMachine(ns, name, priorityClass string) *unstructured.Unstructured {
 }
 
 // kubevirtCluster is a fake cluster that knows KubeVirt's and
-// kubevirt-manager's kinds, with objs in it.
+// kubevirt-manager's kinds, with objs in it. Its client has the manager's
+// scheme (cmd/main.go), plus those kinds as unstructured, as the API server
+// serves them: up to v0.6.0 this scheme had apiextensions/v1 and the
+// manager's did not, and the image catalog CRD was never deleted (#45).
 func kubevirtCluster(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
-	s := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	if err := apiextensionsv1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
+	s := operatorscheme.New()
 	for _, gvk := range []schema.GroupVersionKind{vmGVK, imageGVK} {
 		s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
 		s.AddKnownTypeWithName(gvk.GroupVersion().WithKind(gvk.Kind+"List"), &unstructured.UnstructuredList{})
@@ -229,7 +225,7 @@ func kubevirtManagerNamespaceLeft(t *testing.T, c client.Client, ns string) {
 
 func TestKubevirtManagerRemoval_DeletesTheNamespaceItLeaves(t *testing.T) {
 	c, cfg := envtestClient(t)
-	ns := "kubevirt-manager-left"
+	ns := envtestNamespace("kubevirt-manager-left")
 	kubevirtManagerNamespaceLeft(t, c, ns)
 	h := &KubevirtManagerHook{client: c, log: logr.Discard(), restConfig: cfg, namespace: ns,
 		settle: 2 * time.Second, poll: 200 * time.Millisecond}
@@ -247,7 +243,7 @@ func TestKubevirtManagerRemoval_DeletesTheNamespaceItLeaves(t *testing.T) {
 // they and their namespace stay.
 func TestKubevirtManagerRemoval_KeepsANamespaceWithTheUsersObjects(t *testing.T) {
 	c, cfg := envtestClient(t)
-	ns := "kubevirt-manager-configured"
+	ns := envtestNamespace("kubevirt-manager-configured")
 	kubevirtManagerNamespaceLeft(t, c, ns)
 	mine := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "auth-config"}}
 	if err := c.Create(context.Background(), mine); err != nil {

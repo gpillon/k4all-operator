@@ -50,8 +50,9 @@ func New(c client.Client, restConfig *rest.Config, log logr.Logger, toolsImage s
 type ReconcileOption func(*reconcileOptions)
 
 type reconcileOptions struct {
-	waitUntilReady bool
-	mutator        ObjectMutator
+	waitUntilReady  bool
+	mutator         ObjectMutator
+	allowValuesDrop func(revision int) bool
 }
 
 // WaitUntilReady makes Helm components return only once their resources are
@@ -68,7 +69,9 @@ func MutateObjects(m ObjectMutator) ReconcileOption {
 
 // ReconcileComponent installs or upgrades a single component.
 // It resolves version templates, dispatches to the appropriate installer,
-// and applies any post-install patches.
+// and applies the patches the installer has not applied: all of them after
+// a Helm install, those whose target is in no manifest after a manifest
+// apply.
 func (e *Engine) ReconcileComponent(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, extraValues map[string]interface{},
 	opts ...ReconcileOption,
@@ -99,11 +102,15 @@ func (e *Engine) ReconcileComponent(
 		return st, err
 	}
 
+	// The patches applied after the install: for a manifest component, those
+	// whose target is in none of its manifests (the others are folded into
+	// its objects before their apply, patch_fold.go).
+	patches := spec.Patches
 	switch spec.Type {
 	case k4allv1alpha1.ComponentTypeHelm, k4allv1alpha1.ComponentTypeHelmOCI:
-		err = e.helm.Reconcile(ctx, name, spec, values, o.waitUntilReady)
+		err = e.helm.Reconcile(ctx, name, spec, values, o.waitUntilReady, o.allowValuesDrop)
 	case k4allv1alpha1.ComponentTypeManifest:
-		err = e.manifest.Apply(ctx, name, spec, o.mutator)
+		patches, err = e.manifest.Apply(ctx, name, spec, o.mutator)
 	case k4allv1alpha1.ComponentTypeBinary:
 		err = e.binary.Install(ctx, name, spec)
 	case k4allv1alpha1.ComponentTypeStaticPod:
@@ -120,8 +127,8 @@ func (e *Engine) ReconcileComponent(
 		return st, err
 	}
 
-	if len(spec.Patches) > 0 {
-		if patchErr := e.patcher.ApplyAll(ctx, spec.Patches); patchErr != nil {
+	if len(patches) > 0 {
+		if patchErr := e.patcher.ApplyAll(ctx, patches); patchErr != nil {
 			st.State = k4allv1alpha1.ComponentStateFailed
 			st.Message = fmt.Sprintf("patch failed: %v", patchErr)
 			return st, patchErr

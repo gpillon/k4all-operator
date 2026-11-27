@@ -37,10 +37,12 @@ func retryAfter(failedFor time.Duration) time.Duration {
 // retried tells whether a component's status is a failure that the
 // reconcile tries again with retryBackoff: Failed, whatever the error (an
 // apply, an uninstall, a stuck operator uninstall), or installed with a
-// failed hook. A refused downgrade waits on a person, not on a retry.
+// failed hook. A refused downgrade or takeover waits on a person, not on a
+// retry.
 func retried(st k4allv1alpha1.ComponentStatus) bool {
 	if st.State == k4allv1alpha1.ComponentStateFailed {
-		return !strings.HasPrefix(st.Message, downgradeRefusedPrefix)
+		return !strings.HasPrefix(st.Message, downgradeRefusedPrefix) &&
+			!strings.HasPrefix(st.Message, valuesDropRefusedPrefix)
 	}
 	return strings.HasPrefix(st.Message, hookFailedPrefix)
 }

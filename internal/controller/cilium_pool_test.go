@@ -23,9 +23,10 @@ const defaultPodNetwork = "10.100.0.1/18"
 var ciliumSpec = k4allv1alpha1.ComponentSpec{Type: "helm-oci", Version: "1.20.4", Namespace: "kube-system"}
 
 // ciliumValues returns the Helm values the operator computes for Cilium on a
-// cluster holding objects.
+// cluster holding objects, and kube-proxy.
 func ciliumValues(t *testing.T, config k4allv1alpha1.ClusterConfigSpec, objects ...client.Object) map[string]interface{} {
 	t.Helper()
+	objects = append([]client.Object{kubeProxy()}, objects...)
 	r := &ReleaseReconciler{
 		hookReg: hooks.NewRegistry(fake.NewClientBuilder().WithObjects(objects...).Build(), logr.Discard()),
 	}

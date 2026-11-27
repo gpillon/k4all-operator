@@ -54,11 +54,13 @@ type ObjectMutator interface {
 }
 
 // Apply server-side applies the objects of the component's manifests, URL
-// sources first, then inline manifests. mutator, if not nil, changes the
-// objects it claims before their apply.
+// sources first, then inline manifests, each with the component's patches
+// whose target it is folded in (patch_fold.go). mutator, if not nil, changes
+// the objects it claims before their apply. It returns the patches whose
+// target is in no manifest, for after the apply.
 func (m *ManifestApplier) Apply(
 	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, mutator ObjectMutator,
-) error {
+) ([]k4allv1alpha1.ComponentPatch, error) {
 	urls := spec.Sources
 	if len(urls) == 0 && spec.Source != "" {
 		urls = []string{spec.Source}
@@ -67,7 +69,17 @@ func (m *ManifestApplier) Apply(
 	if len(urls) == 0 && len(spec.InlineManifests) == 0 {
 		// Its hook renders its objects (k4all-metadata).
 		m.log.V(1).Info("no manifests to apply", "component", name)
-		return nil
+		return spec.Patches, nil
+	}
+	patches := newPatchFolder(spec.Patches, m.client.Scheme())
+	// prepare fills in the component's namespace and folds the patches into
+	// obj, once: the inline manifests' apply is retried with the same object.
+	prepare := func(obj *unstructured.Unstructured) error {
+		manifestNamespace := obj.GetNamespace()
+		if spec.Namespace != "" && obj.GetNamespace() == "" && isNamespaced(*obj) {
+			obj.SetNamespace(spec.Namespace)
+		}
+		return patches.fold(obj, manifestNamespace)
 	}
 
 	// Apply URL-sourced manifests first
@@ -75,18 +87,15 @@ func (m *ManifestApplier) Apply(
 		m.log.Info("applying manifest", "component", name, "url", url)
 		objects, err := m.fetchAndDecode(ctx, url)
 		if err != nil {
-			return fmt.Errorf("fetch %s: %w", url, err)
+			return nil, fmt.Errorf("fetch %s: %w", url, err)
 		}
 
 		for _, obj := range objects {
-			if spec.Namespace != "" && obj.GetNamespace() == "" {
-				if isNamespaced(obj) {
-					obj.SetNamespace(spec.Namespace)
-				}
+			if err := prepare(&obj); err != nil {
+				return nil, fmt.Errorf("%s %s/%s: %w", obj.GetKind(), obj.GetNamespace(), obj.GetName(), err)
 			}
-
 			if err := m.serverSideApply(ctx, &obj, spec, mutator); err != nil {
-				return fmt.Errorf("apply %s %s/%s: %w",
+				return nil, fmt.Errorf("apply %s %s/%s: %w",
 					obj.GetKind(), obj.GetNamespace(), obj.GetName(), err)
 			}
 		}
@@ -97,24 +106,21 @@ func (m *ManifestApplier) Apply(
 		m.log.Info("applying inline manifest", "component", name, "index", i)
 		objects, err := decodeMultiDoc([]byte(raw))
 		if err != nil {
-			return fmt.Errorf("decode inline manifest %d: %w", i, err)
+			return nil, fmt.Errorf("decode inline manifest %d: %w", i, err)
 		}
 
 		for _, obj := range objects {
-			if spec.Namespace != "" && obj.GetNamespace() == "" {
-				if isNamespaced(obj) {
-					obj.SetNamespace(spec.Namespace)
-				}
+			if err := prepare(&obj); err != nil {
+				return nil, fmt.Errorf("inline %s %s/%s: %w", obj.GetKind(), obj.GetNamespace(), obj.GetName(), err)
 			}
-
 			if err := m.serverSideApplyWithRetry(ctx, &obj, spec, mutator); err != nil {
-				return fmt.Errorf("apply inline %s %s/%s: %w",
+				return nil, fmt.Errorf("apply inline %s %s/%s: %w",
 					obj.GetKind(), obj.GetNamespace(), obj.GetName(), err)
 			}
 		}
 	}
 
-	return nil
+	return patches.unfolded(), nil
 }
 
 func (m *ManifestApplier) serverSideApplyWithRetry(
