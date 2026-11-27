@@ -14,7 +14,6 @@ import (
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -91,6 +90,14 @@ func (h *KubevirtManagerHook) Remove(ctx context.Context, _ k4allv1alpha1.Compon
 	h.removePriorityClasses(ctx)
 	deleteNamespaceIfEmpty(ctx, h.client, h.restConfig, h.log, ns, h.settle, h.poll)
 	return nil
+}
+
+// SweepRemoved implements RemovedSweeper: the image catalog CRD goes now if
+// it is still empty. Operators up to v0.6.0 could not delete it (their
+// manager's scheme lacked apiextensions/v1, #45), and kubevirt-manager was
+// Removed already: its Remove does not run again.
+func (h *KubevirtManagerHook) SweepRemoved(ctx context.Context) {
+	h.removeImageCatalog(ctx)
 }
 
 // imageCatalogCRD is kubevirt-manager's image catalog; its Images are the user's.
@@ -188,7 +195,8 @@ func (h *KubevirtManagerHook) priorityClassesInUse(ctx context.Context) (map[str
 	return used, nil
 }
 
-// notServed: the API server (or the client's scheme) does not know the kind.
+// notServed: the API server does not serve the kind (kindNotServed), or the
+// client's scheme does not know it.
 func notServed(err error) bool {
-	return meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err)
+	return kindNotServed(err) || runtime.IsNotRegisteredError(err)
 }

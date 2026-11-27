@@ -1,0 +1,106 @@
+# The DaemonSet of ovs-cni's examples/ovs-cni.yml v0.40.0, as published.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ovs-cni-amd64
+  namespace: kube-system
+  labels:
+    tier: node
+    app: ovs-cni
+spec:
+  selector:
+    matchLabels:
+      app: ovs-cni
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        tier: node
+        app: ovs-cni
+      annotations:
+        description: OVS CNI allows users to attach their Pods/VMs to Open vSwitch bridges available on nodes
+    spec:
+      serviceAccountName: ovs-cni-marker
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/os: linux
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      initContainers:
+      - name: ovs-cni-plugin
+        image: ghcr.io/k8snetworkplumbingwg/ovs-cni-plugin:latest
+        command: ["/bin/sh","-c"]
+        args:
+          - >
+            cp /ovs /host/opt/cni/bin/ovs &&
+            cp /ovs-mirror-producer /host/opt/cni/bin/ovs-mirror-producer &&
+            cp /ovs-mirror-consumer /host/opt/cni/bin/ovs-mirror-consumer
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "15Mi"
+        volumeMounts:
+        - name: cnibin
+          mountPath: /host/opt/cni/bin
+      priorityClassName: system-node-critical
+      containers:
+      - name: ovs-cni-marker
+        image: ghcr.io/k8snetworkplumbingwg/ovs-cni-plugin:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        command:
+          - /marker
+        args:
+          - -v
+          - "3"
+          - -logtostderr
+          - -node-name
+          - $(NODE_NAME)
+          - -ovs-socket
+          - unix:/host/var/run/openvswitch/db.sock
+          - -healthcheck-interval=60
+        volumeMounts:
+          - name: ovs-var-run
+            mountPath: /host/var/run/openvswitch
+          - name: tmp
+            mountPath: /tmp
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "10Mi"
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        livenessProbe:
+          exec:
+            command:
+              - sh
+              - -c
+              - >-
+                find /tmp/healthy -mmin -2 | grep -q '/tmp/healthy'
+          initialDelaySeconds: 60
+          periodSeconds: 60
+        terminationMessagePolicy: FallbackToLogsOnError
+      volumes:
+        - name: cnibin
+          hostPath:
+            path: /opt/cni/bin
+        - name: ovs-var-run
+          hostPath:
+            path: /var/run/openvswitch
+        - name: tmp
+          emptyDir: {}

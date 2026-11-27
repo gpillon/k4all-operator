@@ -353,7 +353,7 @@ func cephClustersBlock(ctx context.Context, c client.Client, name string) (strin
 	list.SetAPIVersion(cephAPIVersion)
 	list.SetKind(cephClusterKind + "List")
 	if err := c.List(ctx, list); err != nil {
-		if meta.IsNoMatchError(err) {
+		if kindNotServed(err) {
 			return "", nil
 		}
 		return "", fmt.Errorf("list CephClusters: %w", err)

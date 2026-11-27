@@ -46,7 +46,7 @@ func TestFeatureEnabled_VirtMetadataNeedsVirtAndMetadata(t *testing.T) {
 func TestManifestApply_NothingToApply(t *testing.T) {
 	m := NewManifestApplier(fake.NewClientBuilder().Build(), logr.Discard())
 	spec := k4allv1alpha1.ComponentSpec{Type: k4allv1alpha1.ComponentTypeManifest, Version: "v0.6.0"}
-	if err := m.Apply(context.Background(), "k4all-metadata", spec, nil); err != nil {
+	if _, err := m.Apply(context.Background(), "k4all-metadata", spec, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Delete(context.Background(), "k4all-metadata", spec); err != nil {

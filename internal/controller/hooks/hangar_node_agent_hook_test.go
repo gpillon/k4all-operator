@@ -80,7 +80,7 @@ func hangarNodeAgentHook(t *testing.T, c client.Client) *HangarNodeAgentHook {
 // does the namespace.
 func TestHangarNodeAgentRemoval_DeletesTheAgentAndItsNamespace(t *testing.T) {
 	c, _ := envtestClient(t)
-	ns := "hangar-agent-alone"
+	ns := envtestNamespace("hangar-agent-alone")
 	spec, bundle := hangarNodeAgentRelease(t, ns)
 	installHangarNodeAgent(t, c, bundle)
 
@@ -112,7 +112,7 @@ func TestHangarNodeAgentRemoval_DeletesTheAgentAndItsNamespace(t *testing.T) {
 // were.
 func TestHangarNodeAgentRemoval_KeepsTheNamespaceWithHangarsConfigMap(t *testing.T) {
 	c, _ := envtestClient(t)
-	ns := "hangar-agent-passthrough"
+	ns := envtestNamespace("hangar-agent-passthrough")
 	spec, bundle := hangarNodeAgentRelease(t, ns)
 	installHangarNodeAgent(t, c, bundle)
 	passthrough := &corev1.ConfigMap{
@@ -152,7 +152,7 @@ func TestHangarNodeAgentRemoval_KeepsTheNamespaceWithHangarsConfigMap(t *testing
 // earlier version of the agent goes too, by its label and name.
 func TestHangarNodeAgentRemoval_DeletesTheScriptsOfEarlierVersions(t *testing.T) {
 	c, _ := envtestClient(t)
-	ns := "hangar-agent-older"
+	ns := envtestNamespace("hangar-agent-older")
 	spec, bundle := hangarNodeAgentRelease(t, ns)
 	installHangarNodeAgent(t, c, bundle)
 	older := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "hangar-node-agent-scripts-5h2f8m9k7c",
@@ -177,7 +177,7 @@ func TestHangarNodeAgentRemoval_DeletesTheScriptsOfEarlierVersions(t *testing.T)
 // addition to Hangar's file) is the component's too: it goes with the rest.
 func TestHangarNodeAgentRemoval_DeletesItsInlineObjects(t *testing.T) {
 	c, _ := envtestClient(t)
-	ns := "hangar-agent-inline"
+	ns := envtestNamespace("hangar-agent-inline")
 	spec, bundle := hangarNodeAgentRelease(t, ns)
 	installHangarNodeAgent(t, c, bundle)
 	inline := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "k4all-agent-settings"}}
@@ -202,7 +202,7 @@ func TestHangarNodeAgentRemoval_DeletesItsInlineObjects(t *testing.T) {
 // deleted, and the error keeps the component for the next reconcile.
 func TestHangarNodeAgentRemoval_KeepsEverythingWithoutItsManifest(t *testing.T) {
 	c, _ := envtestClient(t)
-	ns := "hangar-agent-offline"
+	ns := envtestNamespace("hangar-agent-offline")
 	spec, bundle := hangarNodeAgentRelease(t, ns)
 	installHangarNodeAgent(t, c, bundle)
 	spec.Version = "v9.9.9" // not served

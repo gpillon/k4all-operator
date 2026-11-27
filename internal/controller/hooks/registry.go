@@ -104,6 +104,16 @@ type Remover interface {
 	Remove(ctx context.Context, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec) error
 }
 
+// RemovedSweeper is implemented by a Remover whose removal an earlier
+// operator could not finish: kubevirt-manager's empty image catalog CRD,
+// which operators up to v0.6.0 left (#45). The reconciler calls
+// SweepRemoved for the component already Removed, once per operator start;
+// it deletes, best effort and only logged, what Remove would delete now,
+// with the same checks.
+type RemovedSweeper interface {
+	SweepRemoved(ctx context.Context)
+}
+
 // HeldFeatures are the feature gates the ClusterConfig turns off while
 // components of theirs are still installed: their uninstall refused (VMs, a
 // CephCluster), queued or not over yet (gpillon/k4all#96). Sorted.

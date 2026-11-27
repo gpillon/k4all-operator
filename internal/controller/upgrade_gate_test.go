@@ -7,12 +7,12 @@ import (
 
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/operatorscheme"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -22,16 +22,11 @@ import (
 // until COMMIT or HOLD (fcos-k8s ai/migrazioni/contratto-host-operator.md §5.1).
 const upgradeInProgress = "k4all.magesgate.com/upgrade-in-progress"
 
+// gateScheme is the manager's scheme, as cmd/main.go builds it: a type the
+// operator writes and the manager lacks fails the tests (#45).
 func gateScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
-	s := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	if err := k4allv1alpha1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	return s
+	return operatorscheme.New()
 }
 
 // reconcileOnce runs one Reconcile over a cluster with a single component of

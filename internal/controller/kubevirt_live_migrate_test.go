@@ -23,11 +23,10 @@ func workloadUpdateMethods(t *testing.T, cr *unstructured.Unstructured) []string
 }
 
 // The apply of upstream's kubevirt-cr.yaml (workloadUpdateStrategy: {}, as
-// k4all-operator) and the release's patch (workloadUpdateMethods, after it)
-// do not fight: every apply ends with [LiveMigrate], a value set by hand
-// gives way at the next apply, and Hangar's own KubeVirt fields
-// (evictionStrategy, D3) stay. The engine's apply and patch are those of
-// v0.5.7, which the k4all v2.7.0 image pins until v0.6.0 is tagged.
+// k4all-operator) and the release's patch (workloadUpdateMethods, folded
+// into it since #44, after it before) do not fight: every apply ends with
+// [LiveMigrate], a value set by hand gives way at the next apply, and
+// Hangar's own KubeVirt fields (evictionStrategy, D3) stay.
 func TestReconcile_KubeVirtKeepsTheLiveMigrateInvariant(t *testing.T) {
 	srv := upstreamReleases(t)
 	kubevirt := func(version string) k4allv1alpha1.ComponentSpec {

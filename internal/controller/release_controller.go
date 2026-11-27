@@ -65,6 +65,9 @@ type ReleaseReconciler struct {
 
 	engine  *engine.Engine
 	hookReg *hooks.Registry
+	// swept are the Removed components whose hook's SweepRemoved has run
+	// since the operator started (sweepRemoved).
+	swept map[string]bool
 }
 
 // +kubebuilder:rbac:groups=k4all.magesgate.com,resources=releasemanifests,verbs=get;list;watch;create;update;patch;delete
@@ -952,6 +955,9 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 				allOK = false
 				continue
 			}
+			r.markSwept(name) // Remove did what a sweep would do
+		} else if hasPrev && prevStatus.State == k4allv1alpha1.ComponentStateRemoved {
+			r.sweepRemoved(ctx, name)
 		}
 		rm.Status.Components[name] = k4allv1alpha1.ComponentStatus{
 			State:              k4allv1alpha1.ComponentStateRemoved,
@@ -960,6 +966,25 @@ func (r *ReleaseReconciler) reconcileRemovedComponents(
 		}
 	}
 	return allOK
+}
+
+// sweepRemoved runs the SweepRemoved of the hook of name, a component
+// already Removed, if it is a RemovedSweeper, once per operator start: what
+// an earlier operator's removal left (#45) goes after the operator upgrade.
+func (r *ReleaseReconciler) sweepRemoved(ctx context.Context, name string) {
+	sweeper, ok := r.hookReg.Get(name).(hooks.RemovedSweeper)
+	if !ok || r.swept[name] {
+		return
+	}
+	r.markSwept(name)
+	sweeper.SweepRemoved(ctx)
+}
+
+func (r *ReleaseReconciler) markSwept(name string) {
+	if r.swept == nil {
+		r.swept = map[string]bool{}
+	}
+	r.swept[name] = true
 }
 
 // uninstallRefusedPrefix starts the message of a component whose hook

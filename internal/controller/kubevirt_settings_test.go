@@ -354,11 +354,12 @@ func TestReconcile_KubeVirtReappliedOnceAfterTheUpgradeFromV057(t *testing.T) {
 	}
 }
 
-// The release sets workloadUpdateMethods with a merge patch after the apply
-// (spec D3, k4all-release.yaml), the infra placement the same way. The apply
-// leaves workloadUpdateStrategy out, empty upstream: the next apply must not
-// remove what the patch wrote, and the patch's fields are k4all-operator's
-// too.
+// The release sets workloadUpdateMethods with a merge patch (spec D3,
+// k4all-release.yaml), the infra placement the same way, folded into the CR
+// before its apply (#44). The apply leaves upstream's empty
+// workloadUpdateStrategy out, not the patch's methods: the next apply must
+// not remove what the patch wrote, and the patch's fields are
+// k4all-operator's, by its apply, not by a patch after it.
 func TestReconcile_KubeVirtReleasePatchesSurviveTheApply(t *testing.T) {
 	srv, c, r := kubeVirtOnEnvtest(t, "v1.9.1", nil)
 	spec := kubeVirtComponent(srv, "v1.9.1")
@@ -378,11 +379,11 @@ func TestReconcile_KubeVirtReleasePatchesSurviveTheApply(t *testing.T) {
 	if !slices.Equal(methods, []string{"LiveMigrate"}) {
 		t.Errorf("workloadUpdateMethods %v, want the release's [LiveMigrate]", methods)
 	}
-	if !owns(managedFieldsOf(t, cr, metav1.ManagedFieldsOperationUpdate),
+	if !owns(managedFieldsOf(t, cr, metav1.ManagedFieldsOperationApply),
 		"spec", "workloadUpdateStrategy", "workloadUpdateMethods") {
-		t.Errorf("workloadUpdateMethods is not k4all-operator's; managers: %v", managers(cr))
+		t.Errorf("workloadUpdateMethods is not k4all-operator's apply; managers: %v", managers(cr))
 	}
-	if owns(managedFieldsOf(t, cr, metav1.ManagedFieldsOperationApply), "spec", "workloadUpdateStrategy") {
-		t.Error("the apply owns workloadUpdateStrategy, which upstream leaves empty")
+	if owns(managedFieldsOf(t, cr, metav1.ManagedFieldsOperationUpdate), "spec", "workloadUpdateStrategy") {
+		t.Errorf("k4all-operator patched workloadUpdateStrategy after its apply; managers: %v", managers(cr))
 	}
 }
