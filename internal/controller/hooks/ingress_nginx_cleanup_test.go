@@ -2,8 +2,10 @@ package hooks
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +49,16 @@ func envtestClient(t *testing.T) (client.Client, *rest.Config) {
 	}
 	return c, envCfg
 }
+
+// envtestNamespace is the name of a namespace a test creates in the shared
+// envtest, another one at each run of the test (go test -count): envtest
+// never finishes deleting a namespace, and the next run could not create it
+// again.
+func envtestNamespace(name string) string {
+	return fmt.Sprintf("%s-%d", name, envtestNamespaces.Add(1))
+}
+
+var envtestNamespaces atomic.Int64
 
 func TestMain(m *testing.M) {
 	code := m.Run()
@@ -102,7 +114,7 @@ func deleting(t *testing.T, c client.Client, ns string) bool {
 
 func TestIngressNginxCleanup_DeletesTheNamespaceItLeft(t *testing.T) {
 	c, cfg := envtestClient(t)
-	ns := "ingress-nginx-left"
+	ns := envtestNamespace("ingress-nginx-left")
 	leftNamespace(t, c, ns)
 	h := &IngressNginxHook{client: c, log: logr.Discard(), restConfig: cfg, namespace: ns, settle: 2 * time.Second, poll: 200 * time.Millisecond}
 
@@ -116,7 +128,7 @@ func TestIngressNginxCleanup_DeletesTheNamespaceItLeft(t *testing.T) {
 
 func TestIngressNginxCleanup_KeepsANamespaceWithOtherObjects(t *testing.T) {
 	c, cfg := envtestClient(t)
-	ns := "ingress-nginx-shared"
+	ns := envtestNamespace("ingress-nginx-shared")
 	leftNamespace(t, c, ns)
 	mine := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mine"}}
 	if err := c.Create(context.Background(), mine); err != nil {
@@ -157,7 +169,7 @@ func TestIngressNginxCleanup_NeverFailsTheRemoval(t *testing.T) {
 // gone a moment later. The cleanup waits for them before it decides.
 func TestIngressNginxCleanup_WaitsForWhatTheUninstallIsDeleting(t *testing.T) {
 	c, cfg := envtestClient(t)
-	ns := "ingress-nginx-going"
+	ns := envtestNamespace("ingress-nginx-going")
 	leftNamespace(t, c, ns)
 	going := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ingress-nginx-controller-5sgxq"},

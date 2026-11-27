@@ -225,7 +225,7 @@ func kubevirtManagerNamespaceLeft(t *testing.T, c client.Client, ns string) {
 
 func TestKubevirtManagerRemoval_DeletesTheNamespaceItLeaves(t *testing.T) {
 	c, cfg := envtestClient(t)
-	ns := "kubevirt-manager-left"
+	ns := envtestNamespace("kubevirt-manager-left")
 	kubevirtManagerNamespaceLeft(t, c, ns)
 	h := &KubevirtManagerHook{client: c, log: logr.Discard(), restConfig: cfg, namespace: ns,
 		settle: 2 * time.Second, poll: 200 * time.Millisecond}
@@ -243,7 +243,7 @@ func TestKubevirtManagerRemoval_DeletesTheNamespaceItLeaves(t *testing.T) {
 // they and their namespace stay.
 func TestKubevirtManagerRemoval_KeepsANamespaceWithTheUsersObjects(t *testing.T) {
 	c, cfg := envtestClient(t)
-	ns := "kubevirt-manager-configured"
+	ns := envtestNamespace("kubevirt-manager-configured")
 	kubevirtManagerNamespaceLeft(t, c, ns)
 	mine := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "auth-config"}}
 	if err := c.Create(context.Background(), mine); err != nil {

@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -83,7 +82,7 @@ func listServed(ctx context.Context, c client.Client, kind snapshotKind) ([]unst
 		list.SetAPIVersion(kind.group + "/" + version)
 		list.SetKind(kind.kind + "List")
 		err := c.List(ctx, list)
-		if meta.IsNoMatchError(err) {
+		if kindNotServed(err) {
 			continue
 		}
 		if err != nil {

@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/yaml"
@@ -77,12 +78,58 @@ func withTestCRD(t *testing.T, c client.Client, file, name string) {
 	if _, err := envtest.InstallCRDs(cfg, opts); err != nil {
 		t.Fatalf("install the CRD %s: %v", name, err)
 	}
-	t.Cleanup(func() {
-		if err := envtest.UninstallCRDs(cfg, opts); err != nil {
-			t.Errorf("uninstall the CRD %s: %v", name, err)
+	t.Cleanup(func() { uninstallTestCRD(t, c, file, name) })
+}
+
+// uninstallTestCRD removes the CRD name of hooks/testdata/crds/file, and
+// waits until it is gone and the API server's discovery no longer serves
+// its group version: a client the next test makes maps none of its kinds.
+func uninstallTestCRD(t *testing.T, c client.Client, file, name string) {
+	t.Helper()
+	opts := envtest.CRDInstallOptions{Paths: []string{filepath.Join("hooks", "testdata", "crds", file)}}
+	if err := envtest.ReadCRDFiles(&opts); err != nil {
+		t.Fatalf("read the CRD %s: %v", name, err)
+	}
+	crds := opts.CRDs
+	opts.Paths = nil
+	if err := envtest.UninstallCRDs(envtestConfig(t), opts); err != nil {
+		t.Errorf("uninstall the CRD %s: %v", name, err)
+	}
+	waitUntilCRDIsGone(t, c, name)
+	for _, crd := range crds {
+		for _, v := range crd.Spec.Versions {
+			waitUntilNotServed(t, crd.Spec.Group+"/"+v.Name)
 		}
-		waitUntilCRDIsGone(t, c, name)
-	})
+	}
+}
+
+// waitUntilNotServed waits until the API server's discovery lists no
+// groupVersion: neither in its groups nor as its own resource list.
+func waitUntilNotServed(t *testing.T, groupVersion string) {
+	t.Helper()
+	dc, err := discovery.NewDiscoveryClientForConfig(envtestConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 30*time.Second, true,
+		func(context.Context) (bool, error) {
+			groups, err := dc.ServerGroups()
+			if err != nil {
+				return false, nil
+			}
+			for _, g := range groups.Groups {
+				for _, v := range g.Versions {
+					if v.GroupVersion == groupVersion {
+						return false, nil
+					}
+				}
+			}
+			_, err = dc.ServerResourcesForGroupVersion(groupVersion)
+			return apierrors.IsNotFound(err), nil
+		})
+	if err != nil {
+		t.Errorf("the API server still serves %s: %v", groupVersion, err)
+	}
 }
 
 // waitUntilCRDIsGone waits until the CRD name is deleted.
@@ -164,10 +211,37 @@ func TestReconcile_RookStaysWhileACephClusterExists(t *testing.T) {
 }
 
 // Without Rook's CRDs no CephCluster can exist: rook-ceph, its feature
-// turned off, is uninstalled.
+// turned off, is uninstalled. The test waits until the API server serves
+// none of them: tests before it install and remove the CephCluster CRD in
+// the shared envtest, and its discovery may list the kind for a moment
+// after the CRD is gone (#47).
 func TestReconcile_RookWithoutItsCRDsIsUninstalled(t *testing.T) {
+	waitUntilNotServed(t, "ceph.rook.io/v1")
 	c, r := installedOnEnvtest(t, rookOffSpec, "v1")
 	asRookCeph(t, c, rookOffSpec)
+
+	reconcileProbe(t, r)
+
+	if st, _ := rookCephStatus(t, c); st.State != k4allv1alpha1.ComponentStateSkipped {
+		t.Fatalf("rook-ceph %s (%s), want Skipped: uninstalled", st.State, st.Message)
+	}
+}
+
+// The operator saw Rook's CRDs, the admin deleted them by hand, then turned
+// Rook off. The operator's client still maps CephCluster, and its List gets
+// a 404: no CephCluster can exist, and rook-ceph is uninstalled. Before, the
+// guard refused ("cannot tell") until the operator restarted (#47).
+func TestReconcile_RookWhoseCRDsWereDeletedIsUninstalled(t *testing.T) {
+	c, r := installedOnEnvtest(t, rookOffSpec, "v1")
+	asRookCeph(t, c, rookOffSpec)
+	withCephClusterCRD(t, c)
+	clusters := &unstructured.UnstructuredList{}
+	clusters.SetAPIVersion("ceph.rook.io/v1")
+	clusters.SetKind("CephClusterList")
+	if err := r.List(context.Background(), clusters); err != nil {
+		t.Fatalf("the operator's client lists no CephCluster: %v", err)
+	}
+	uninstallTestCRD(t, c, "ceph.rook.io_cephclusters.yaml", "cephclusters.ceph.rook.io")
 
 	reconcileProbe(t, r)
 

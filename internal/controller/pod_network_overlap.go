@@ -11,6 +11,7 @@ import (
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -244,7 +245,8 @@ func nodePodCIDRs(ctx context.Context, c client.Reader) ([]addressRange, error) 
 	list.SetAPIVersion("cilium.io/v2")
 	list.SetKind("CiliumNodeList")
 	if err := c.List(ctx, list); err != nil {
-		if meta.IsNoMatchError(err) {
+		// Not served: no match, or a 404 once the CRD is deleted (#47).
+		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("list CiliumNodes: %w", err)

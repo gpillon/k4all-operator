@@ -14,7 +14,6 @@ import (
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -196,7 +195,8 @@ func (h *KubevirtManagerHook) priorityClassesInUse(ctx context.Context) (map[str
 	return used, nil
 }
 
-// notServed: the API server (or the client's scheme) does not know the kind.
+// notServed: the API server does not serve the kind (kindNotServed), or the
+// client's scheme does not know it.
 func notServed(err error) bool {
-	return meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err)
+	return kindNotServed(err) || runtime.IsNotRegisteredError(err)
 }

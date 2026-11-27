@@ -6,8 +6,6 @@ import (
 	"sort"
 	"strings"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -124,12 +122,6 @@ func listWorkloads(
 		}
 	}
 	return names, nil
-}
-
-// kindNotServed: the cluster does not serve the kind, now (no match) or any
-// more (the client's discovery is older than the CRD's removal).
-func kindNotServed(err error) bool {
-	return meta.IsNoMatchError(err) || apierrors.IsNotFound(err)
 }
 
 // refusalExamples is how many objects of a kind the refusal names.
