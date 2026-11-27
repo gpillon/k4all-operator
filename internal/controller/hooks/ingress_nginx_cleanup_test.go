@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/operatorscheme"
 )
 
 var (
@@ -40,7 +41,7 @@ func envtestClient(t *testing.T) (client.Client, *rest.Config) {
 	if envErr != nil {
 		t.Fatalf("start envtest: %v", envErr)
 	}
-	c, err := client.New(envCfg, client.Options{})
+	c, err := client.New(envCfg, client.Options{Scheme: operatorscheme.New()})
 	if err != nil {
 		t.Fatal(err)
 	}

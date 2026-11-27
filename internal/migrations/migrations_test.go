@@ -5,12 +5,12 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
+	"github.com/gpillon/k4all-operator/internal/operatorscheme"
 )
 
 const configName = "k4all-cluster-config"
@@ -53,11 +53,7 @@ func clusterConfig(ingress k4allv1alpha1.IngressConfig, annotations map[string]s
 
 func newClient(t *testing.T, cc *k4allv1alpha1.ClusterConfig) client.Client {
 	t.Helper()
-	s := runtime.NewScheme()
-	if err := k4allv1alpha1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	return fake.NewClientBuilder().WithScheme(s).WithObjects(cc).Build()
+	return fake.NewClientBuilder().WithScheme(operatorscheme.New()).WithObjects(cc).Build()
 }
 
 // run runs the migrations on cc and returns what is stored afterwards.

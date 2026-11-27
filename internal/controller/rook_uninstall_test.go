@@ -58,34 +58,47 @@ var rookOffSpec = k4allv1alpha1.ComponentSpec{
 }
 
 // withCephClusterCRD installs Rook's CephCluster CRD for the test and removes
-// it when the test ends, waiting until it is gone: the other tests of the
-// package run without Rook's CRDs.
+// it when the test ends: the other tests of the package run without Rook's
+// CRDs.
 func withCephClusterCRD(t *testing.T, c client.Client) {
 	t.Helper()
+	withTestCRD(t, c, "ceph.rook.io_cephclusters.yaml", "cephclusters.ceph.rook.io")
+}
+
+// withTestCRD installs the CRD name of hooks/testdata/crds/file for the test
+// and removes it when the test ends, waiting until it is gone.
+func withTestCRD(t *testing.T, c client.Client, file, name string) {
+	t.Helper()
 	opts := envtest.CRDInstallOptions{
-		Paths:              []string{filepath.Join("hooks", "testdata", "crds", "ceph.rook.io_cephclusters.yaml")},
+		Paths:              []string{filepath.Join("hooks", "testdata", "crds", file)},
 		ErrorIfPathMissing: true,
 	}
 	cfg := envtestConfig(t)
 	if _, err := envtest.InstallCRDs(cfg, opts); err != nil {
-		t.Fatalf("install the CephCluster CRD: %v", err)
+		t.Fatalf("install the CRD %s: %v", name, err)
 	}
 	t.Cleanup(func() {
 		if err := envtest.UninstallCRDs(cfg, opts); err != nil {
-			t.Errorf("uninstall the CephCluster CRD: %v", err)
+			t.Errorf("uninstall the CRD %s: %v", name, err)
 		}
-		crd := &unstructured.Unstructured{}
-		crd.SetAPIVersion("apiextensions.k8s.io/v1")
-		crd.SetKind("CustomResourceDefinition")
-		crd.SetName("cephclusters.ceph.rook.io")
-		err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 30*time.Second, true,
-			func(ctx context.Context) (bool, error) {
-				return apierrors.IsNotFound(c.Get(ctx, client.ObjectKeyFromObject(crd), crd)), nil
-			})
-		if err != nil {
-			t.Errorf("the CephCluster CRD is still there: %v", err)
-		}
+		waitUntilCRDIsGone(t, c, name)
 	})
+}
+
+// waitUntilCRDIsGone waits until the CRD name is deleted.
+func waitUntilCRDIsGone(t *testing.T, c client.Client, name string) {
+	t.Helper()
+	crd := &unstructured.Unstructured{}
+	crd.SetAPIVersion("apiextensions.k8s.io/v1")
+	crd.SetKind("CustomResourceDefinition")
+	crd.SetName(name)
+	err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 30*time.Second, true,
+		func(ctx context.Context) (bool, error) {
+			return apierrors.IsNotFound(c.Get(ctx, client.ObjectKeyFromObject(crd), crd)), nil
+		})
+	if err != nil {
+		t.Errorf("the CRD %s is still there: %v", name, err)
+	}
 }
 
 // Rook turned off while a CephCluster holds data: rook-ceph stays installed,

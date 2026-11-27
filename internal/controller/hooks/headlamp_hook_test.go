@@ -11,15 +11,14 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
+	"github.com/gpillon/k4all-operator/internal/operatorscheme"
 )
 
 const (
@@ -62,13 +61,7 @@ func redirectMiddleware() *unstructured.Unstructured {
 // objs and returns the dashboard Ingress.
 func dashboard(t *testing.T, config k4allv1alpha1.ClusterConfigSpec, objs ...client.Object) *networkingv1.Ingress {
 	t.Helper()
-	s := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	if err := k4allv1alpha1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
+	s := operatorscheme.New()
 	s.AddKnownTypeWithName(middlewareGVK, &unstructured.Unstructured{})
 	s.AddKnownTypeWithName(middlewareGVK.GroupVersion().WithKind("MiddlewareList"), &unstructured.UnstructuredList{})
 	node := &corev1.Node{

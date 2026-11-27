@@ -93,6 +93,14 @@ func (h *KubevirtManagerHook) Remove(ctx context.Context, _ k4allv1alpha1.Compon
 	return nil
 }
 
+// SweepRemoved implements RemovedSweeper: the image catalog CRD goes now if
+// it is still empty. Operators up to v0.6.0 could not delete it (their
+// manager's scheme lacked apiextensions/v1, #45), and kubevirt-manager was
+// Removed already: its Remove does not run again.
+func (h *KubevirtManagerHook) SweepRemoved(ctx context.Context) {
+	h.removeImageCatalog(ctx)
+}
+
 // imageCatalogCRD is kubevirt-manager's image catalog; its Images are the user's.
 const imageCatalogCRD = "images.kubevirt-manager.io"
 
