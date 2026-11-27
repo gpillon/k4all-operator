@@ -35,15 +35,20 @@ const ciliumValuesRevision = "3"
 // ValuesRevision implements ValuesRevisioner.
 func (h *CiliumHook) ValuesRevision() string { return ciliumValuesRevision }
 
-// PreInstall renders BuildCiliumValues and the IPAM: the pool Cilium runs,
-// or spec.cluster.podNetwork on a new cluster (ReadCiliumIPAM).
-func (h *CiliumHook) PreInstall(ctx context.Context, _ string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {
+// PreInstall renders BuildCiliumValues, the IPAM: the pool Cilium runs, or
+// spec.cluster.podNetwork on a new cluster (ReadCiliumIPAM), and, on a
+// cluster without kube-proxy, the API server's endpoint
+// (ciliumAPIServerValues).
+func (h *CiliumHook) PreInstall(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, config k4allv1alpha1.ClusterConfigSpec, values map[string]interface{}) (map[string]interface{}, error) {
 	ipam, err := ReadCiliumIPAM(ctx, h.client, spec.Namespace, config)
 	if err != nil {
 		return nil, err
 	}
 	extra := BuildCiliumValues(config)
 	extra["ipam"] = ipam.helmValues()
+	if err := ciliumAPIServerValues(ctx, h.client, name, config, extra); err != nil {
+		return nil, err
+	}
 	for k, v := range extra {
 		values[k] = v
 	}

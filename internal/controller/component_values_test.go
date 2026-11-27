@@ -9,14 +9,24 @@ import (
 	"github.com/go-logr/logr"
 	k4allv1alpha1 "github.com/gpillon/k4all-operator/api/v1alpha1"
 	"github.com/gpillon/k4all-operator/internal/controller/hooks"
+	appsv1 "k8s.io/api/apps/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+// newValuesReconciler computes values on a cluster k4all 2.x installed:
+// kube-proxy runs.
 func newValuesReconciler() *ReleaseReconciler {
 	return &ReleaseReconciler{
-		hookReg: hooks.NewRegistry(fake.NewClientBuilder().Build(), logr.Discard()),
+		hookReg: hooks.NewRegistry(fake.NewClientBuilder().WithObjects(kubeProxy()).Build(), logr.Discard()),
 	}
+}
+
+// kubeProxy is kube-proxy's DaemonSet, as kubeadm installs it on every
+// cluster k4all 2.x installs.
+func kubeProxy() *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kube-proxy"}}
 }
 
 func overrideValues(t *testing.T, raw string) *apiextensionsv1.JSON {
