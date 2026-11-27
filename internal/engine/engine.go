@@ -50,8 +50,9 @@ func New(c client.Client, restConfig *rest.Config, log logr.Logger, toolsImage s
 type ReconcileOption func(*reconcileOptions)
 
 type reconcileOptions struct {
-	waitUntilReady bool
-	mutator        ObjectMutator
+	waitUntilReady  bool
+	mutator         ObjectMutator
+	allowValuesDrop func(revision int) bool
 }
 
 // WaitUntilReady makes Helm components return only once their resources are
@@ -107,7 +108,7 @@ func (e *Engine) ReconcileComponent(
 	patches := spec.Patches
 	switch spec.Type {
 	case k4allv1alpha1.ComponentTypeHelm, k4allv1alpha1.ComponentTypeHelmOCI:
-		err = e.helm.Reconcile(ctx, name, spec, values, o.waitUntilReady)
+		err = e.helm.Reconcile(ctx, name, spec, values, o.waitUntilReady, o.allowValuesDrop)
 	case k4allv1alpha1.ComponentTypeManifest:
 		patches, err = e.manifest.Apply(ctx, name, spec, o.mutator)
 	case k4allv1alpha1.ComponentTypeBinary:

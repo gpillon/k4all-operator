@@ -31,6 +31,11 @@ type HelmInstaller struct {
 	cacheDir   string
 	// configFor builds the Helm action configuration of a namespace.
 	configFor func(namespace string) (*action.Configuration, error)
+	// fieldManager is the field manager of this operator's Helm writes, and
+	// revisionWriter tells which field manager wrote a revision of a release
+	// (checkTakeover).
+	fieldManager   string
+	revisionWriter func(ctx context.Context, namespace string, rel *release.Release) (string, error)
 }
 
 func NewHelmInstaller(restConfig *rest.Config, log logr.Logger) *HelmInstaller {
@@ -42,6 +47,8 @@ func NewHelmInstaller(restConfig *rest.Config, log logr.Logger) *HelmInstaller {
 		cacheDir:   cacheDir,
 	}
 	h.configFor = h.actionConfig
+	h.fieldManager = fieldManagerOf(restConfig)
+	h.revisionWriter = secretCreator(restConfig)
 	return h
 }
 
@@ -66,10 +73,20 @@ func (h *HelmInstaller) RunningVersion(_ context.Context, name, namespace string
 
 // Reconcile installs or upgrades the release. With wait it returns only once
 // the release's resources are ready (used for intermediate upgradePath steps).
-func (h *HelmInstaller) Reconcile(ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, values map[string]interface{}, wait bool) error {
+// A release this operator did not write last is upgraded only when values
+// drop none of its values, or allowValuesDrop allows it (checkTakeover);
+// nothing is done to it otherwise, not even the recovery of a pending
+// revision.
+func (h *HelmInstaller) Reconcile(
+	ctx context.Context, name string, spec k4allv1alpha1.ComponentSpec, values map[string]interface{}, wait bool,
+	allowValuesDrop func(revision int) bool,
+) error {
 	cfg, err := h.actionConfig(spec.Namespace)
 	if err != nil {
 		return fmt.Errorf("helm action config: %w", err)
+	}
+	if err := h.checkTakeover(ctx, cfg, name, spec.Namespace, values, allowValuesDrop); err != nil {
+		return err
 	}
 	if err := h.recoverPendingRelease(cfg, name, time.Now()); err != nil {
 		return err
